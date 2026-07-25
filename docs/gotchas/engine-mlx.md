@@ -177,3 +177,104 @@ Ported oMLX Lightning's scheme faithfully (drafts from a fixed sharper dist temp
 **MTP round pipelining — the CPU graph-build was the recoverable overhead; our emit gap is ~0.03 ms so pre-draft buys little beyond early dispatch.** Three landed levers, each kill-switched and BIT-IDENTICAL to its off state (lazy sampling ops bind their PRNG key at graph BUILD): (1) **early dispatch** (`MLX_SERVE_MTP_EARLY_DISPATCH=0`) — `mlx_async_eval` the draft chain as soon as Phase 1 builds it, so it runs while the CPU builds Phases 2–4. (2) **cross-round pre-draft** (`MLX_SERVE_MTP_PREDRAFT=0`) — `nextMtp` tail builds+dispatches the next round's chunk A (plan after the EV update == head-of-round); mirrors oMLX `_step_mtp` but our scheduler has no Python-sized emit window, so it ≈ early-dispatch on totals (kept for the cheaper EV boundary sync). A `MtpPreDraft` owns every handle; consume asserts stash-XOR-predraft. (3) **GDN capture-tail trim** — the seq kernel emits `state_out` from registers and never writes `state_seq[T-1]` (partial accept reads ≤ T-2), so the final state is no longer a slice VIEW pinning the whole [T,…] buffer. Residual vs oMLX is GPU work (their round ≈ their AR forward), not scheduling.
 
 **EV controller under honest costs — two structural traps fire once marginals stop being cheap.** (Refit cost constants only on a SATURATED sweep whose realized `m_avg`==depth — ladder prompts demote-flap and poison the fit; echo pins it.) Trap 1 — **two-chunk plans pay a mid-pipeline boundary sync the cost surface can't see** (the chunk-A sync blocks on the still-running head chain + confidence graphs): fix = the extension **dry-spell gate** (`mtpExtDryAllows`: ~16 dry rounds → short single-chunk cooldown → fresh trial; `MLX_SERVE_MTP_EXT_DRY=0`), fed by REALIZED extension rate never priors, cooldown SHORT vs a request's round count (64 swallowed a 160-token request's echo stretch). Trap 2 — **the horizon check deadlocks on an unobservable EMA**: `a[m_lo]` updates ONLY when extension fires, so a value dragged cold under an earlier workload closes the horizon FOREVER (pure echo runs ext_rounds=0). Fix: when the base pays (`best_r > MTP_EV_EXPLORE_MIN_R = 1.10`) one extension position stays reachable at the clamped tau. Pinned by the equivalence echo test + `mtpEvPlanFor` unit tests.
+
+### A slice handle wrapped in `contiguous` and never freed pins its PARENT's buffer (MageFlow 2.2 GB-per-megapixel leak, 2026-07-25)
+The third member of the family above, and the one that hides best: not a phantom +1 (the handle is legitimately ours) and not allocator-cache growth (`active_bytes` climbs with it). `mage_flow.sliceSeq` was
+```zig
+var o = mlx.mlx_array_new();
+try mlx.check(mlx.mlx_slice(&o, x, &lo, 3, &hi, 3, &st, 3, s));
+return contig(o, s);   // `o` is never freed
+```
+— correct output, every parity fixture green, and six helpers across the DiT, text-encoder, ViT and VAE paths written the same way. **An mlx slice is a VIEW: keeping its handle alive keeps the whole parent buffer alive**, so `jointAttn`'s two calls (txt slice + img slice off the same `flat`) retained the img+txt pair the block was handed — ~47 MB at 1024², × 12 blocks × 4 steps = **~2.2 GB per megapixel per generation**, linear in output pixels within 6% across five sizes from 0.26 to 1.57 MP. It compounded across generations and SURVIVED `/v1/unload-model` (`mlx_active` 3.60 → 7.19 → 10.79 GB over three load→gen→unload cycles); a normal session reached 40+ GB.
+- **What made it slow to find**, and the ladder that worked: RSS is BLIND to Metal buffers — it sat at 8.48 GB the whole time while 10 GB leaked, so `ps` says "healthy" and only `/props` `active_bytes` + `vmmap -summary` see it. FLUX klein is the clean CONTROL (returns to exactly 0.00 GB per cycle) — running the identical harness against a sibling backend is what proved the bug was ours and not MLX's. Stage instrumentation localized the gain to `Dit.forward`, then per-block marks to a flat ~47 MB per `ditBlock`. The decisive step was forcing `mlx_array_eval` on `img`/`txt` after every block: memory still grew, which RULES OUT lazy-graph retention and says the bytes are held by a live reference — the whole remaining search is then "which handle is never freed", which greps out in minutes. Quantization was a red herring (the dense bf16 checkpoint leaked byte-for-byte the same, 3.60/7.19/10.79 — identical figures mean activation-shaped data, not weights).
+- **Fix**: one `sliceContig(x, lo, hi, st, s)` owns the intermediate (`defer mlx_array_free(o)` before `return contig(o, s)`), and all six helpers delegate to it — the pattern now exists in exactly ONE place. Numerics are untouched: the same seed produces a **byte-identical PNG** before and after. `krea.zig`/`flux.zig` were already correct (`defer free(out); return contig(out, s)`), which is why only MageFlow leaked.
+- **Rule**: a helper that materializes a view owns the view — free the intermediate, don't just wrap it. `mlx_clear_cache` is NOT the fix for this class (that's the cache-growth one above); if `active_bytes` itself climbs, you are holding handles. Prefer one shared slice-and-materialize helper per file over N hand-rolled copies: this shipped six times in one file because each site was written independently.
+- Guards: `tests/test_media_gen_memory.sh` (varies the size-driving shape across generations — a fixed-size replay cannot separate a leak from size-keyed caching — and asserts three load/gen/unload cycles return to the pre-load baseline; red-on-revert at +3.18 GB across four generations) and the hermetic `materializing helpers hand back every array they take` in mage_flow.zig, which calls each helper with a source built and freed INSIDE the loop and asserts `mlx_get_active_memory` returns to baseline. **The input must be rebuilt per iteration**: a caller-owned source that outlives the call keeps the parent alive anyway, and the first version of that test passed against the broken code for exactly that reason.
+
+## GDN blocked-prefill kernel: hardcoded bf16 vs an f16 checkpoint (2026-07-25)
+
+`./mlx-serve --serve --model=~/.mlx-serve/models/…/Nanbeige…` died mid-request with
+
+```
+MLX error: [metal::Device] Unable to build metal library from source
+utils.h:476:19: error: cannot initialize a variable of type 'const device bfloat *'
+                       with an rvalue of type 'const device float *'
+const device InT* k_base = k + ((size_t)b * T * Hk + hk) * Dk;
+```
+
+Two independent bugs stacked, and the first hid the second.
+
+**It was not the model in the command.** `main.zig`'s flag loop takes values as a
+separate argv token, so `--model=<path>` matched nothing and was silently
+dropped (see docs/gotchas/server-http.md). The server went headless, and on the
+first request auto-picked `prism-ml/Ternary-Bonsai-27B-mlx-2bit` as the default
+chat model. That is what crashed. Nanbeige never loaded at all — its
+`model_type` is `nanbeige`, which discovery already skips.
+
+**The crash: the checkpoint is F16, not bf16.**
+
+```
+dtype histogram: {'U32': 498, 'F16': 1682}
+```
+
+Every other GDN model we serve is bf16. With f16 weights the activations get
+promoted to fp32 (f16 ⊕ f32-scalar → f32, the `scalarLike` class), which the
+mangled kernel name states outright — the input dtype list reads
+`float float float bfloat16_t float bfloat16_t int32_t` for
+q,k,v,g,beta,state_in,T. So q/k/v/beta are fp32 while `g` (our fused gate
+kernel's output) and the state buffer stay bf16: a genuinely MIXED input set.
+
+`transformer.zig` hardcoded `add_template_arg_dtype(config, "InT", .bfloat16)`
+at five sites, and the blocked kernel body hand-declared
+`const device InT* k_base = …` off it. fp32 buffer, bf16 pointer, compile
+failure — and an MLX compile failure is not a Zig error, it aborts the process.
+One request took the server down for every client.
+
+The comment above the kernel had predicted the whole thing and then dismissed it:
+
+> block size: MLX_SERVE_GDN_BLOCK_T (16|32|48, default 32 for bf16 — Metal's
+> 32 KiB threadgroup limit governs; fp32 inputs would need 16, **but our GDN
+> inputs are always bf16**).
+
+**Why the stock kernel survived.** `GDN_KERNEL_SOURCE` indexes the raw buffer
+names (`auto q_ = q + …`), so it adapts to whatever dtype arrives — exactly the
+house rule the blocked port broke. `MLX_SERVE_GDN_BLOCKED=0` was therefore a
+complete workaround, and that A/B is how the diagnosis was confirmed: same
+model, same 501-token request, 22.6 → coherent generation with the kernel off,
+`Unable to build metal library` with it on.
+
+**Three things the fix had to get right, not one.**
+
+1. `InT`/`StT` come from `mlx_array_dtype` of the actual arrays. `g`/`beta` need
+   no template arg at all — they are read through raw names with an explicit
+   `(float)` cast, which is why the mixed set never bothered them.
+2. **Block size follows the dtype.** The staging arrays are declared *in* `InT`
+   (`threadgroup InT k_s[TB][Dk+8]`), so fp32 doubles the footprint: at
+   Dk=128/TB=32 that is 40,192 bytes against a 32 KiB threadgroup limit.
+   `gdnBlockTFor(requested, dk, itemsize)` picks the largest supported TB that
+   fits (fp32 ⇒ 16) and returns null — decline to the stock kernel — rather than
+   ever dispatching over budget. Fixing the dtype alone would have traded a
+   compile error for a different compile error.
+3. **The store type is the OUTPUT's.** Making `InT` honest immediately broke the
+   *stock* kernel too:
+
+   ```
+   error: assigning to 'bfloat16_t' (aka 'bfloat') from incompatible type 'float'
+       y[dv_idx] = static_cast<InT>(out);
+   ```
+
+   Metal has no implicit float→bfloat conversion, and `y` is declared bf16 by us.
+   `static_cast<InT>` had only ever compiled because InT happened to equal the
+   output dtype. That is now `OutT`, set from the output declaration, in all
+   three kernel sources.
+
+Diagnosis order that worked: read the dtypes out of the mangled template name in
+the error (they are all there), then the safetensors header histogram, then
+`grep` for the hardcoded `.bfloat16` template args. The kernel name is the
+fastest signal — it tells you what MLX actually saw, not what you assumed.
+
+Guards: `gdnBlockTFor` unit test (pure, pins the staging arithmetic and the
+clamp), plus fp32 and f16 cases in the blocked-parity sweep, which run through
+the same `gdnBlockTFor` the production path does — so a regression that declines
+the blocked route instead of clamping fails with `error.GdnBlockedDeclined`
+rather than passing on the stock fallback.

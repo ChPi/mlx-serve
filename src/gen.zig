@@ -17,6 +17,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
+const mage_flow_mod = @import("mage_flow.zig");
 const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
@@ -35,6 +36,7 @@ const log = @import("log.zig");
 const metrics = @import("status.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
+const multipart = @import("multipart.zig");
 const stb = @import("stb");
 
 const Conn = server_mod.Conn;
@@ -78,6 +80,7 @@ pub const Modality = enum {
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
+    if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
@@ -117,6 +120,17 @@ pub fn audioBackendKindForType(model_type: []const u8) enum { tts, music } {
 pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     // Guard the openFileAbsolute assert (ReleaseFast UB on relative/empty paths).
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    if (readConfigModelType(io, allocator, model_dir)) |mt| return mt;
+    // Diffusers-style repos (Mage-Flow) have no root config.json / model_type —
+    // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
+    // the "mage_flow" marker so routing + the backend dispatch light up.
+    if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    return null;
+}
+
+/// Read `model_dir/config.json`'s `model_type` (owned dupe) or null on any
+/// read/parse error or when the field is absent.
+fn readConfigModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return null;
     defer allocator.free(path);
     const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
@@ -131,6 +145,25 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     const mt = parsed.value.object.get("model_type") orelse return null;
     if (mt != .string) return null;
     return allocator.dupe(u8, mt.string) catch null;
+}
+
+/// True when `model_dir/model_index.json` marks a MageFlow pipeline (its
+/// `_class_name` is "MageFlowPipeline", or the `_mage_flow_version` tag exists).
+fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    if (parsed.value.object.get("_mage_flow_version") != null) return true;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
 }
 
 /// Classify a model dir into a media modality (reads its `model_type`), or null
@@ -319,6 +352,7 @@ const FluxImpl = struct {
 const ImageBackend = union(enum) {
     flux: FluxImpl,
     krea: *krea.Engine,
+    mage_flow: *mage_flow_mod.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -341,6 +375,12 @@ pub const ImageGenOpts = struct {
     /// ride at their own t offset: "replace the face in image 1 with the face
     /// from image 2". Empty = not an edit.
     edit_images: []const mlx.mlx_array = &.{},
+    /// Raw reference bytes (PNG/JPEG) for backends that do their OWN edit
+    /// preprocessing rather than consuming pre-decoded `edit_images` — MageFlow
+    /// needs a target-size VAE resize AND a separate 384/smart-resize for its
+    /// vision tower, so it resizes from the source bytes. Primary first. Empty =
+    /// not a MageFlow edit.
+    edit_image_bytes: []const []const u8 = &.{},
     /// Conditioning rebalance: global gain × per-tapped-layer weights
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
@@ -363,18 +403,20 @@ pub const ImageEngine = struct {
         const self = try allocator.create(ImageEngine);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .backend = undefined };
-        // Re-peek the arch to pick the backend (detectModality already proved
-        // config.json parses). `krea*` → Krea; everything else → FLUX.
-        const is_krea = blk: {
-            const mt = peekModelType(io, allocator, model_dir) orelse break :blk false;
+        // Re-peek the arch to pick the backend (detectModality already proved the
+        // config parses). `mage_flow*` → MageFlow; `krea*` → Krea; else FLUX.
+        if (peekModelType(io, allocator, model_dir)) |mt| {
             defer allocator.free(mt);
-            break :blk std.mem.startsWith(u8, mt, "krea");
-        };
-        if (is_krea) {
-            self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
-        } else {
-            self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
+            if (std.mem.startsWith(u8, mt, "mage_flow") or std.mem.eql(u8, mt, "mageflow")) {
+                self.backend = .{ .mage_flow = try mage_flow_mod.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
+            if (std.mem.startsWith(u8, mt, "krea")) {
+                self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
+        self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
     }
 
@@ -383,6 +425,7 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
+            .mage_flow => |m| m.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -391,6 +434,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.s,
             .krea => |k| k.s,
+            .mage_flow => |m| m.s,
         };
     }
 
@@ -399,6 +443,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => 3,
             .krea => 12,
+            .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
         };
     }
 
@@ -407,6 +452,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
+            .mage_flow => false, // img2img lands with the MageFlow VAE encoder
         };
     }
 
@@ -416,7 +462,15 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
+            .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
         };
+    }
+
+    /// True when the edit backend consumes RAW reference bytes (`edit_image_bytes`)
+    /// and does its own resizing, rather than pre-decoded `edit_images`. MageFlow
+    /// needs a target-size VAE resize AND a separate VLM resize per reference.
+    pub fn editUsesRawBytes(self: *const ImageEngine) bool {
+        return self.backend == .mage_flow;
     }
 
     /// Reconcile the engine's attached LoRA with the request: `path == null`
@@ -432,6 +486,7 @@ pub const ImageEngine = struct {
             const matched = switch (self.backend) {
                 .flux => |*f| flux.attachLora(&f.dit, &lf, scale),
                 .krea => |k| krea.attachLora(&k.dit, &lf, scale),
+                .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             };
             if (matched == 0) {
                 lf.deinit();
@@ -451,6 +506,7 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
+            .mage_flow => {}, // no LoRA attached
         }
         if (self.lora_file) |*lf| lf.deinit();
         self.lora_file = null;
@@ -480,6 +536,12 @@ pub const ImageEngine = struct {
                 };
                 break :blk k.generateImageOpts(allocator, prompt, width, height, seed, steps, kopts, progress);
             },
+            // Turbo txt2img (guidance 1.0, no CFG), or the multi-reference edit
+            // when the request carries reference images (Edit checkpoint only).
+            .mage_flow => |m| if (opts.edit_image_bytes.len != 0)
+                m.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, progress)
+            else
+                m.generateImage(allocator, prompt, width, height, seed, steps, progress),
         };
     }
 
@@ -497,7 +559,24 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => .{ .w = clampFluxDim(req_w), .h = clampFluxDim(req_h) },
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
+            .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
+    }
+
+    /// The ceiling `normalizeSize` clamps a dimension to. The edit path needs it
+    /// as a NUMBER, not as a clamp: clamping width and height INDEPENDENTLY
+    /// discards the aspect ratio, which is how a 4032x3024 phone photo came back
+    /// 2048x2048. Pinned to the clamps themselves by a drift test.
+    pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
+        return switch (kind) {
+            .flux => 1536,
+            .krea, .mage_flow => 2048,
+        };
+    }
+
+    pub fn maxDim(self: *const ImageEngine) u32 {
+        return maxDimFor(std.meta.activeTag(self.backend));
     }
 };
 
@@ -1034,6 +1113,176 @@ fn fitRefDims(w: u32, h: u32) struct { w: u32, h: u32 } {
     };
 }
 
+// ── OpenAI `POST /v1/images/edits` (multipart) → our JSON edit request ──
+// Pure translation, the ollama.zig principle: ONE request schema and ONE engine
+// path, with the vendor surface rewritten into it. Everything downstream
+// (`handleImage`) is untouched, so every guard, 400 and capability check
+// applies identically whether the client speaks our JSON or OpenAI multipart.
+
+pub const EditFormError = error{
+    NotMultipart,
+    MissingPrompt,
+    MissingImage,
+    TooManyImages,
+    MaskUnsupported,
+    MultipleChoicesUnsupported,
+    UrlResponseUnsupported,
+    OutputFormatUnsupported,
+    StreamUnsupported,
+    OutOfMemory,
+};
+
+/// The 400 text for each rejection — every one names what we can't do and why,
+/// never a silent no-op (the llmprobe-flagged class).
+pub fn editFormErrorMessage(err: EditFormError) []const u8 {
+    return switch (err) {
+        error.NotMultipart => "/v1/images/edits expects multipart/form-data with a 'boundary' parameter",
+        error.MissingPrompt => "missing required form field 'prompt'",
+        error.MissingImage => "missing required form field 'image' (the picture to edit)",
+        error.TooManyImages => "too many 'image' parts (at most 4: the edited source plus 3 references)",
+        error.MaskUnsupported => "'mask' is not supported: this server's editors are maskless in-context models (describe the change in the prompt instead)",
+        error.MultipleChoicesUnsupported => "'n' must be 1 — this engine generates a single image per request",
+        error.UrlResponseUnsupported => "'response_format' must be 'b64_json' — this server does not host generated files",
+        error.OutputFormatUnsupported => "'output_format' must be 'png' — this server always returns PNG",
+        error.StreamUnsupported => "'stream' is not supported on /v1/images/edits (use /v1/images/generations for SSE progress)",
+        error.OutOfMemory => "out of memory",
+    };
+}
+
+/// Rewrite an OpenAI images-edit form into the `/v1/images/generations` body.
+/// Returns owned JSON (caller frees). Files are re-encoded as base64 (the
+/// internal schema's transport); everything OpenAI accepts but we can't honor
+/// is an explicit error rather than a silently ignored field.
+pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, content_type: []const u8) EditFormError![]u8 {
+    const boundary = multipart.boundaryFromContentType(content_type) orelse return error.NotMultipart;
+    var it = multipart.Iterator.init(body, boundary) catch return error.NotMultipart;
+
+    var images: [MAX_EDIT_IMAGES][]const u8 = undefined;
+    var images_n: usize = 0;
+    var prompt: ?[]const u8 = null;
+    var model: ?[]const u8 = null;
+    var size: ?[]const u8 = null;
+
+    while (it.next()) |part| {
+        // `image`, `image[]` and `image[0]` are all in the wild.
+        if (std.mem.eql(u8, part.name, "image") or std.mem.startsWith(u8, part.name, "image[")) {
+            if (part.data.len == 0) continue;
+            if (images_n >= MAX_EDIT_IMAGES) return error.TooManyImages;
+            images[images_n] = part.data;
+            images_n += 1;
+        } else if (std.mem.eql(u8, part.name, "prompt")) {
+            prompt = part.data;
+        } else if (std.mem.eql(u8, part.name, "model")) {
+            model = part.data;
+        } else if (std.mem.eql(u8, part.name, "size")) {
+            // "auto" means "you decide" — leave it out and let the edit path
+            // resolve from the reference.
+            if (!std.mem.eql(u8, part.data, "auto") and part.data.len != 0) size = part.data;
+        } else if (std.mem.eql(u8, part.name, "mask")) {
+            if (part.data.len != 0) return error.MaskUnsupported;
+        } else if (std.mem.eql(u8, part.name, "n")) {
+            if (part.data.len != 0 and !std.mem.eql(u8, part.data, "1")) return error.MultipleChoicesUnsupported;
+        } else if (std.mem.eql(u8, part.name, "response_format")) {
+            if (part.data.len != 0 and !std.mem.eql(u8, part.data, "b64_json")) return error.UrlResponseUnsupported;
+        } else if (std.mem.eql(u8, part.name, "output_format")) {
+            if (part.data.len != 0 and !std.mem.eql(u8, part.data, "png")) return error.OutputFormatUnsupported;
+        } else if (std.mem.eql(u8, part.name, "stream")) {
+            if (std.mem.eql(u8, part.data, "true")) return error.StreamUnsupported;
+        }
+        // background / quality / input_fidelity / output_compression / user /
+        // partial_images: accepted and ignored — they don't change what we'd
+        // produce, so rejecting them would break working clients for nothing.
+    }
+
+    const p = prompt orelse return error.MissingPrompt;
+    if (p.len == 0) return error.MissingPrompt;
+    if (images_n == 0) return error.MissingImage;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"mode\":\"edit\",\"prompt\":");
+    try chat_mod.appendJsonString(allocator, &out, p);
+    if (model) |m| {
+        if (m.len != 0) {
+            try out.appendSlice(allocator, ",\"model\":");
+            try chat_mod.appendJsonString(allocator, &out, m);
+        }
+    }
+    if (size) |sz| {
+        try out.appendSlice(allocator, ",\"size\":");
+        try chat_mod.appendJsonString(allocator, &out, sz);
+    }
+    try out.appendSlice(allocator, ",\"image\":\"");
+    try appendBase64(allocator, &out, images[0]);
+    try out.appendSlice(allocator, "\"");
+    if (images_n > 1) {
+        try out.appendSlice(allocator, ",\"ref_images\":[");
+        for (images[1..images_n], 0..) |img, i| {
+            if (i != 0) try out.appendSlice(allocator, ",");
+            try out.appendSlice(allocator, "\"");
+            try appendBase64(allocator, &out, img);
+            try out.appendSlice(allocator, "\"");
+        }
+        try out.appendSlice(allocator, "]");
+    }
+    try out.appendSlice(allocator, "}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendBase64(allocator: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+    const n = std.base64.standard.Encoder.calcSize(bytes.len);
+    const start = out.items.len;
+    try out.resize(allocator, start + n);
+    _ = std.base64.standard.Encoder.encode(out.items[start..], bytes);
+}
+
+/// Reshape a target size to `src`'s aspect ratio at the SAME pixel budget
+/// (`budget_w × budget_h`), rounded to a multiple of 16. Used by the byte-based
+/// edit path so the output geometry matches the reference image the user handed
+/// us while still honoring the resolution they picked as an area.
+fn fitAspect(src_w: u32, src_h: u32, budget_w: u32, budget_h: u32) struct { w: u32, h: u32 } {
+    if (src_w == 0 or src_h == 0) return .{ .w = budget_w, .h = budget_h };
+    const budget: f64 = @as(f64, @floatFromInt(budget_w)) * @as(f64, @floatFromInt(budget_h));
+    const aspect: f64 = @as(f64, @floatFromInt(src_w)) / @as(f64, @floatFromInt(src_h));
+    const h = std.math.sqrt(budget / aspect);
+    const w = h * aspect;
+    return .{
+        .w = @max(16, (@as(u32, @intFromFloat(@round(w))) / 16) * 16),
+        .h = @max(16, (@as(u32, @intFromFloat(@round(h))) / 16) * 16),
+    };
+}
+
+/// Scale (w,h) down proportionally until neither exceeds `cap`, floored to /16.
+/// Preserves the aspect ratio `fitAspect` just established. Extreme aspects can
+/// still meet the 256 floor inside `normalizeSize` — nothing can honor a 2048
+/// ceiling and a 256 floor past ~8:1 — but that is a far smaller distortion than
+/// squaring the image off.
+/// Named so the two geometry helpers below can hand results to each other —
+/// Zig treats each anonymous `struct { w, h }` as a distinct type.
+const Dims = struct { w: u32, h: u32 };
+
+fn fitWithinCap(w: u32, h: u32, cap: u32) Dims {
+    const longest = @max(w, h);
+    if (longest <= cap or longest == 0 or cap == 0) return .{ .w = w, .h = h };
+    const scale = @as(f64, @floatFromInt(cap)) / @as(f64, @floatFromInt(longest));
+    const sw = @round(@as(f64, @floatFromInt(w)) * scale);
+    const sh = @round(@as(f64, @floatFromInt(h)) * scale);
+    return .{
+        .w = @max(16, (@as(u32, @intFromFloat(sw)) / 16) * 16),
+        .h = @max(16, (@as(u32, @intFromFloat(sh)) / 16) * 16),
+    };
+}
+
+/// Output geometry for a byte-based edit: keep the primary reference's aspect at
+/// the requested pixel budget, THEN scale into the backend's dimension cap.
+/// Both steps are load-bearing — `fitAspect` alone left `normalizeSize`'s
+/// per-dimension clamp free to square the result off again, which it did for any
+/// reference bigger than the cap (i.e. every modern phone photo).
+fn resolveEditTargetSize(src_w: u32, src_h: u32, budget_w: u32, budget_h: u32, cap: u32) Dims {
+    const fit = fitAspect(src_w, src_h, budget_w, budget_h);
+    return fitWithinCap(fit.w, fit.h, cap);
+}
+
 /// Native pixel dims of an encoded PNG/JPEG, without decoding the pixels.
 fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
     var w: c_int = 0;
@@ -1240,15 +1489,20 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     // 1024², Krea accepts any multiple of 16 in [256,2048]).
     var req_w: u32 = 1024;
     var req_h: u32 = 1024;
+    // Whether the CLIENT chose a size. An edit with no size means "keep the
+    // source's resolution" (the reference pipeline's `max_size = source size`
+    // default) — indistinguishable from an explicit 1024² unless we track it.
+    var size_given = false;
     if (extractJsonString(body, "size")) |size| {
         if (parseSize(size)) |wh| {
             req_w = wh.w;
             req_h = wh.h;
+            size_given = true;
         }
     }
     const sz = engine.normalizeSize(req_w, req_h);
-    const width = sz.w;
-    const height = sz.h;
+    var width = sz.w;
+    var height = sz.h;
     if (req_w != width or req_h != height) {
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
@@ -1271,6 +1525,11 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     defer for (edit_imgs[0..edit_imgs_n]) |ei| {
         _ = mlx.mlx_array_free(ei);
     };
+    // Raw reference bytes for byte-based edit backends (MageFlow); owned copies
+    // that must outlive `generateImage`.
+    var edit_byte_bufs: [MAX_EDIT_IMAGES][]u8 = undefined;
+    var edit_byte_n: usize = 0;
+    defer for (edit_byte_bufs[0..edit_byte_n]) |b| allocator.free(b);
     var strength: f32 = 0.6;
     var edit_mode = false;
     if (extractJsonString(body, "mode")) |m| {
@@ -1282,9 +1541,9 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     }
     if (extractJsonString(body, "image")) |raw_img| {
         if (edit_mode and !engine.supportsEdit())
-            return sendError(conn, 400, "instruction editing (mode:\"edit\") requires a FLUX.2 model — this model only supports mode:\"variation\"");
-        if (!engine.supportsImg2Img())
-            return sendError(conn, 400, "image-to-image needs the VAE encoder weights, which failed to load for this model");
+            return sendError(conn, 400, "instruction editing (mode:\"edit\") requires a FLUX.2 or Mage-Flow-Edit model");
+        if (!edit_mode and !engine.supportsImg2Img())
+            return sendError(conn, 400, "image-to-image (mode:\"variation\") isn't available for this model — either its VAE encoder failed to load, or this backend has no variation path");
         if (extractJsonFloat(body, "strength")) |sv| {
             if (!(sv > 0.0 and sv <= 1.0)) return sendError(conn, 400, "'strength' must be in (0,1]");
             strength = @floatCast(sv);
@@ -1292,7 +1551,33 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         const img_bytes = base64DecodeAlloc(allocator, raw_img) catch
             return sendError(conn, 400, "invalid base64 in 'image'");
         defer allocator.free(img_bytes);
-        if (edit_mode) {
+        if (edit_mode and engine.editUsesRawBytes()) {
+            // Byte-based edit backend (MageFlow): keep the source bytes; the
+            // engine does its own target-size VAE resize + VLM resize.
+            edit_byte_bufs[0] = try allocator.dupe(u8, img_bytes);
+            edit_byte_n = 1;
+            // MageFlow edits AT the target grid: every reference is resized to
+            // (W,H), so a square target squashes a 3:2 photo — and an editor
+            // that changes the geometry of its input is wrong by construction.
+            // NO size in the request = the reference pipeline's default
+            // (`max_size = source size`): hand back the source's own resolution.
+            // An explicit size keeps the PRIMARY reference's aspect ratio and
+            // treats the request as the pixel budget to fit it into.
+            if (imageNativeSize(img_bytes)) |nat| {
+                // No size given => the reference IS the budget, which `fitAspect`
+                // resolves to the source's own dimensions (/16).
+                const fit = if (size_given)
+                    resolveEditTargetSize(nat.w, nat.h, width, height, engine.maxDim())
+                else
+                    resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, engine.maxDim());
+                const nz = engine.normalizeSize(fit.w, fit.h);
+                if (nz.w != width or nz.h != height)
+                    log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ width, height, nz.w, nz.h, nat.w, nat.h, if (size_given) "requested" else "matched to source" });
+                width = nz.w;
+                height = nz.h;
+            }
+            log.info("[image] edit: reference {d} bytes (byte-based backend)\n", .{img_bytes.len});
+        } else if (edit_mode) {
             // The reference keeps its OWN aspect ratio (fit to ~1MP, /32 dims —
             // official prep behavior); its latent grid is independent of the
             // output grid, so nothing gets squished or cropped away.
@@ -1321,11 +1606,18 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         var it = iterJsonStringArray(body, "ref_images") orelse
             return sendError(conn, 400, "invalid 'ref_images' (must be a JSON array of base64 strings)");
         while (it.next()) |raw_ref| {
-            if (edit_imgs_n >= MAX_EDIT_IMAGES)
+            const cur_n = if (engine.editUsesRawBytes()) edit_byte_n else edit_imgs_n;
+            if (cur_n >= MAX_EDIT_IMAGES)
                 return sendError(conn, 400, "too many reference images ('ref_images' takes at most 3 beside 'image')");
             const ref_bytes = base64DecodeAlloc(allocator, raw_ref) catch
                 return sendError(conn, 400, "invalid base64 in 'ref_images'");
             defer allocator.free(ref_bytes);
+            if (engine.editUsesRawBytes()) {
+                edit_byte_bufs[edit_byte_n] = try allocator.dupe(u8, ref_bytes);
+                edit_byte_n += 1;
+                log.info("[image] edit ref {d}: {d} bytes (byte-based backend)\n", .{ edit_byte_n, ref_bytes.len });
+                continue;
+            }
             const rnat = imageNativeSize(ref_bytes) orelse
                 return sendError(conn, 400, "could not decode a 'ref_images' entry (PNG/JPEG supported)");
             const rrd = fitRefDims(rnat.w, rnat.h);
@@ -1384,6 +1676,7 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         .init_image = init_img, // null in edit mode
         .strength = strength,
         .edit_images = edit_imgs[0..edit_imgs_n],
+        .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
     };
@@ -2190,8 +2483,13 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
 }
 
 fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
-    var body_buf: [256]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\"}}}}", .{msg}) catch return;
+    // Escape at the SINK: several of these messages quote a field value
+    // (`mode:"edit"`), which went onto the wire as raw quotes inside a JSON
+    // string — an unparseable body. See `sse.jsonEscapeMessage`.
+    var esc_buf: [512]u8 = undefined;
+    const esc = sse.jsonEscapeMessage(&esc_buf, msg);
+    var body_buf: [640]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"error\":{{\"message\":\"{s}\"}}}}", .{esc}) catch return;
     var hdr: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ code, body.len }) catch return;
     try conn.writeAllNoFlush(head);
@@ -2439,8 +2737,196 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
+    try testing.expectEqual(Modality.image, modalityFromType("mage_flow").?);
+    try testing.expectEqual(Modality.image, modalityFromType("mageflow").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
+}
+
+test "mage_flow detects from the official diffusers layout (model_index.json, no root config.json)" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // Official Mage-Flow repos have no root config.json/model_type — the
+    // pipeline identity lives in model_index.json (_class_name).
+    try tmp.dir.createDirPath(io, "mf");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mf/model_index.json",
+        .data = "{\"_class_name\":\"MageFlowPipeline\",\"_mage_flow_version\":\"0.1.0\"}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "mf" });
+    defer allocator.free(model_dir);
+
+    const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
+    defer allocator.free(mt);
+    try testing.expectEqualStrings("mage_flow", mt);
+    try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
+}
+
+test "openaiEditFormToJson: OpenAI multipart becomes our edit request" {
+    const a = testing.allocator;
+    const CT = "multipart/form-data; boundary=X";
+    const form =
+        "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nmake it \"winter\"\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nAAA\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nmage-flow-edit\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n1\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\n1024x768\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"quality\"\r\n\r\nhigh\r\n" ++
+        "--X--\r\n";
+    const json = try openaiEditFormToJson(a, form, CT);
+    defer a.free(json);
+    // Must be real JSON (the prompt's quotes are the trap) and carry the fields
+    // handleImage reads.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings("edit", o.get("mode").?.string);
+    try testing.expectEqualStrings("make it \"winter\"", o.get("prompt").?.string);
+    try testing.expectEqualStrings("mage-flow-edit", o.get("model").?.string);
+    try testing.expectEqualStrings("1024x768", o.get("size").?.string);
+    try testing.expectEqualStrings("QUFB", o.get("image").?.string); // base64("AAA")
+    try testing.expect(o.get("ref_images") == null);
+
+    // Extra images become in-context references, in order.
+    const multi =
+        "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ncompose\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"a.png\"\r\n\r\nAAA\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"b.png\"\r\n\r\nBBB\r\n" ++
+        "--X--\r\n";
+    const j2 = try openaiEditFormToJson(a, multi, CT);
+    defer a.free(j2);
+    var p2 = try std.json.parseFromSlice(std.json.Value, a, j2, .{});
+    defer p2.deinit();
+    try testing.expectEqualStrings("QUFB", p2.value.object.get("image").?.string);
+    const refs = p2.value.object.get("ref_images").?.array;
+    try testing.expectEqual(@as(usize, 1), refs.items.len);
+    try testing.expectEqualStrings("QkJC", refs.items[0].string); // base64("BBB")
+
+    // `size=auto` is "you decide" — omitted so the edit path resolves from the
+    // reference instead of being pinned to a default square.
+    const auto = "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\np\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"size\"\r\n\r\nauto\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nAAA\r\n--X--\r\n";
+    const j3 = try openaiEditFormToJson(a, auto, CT);
+    defer a.free(j3);
+    try testing.expect(std.mem.indexOf(u8, j3, "\"size\"") == null);
+}
+
+test "openaiEditFormToJson: everything we can't honor is an explicit error" {
+    const a = testing.allocator;
+    const CT = "multipart/form-data; boundary=X";
+    const base = "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\np\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nAAA\r\n";
+    const cases = .{
+        .{ "Content-Disposition: form-data; name=\"mask\"; filename=\"m.png\"\r\n\r\nMMM", EditFormError.MaskUnsupported },
+        .{ "Content-Disposition: form-data; name=\"n\"\r\n\r\n4", EditFormError.MultipleChoicesUnsupported },
+        .{ "Content-Disposition: form-data; name=\"response_format\"\r\n\r\nurl", EditFormError.UrlResponseUnsupported },
+        .{ "Content-Disposition: form-data; name=\"output_format\"\r\n\r\njpeg", EditFormError.OutputFormatUnsupported },
+        .{ "Content-Disposition: form-data; name=\"stream\"\r\n\r\ntrue", EditFormError.StreamUnsupported },
+    };
+    inline for (cases) |c| {
+        const form = base ++ "--X\r\n" ++ c[0] ++ "\r\n--X--\r\n";
+        try testing.expectError(c[1], openaiEditFormToJson(a, form, CT));
+    }
+    // Missing required fields, and a body that isn't multipart at all.
+    try testing.expectError(EditFormError.MissingImage, openaiEditFormToJson(a, "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\np\r\n--X--\r\n", CT));
+    try testing.expectError(EditFormError.MissingPrompt, openaiEditFormToJson(a, "--X\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nAAA\r\n--X--\r\n", CT));
+    try testing.expectError(EditFormError.NotMultipart, openaiEditFormToJson(a, "{}", "application/json"));
+    // Over the reference cap → a named 400, not a truncated silent edit.
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(a);
+    try many.appendSlice(a, base);
+    for (0..MAX_EDIT_IMAGES) |_| try many.appendSlice(a, "--X\r\nContent-Disposition: form-data; name=\"image[]\"\r\n\r\nZZZ\r\n");
+    try many.appendSlice(a, "--X--\r\n");
+    try testing.expectError(EditFormError.TooManyImages, openaiEditFormToJson(a, many.items, CT));
+    // Every error has human text (no bare error names reaching a client).
+    inline for (@typeInfo(EditFormError).error_set.error_names.?) |name| {
+        try testing.expect(editFormErrorMessage(@field(EditFormError, name)).len > 10);
+    }
+}
+
+test "fitAspect keeps the reference's aspect at the requested pixel budget" {
+    // Square budget, 3:2 landscape reference → a 3:2 output of the same area,
+    // /16. Without this the edit backend resizes the reference INTO 1024² and
+    // hands back a squashed picture.
+    const l = fitAspect(3000, 2000, 1024, 1024);
+    try testing.expectEqual(@as(u32, 1248), l.w);
+    try testing.expectEqual(@as(u32, 832), l.h);
+    try testing.expect(@abs(@as(i64, l.w) * @as(i64, l.h) - 1024 * 1024) < 90_000); // ~same budget
+    // Portrait mirrors it.
+    const p = fitAspect(2000, 3000, 1024, 1024);
+    try testing.expectEqual(l.h, p.w);
+    try testing.expectEqual(l.w, p.h);
+    // A square reference is already the budget — untouched.
+    const s = fitAspect(512, 512, 1024, 1024);
+    try testing.expectEqual(@as(u32, 1024), s.w);
+    try testing.expectEqual(@as(u32, 1024), s.h);
+    // A non-square budget is an AREA, not a shape: a square ref squares it.
+    const nb = fitAspect(600, 600, 1536, 1024);
+    try testing.expectEqual(nb.w, nb.h);
+    // Degenerate dims fall back to the budget rather than dividing by zero.
+    const z = fitAspect(0, 0, 768, 512);
+    try testing.expectEqual(@as(u32, 768), z.w);
+    try testing.expectEqual(@as(u32, 512), z.h);
+    // "Match source" = the reference IS its own budget, so it round-trips to
+    // its own dimensions (this is how an edit with no `size` keeps the source's
+    // resolution — the reference pipeline's `max_size = source size` default).
+    for ([_][2]u32{ .{ 1152, 768 }, .{ 2048, 512 }, .{ 640, 1600 }, .{ 512, 512 } }) |wh| {
+        const same = fitAspect(wh[0], wh[1], wh[0], wh[1]);
+        try testing.expectEqual(wh[0], same.w);
+        try testing.expectEqual(wh[1], same.h);
+    }
+    // An off-grid source floors to /16 rather than erroring.
+    const odd = fitAspect(1153, 769, 1153, 769);
+    try testing.expectEqual(@as(u32, 0), odd.w % 16);
+    try testing.expectEqual(@as(u32, 0), odd.h % 16);
+}
+
+test "resolveEditTargetSize keeps the reference's aspect ABOVE the backend cap" {
+    // The bug this pins: `fitAspect` preserved the aspect and then the
+    // per-dimension clamp in `normalizeSize` threw it away again. A 12 MP 4:3
+    // phone photo on a SIZELESS edit (the plain
+    // `client.images.edit(image=…, prompt=…)` call) came back 2048x2048 —
+    // squared off, which is the one thing an editor must never do to its input.
+    const cap: u32 = 2048;
+    const cases = [_][2]u32{
+        .{ 4032, 3024 }, // 12 MP 4:3 landscape
+        .{ 3024, 4032 }, // and portrait
+        .{ 6000, 4000 }, // 24 MP 3:2 DSLR
+        .{ 8192, 8192 }, // huge square: scales, stays square
+    };
+    for (cases) |wh| {
+        const got = resolveEditTargetSize(wh[0], wh[1], wh[0], wh[1], cap);
+        try testing.expect(got.w <= cap and got.h <= cap);
+        try testing.expect(got.w % 16 == 0 and got.h % 16 == 0);
+        // And it must survive `normalizeSize` — that clamp is the step that
+        // actually reintroduced the squash.
+        const nz_w = clampKreaDim(got.w);
+        const nz_h = clampKreaDim(got.h);
+        const src_aspect = @as(f64, @floatFromInt(wh[0])) / @as(f64, @floatFromInt(wh[1]));
+        const out_aspect = @as(f64, @floatFromInt(nz_w)) / @as(f64, @floatFromInt(nz_h));
+        try testing.expect(@abs(src_aspect - out_aspect) / src_aspect < 0.02);
+    }
+    // Below the cap nothing moves: the existing sizeless round-trip is intact.
+    for ([_][2]u32{ .{ 1152, 768 }, .{ 2048, 512 }, .{ 512, 512 } }) |wh| {
+        const same = resolveEditTargetSize(wh[0], wh[1], wh[0], wh[1], cap);
+        try testing.expectEqual(wh[0], same.w);
+        try testing.expectEqual(wh[1], same.h);
+    }
+}
+
+test "maxDim matches what normalizeSize actually clamps to (drift guard)" {
+    // Two places encode the same ceiling. If someone widens a clamp and forgets
+    // maxDim, the edit path silently starts squashing again.
+    try testing.expectEqual(clampFluxDim(99999), ImageEngine.maxDimFor(.flux));
+    try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.krea));
+    try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.mage_flow));
 }
 
 test "Modality.mesh advertises the 3d capability" {

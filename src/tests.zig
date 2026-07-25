@@ -42,6 +42,7 @@ test {
     _ = @import("tts.zig");
     _ = @import("flux.zig");
     _ = @import("krea.zig");
+    _ = @import("mage_flow.zig");
     _ = @import("lora.zig");
     _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
@@ -57,6 +58,7 @@ test {
     _ = @import("rasterize.zig");
     _ = @import("texinpaint.zig");
     _ = @import("bake.zig");
+    _ = @import("multipart.zig");
     _ = @import("gen.zig");
     _ = @import("ollama.zig");
     _ = @import("cli.zig");

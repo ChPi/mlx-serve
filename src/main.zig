@@ -74,7 +74,7 @@ fn printUsage(io: std.Io) void {
         \\                      (every pulled model loads on demand by name)
         \\
         \\Options:
-        \\  --model <dir>       Path to MLX model directory (required)
+        \\  --model <dir>       Path to MLX model directory
         \\  --serve             Start HTTP server mode
         \\  --host <ip>         Bind address (default: 0.0.0.0)
         \\  --port <n>          Bind port (default: 11234)
@@ -685,6 +685,16 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--kv-attn-mode: expected 'dense' or 'fused'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else {
+            // Nothing above consumed it. This loop used to end here with no
+            // else at all, so an unrecognized argument was dropped in SILENCE
+            // — `--model=<path>` (the '='-joined form none of the arms match)
+            // booted a clean-looking headless server that then auto-picked
+            // some other model. A launcher that ignores what it was asked for
+            // is worse than one that refuses to start.
+            const reason = cli_mod.classifyUnparsedArg(args[i], i + 1 == args.len);
+            log.err("unrecognized argument '{s}' — {s}\n", .{ args[i], reason.hint() });
+            std.process.exit(1);
         }
     }
 
@@ -697,13 +707,18 @@ pub fn main(init: std.process.Init) !void {
         model_dir = d;
         serve_mode = true;
     }
-    if (use_default_models_root) {
-        serve_mode = true;
-        if (models_root == null) {
-            const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
-            default_models_root_storage = try cli_mod.modelsRootPath(allocator, home);
-            models_root = default_models_root_storage;
-        }
+    if (use_default_models_root) serve_mode = true;
+    // An unspecified `--model-dir` falls back to the shared models root that
+    // `pull`/`list`/the app already agree on. Gated so `--model <path> --serve`
+    // still serves exactly the one model it named (cli.shouldDefaultModelsRoot).
+    if (models_root == null and cli_mod.shouldDefaultModelsRoot(.{
+        .subcommand = use_default_models_root,
+        .serve_mode = serve_mode,
+        .has_explicit_model = model_dir.len > 0,
+    })) {
+        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        default_models_root_storage = try cli_mod.modelsRootPath(allocator, home);
+        models_root = default_models_root_storage;
     }
 
     // `mlx-serve run` on a TTY quiets logs to warn (unless --log-level was

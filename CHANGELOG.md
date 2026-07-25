@@ -1,5 +1,28 @@
 # Changelog
 
+## v26.7.11 — Mage-Flow image editing, a built-in console, faster MoE decode
+
+- **Mage-Flow runs natively.** Microsoft's Mage-Flow Turbo generates images in 4 steps, and Mage-Flow Edit Turbo edits them from reference images: no masks, no fine-tuning, just the picture and what you want changed. Point it at several references and it composes them ("put the object from image 2 into image 1"). Full native port like everything else here, no Python. 8-bit conversions are on Hugging Face at 8.5 GB for generation and 9.1 GB for editing, against 16 GB for the originals.
+- **Image editing in the app.** The Image tab takes a source image now, tells you the edit comes back at your picture's own size, and hides the knobs a distilled model ignores (Mage-Flow is fixed at 4 steps, so raising it only costs you time).
+- **Edit images with the OpenAI SDK.** `client.images.edit(image=..., prompt=...)` now works against mlx-serve, including repeated `image[]` for multi-reference edits. It reaches the same engine as everything else, so it works on any edit-capable model you have loaded (FLUX.2 or Mage-Flow Edit). Anything OpenAI accepts that we can't honor gets a named 400 rather than being quietly ignored: masks, `n` > 1, URL response format, non-PNG output, streaming.
+- **The server has a real console now.** Open its address in a browser (http://localhost:11234 by default) and you get a working chat against any model on the box, with history in the sidebar, a Monitor page showing what's loaded and the live metrics, and the full API reference. You can also just ask for things: "generate an image of a fox", attach a photo and say "make it winter", "write me a lo-fi track". It picks the right model for the job and shows the result inline, and it can answer questions about the server's own API.
+- **MoE coding models decode a lot faster.** A new in-place gather kernel for MoE decode reads the expert bank where it sits instead of paying for its size on every token. Laguna at 4-bit went from 37.0 to 55.5 tok/s on an M4 Max, and 2-bit is up 24%, both against the previous release.
+- **Bug fixes.**
+  - Image edits keep the source photo's shape instead of squashing it.
+  - Image generation no longer leaks memory (about 2.2 GB per megapixel).
+  - Qwen3-VL image preprocessing is correct, and image chats keep speculative decoding (#102).
+  - `/v1/images/edits` uses the model named in the form, not the default one.
+  - Unknown endpoints return 404 instead of "no model configured".
+  - A mistyped flag like `--model=/path` exits instead of being ignored.
+  - F16 checkpoints no longer crash on long prompts.
+  - `--pld` and its tuning flags are honored in headless mode (#95).
+  - `--ssm-checkpoint-stride` and `--ssm-checkpoint-max` are documented in `--help` (#96).
+  - Multipart uploads parse in any field order.
+  - Debug logging no longer dumps raw image bytes into the log file.
+  - Published model conversions are labelled quantized on Hugging Face, not fine-tunes.
+
+---
+
 ## v26.7.10 — Insanely fast, LAN Sharing, Sandbox Pi & Hermes with 1 click, Laguna support
 
 - **LAN model sharing.** Turn it on and every Mac on your network can use the models this Mac hosts, chat and image / speech / music / video / 3D generation alike. Macs find each other over Bonjour, shared models show up in every picker as "model · peer", requests stream to the Mac that has the model. Off by default, you pick what to share, and only inference is exposed (management & metrics stay private).

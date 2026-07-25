@@ -78,6 +78,7 @@ pub var g_lan_discover: bool = false;
 
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
+const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
 const cli_mod = @import("cli.zig");
@@ -499,6 +500,81 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
         return body[val_start..pos];
     }
     return null;
+}
+
+/// Every path `handleConnection` dispatches. Kept beside the chain rather than
+/// derived from it because one question has to be answerable BEFORE a model is
+/// resolved: does this endpoint exist at all?
+///
+/// Resolution runs ahead of dispatch, so without this an unknown path on a
+/// server with no default model returned 503 "No default model configured"
+/// instead of 404 — and a path's existence has nothing to do with model state.
+/// The drift guard is a test that reads the dispatch chain out of this file.
+const ROUTE_PATHS = [_][]const u8{
+    "/",
+    "/api/chat",
+    "/api/embed",
+    "/api/embeddings",
+    "/api/generate",
+    "/api/ps",
+    "/api/pull",
+    "/api/show",
+    "/api/tags",
+    "/api/version",
+    "/detokenize",
+    "/health",
+    "/metrics",
+    "/metrics.json",
+    "/props",
+    "/tokenize",
+    "/v1/3d/generations",
+    "/v1/audio/music-generations",
+    "/v1/audio/speech",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/images/edits",
+    "/v1/images/generations",
+    "/v1/load-model",
+    "/v1/messages",
+    "/v1/models",
+    "/v1/responses",
+    "/v1/responses/compact",
+    "/v1/unload-model",
+    "/v1/video/generations",
+};
+
+/// Is `path` an endpoint this server serves at all (any method)?
+fn routeExists(path: []const u8) bool {
+    // `/v1/responses/{id}` (GET/DELETE) is matched by prefix, not by a literal.
+    if (std.mem.startsWith(u8, path, "/v1/responses/")) return true;
+    for (ROUTE_PATHS) |p| if (std.mem.eql(u8, path, p)) return true;
+    return false;
+}
+
+/// The requested model id from a request body of EITHER shape.
+///
+/// Every endpoint we serve takes JSON except `/v1/images/edits`, which is
+/// `multipart/form-data` — and model resolution runs BEFORE that route
+/// translates the form to JSON, so a JSON-only scan reads no id and the request
+/// silently falls back to the default model. Live via Open WebUI (2026-07-25):
+/// an edit naming a Mage-Flow model ran against the default CHAT model and 400'd
+/// "Target model does not support this media modality"; on a headless boot with
+/// no default it 503'd "No default model configured" instead. Both existing edit
+/// tests boot with `--model <the image model>`, so the default was always the
+/// right one and neither could see it.
+///
+/// Every consumer of the requested id must go through here, so the LAN gate and
+/// dispatch can't disagree about which model a request names.
+pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]const u8 {
+    if (multipart.boundaryFromContentType(content_type)) |boundary| {
+        var it = multipart.Iterator.init(body, boundary) catch return null;
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part.name, "model") and part.data.len > 0) return part.data;
+        }
+        return null;
+    }
+    return parseModelFromBody(body);
 }
 
 /// Module-level capacity for plan 03 hot prefix cache. main.zig writes this
@@ -1317,6 +1393,10 @@ fn handleConnection(
     // Strip query string for route matching (e.g. /v1/messages?beta=true -> /v1/messages)
     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
+    // Needed before model resolution, not just at the handler: `/v1/images/edits`
+    // carries its model in a multipart FIELD, which only the content-type's
+    // boundary lets us find (`parseModelFromRequest`).
+    const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
@@ -1345,7 +1425,7 @@ fn handleConnection(
     //    non-loopback requests already died above and key-holders keep full
     //    access — so this gate only exists in keyless mode.
     if (lanGateApplies(stream)) {
-        if (lanShareDenial(g_lan.?, registry, method, path, request_body, isTunneledRequest(request[0..header_end_pos]))) |denial| {
+        if (lanShareDenial(g_lan.?, registry, method, path, request_body, request_content_type, isTunneledRequest(request[0..header_end_pos]))) |denial| {
             log.debug("{s} {s} -> 403 (lan: {s})\n", .{ method, path, denial });
             try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", denial, 403);
             return;
@@ -1366,6 +1446,18 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
+    }
+    // The console. It belongs here, above resolution, for the same reason
+    // /v1/models does: it IS the model picker, so it has to render before
+    // anything is loaded. Dispatched after resolution it rendered one
+    // *LoadedModel and a headless boot (`mlx-serve serve`, and every
+    // app-launched server) answered 503 "No default model configured" at the
+    // root — the first page a person opens. Everything it used to render from
+    // the model it now fetches from /v1/models + /props client-side.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
+        log.debug("GET  / -> 200 (console)\n", .{});
+        try handleStatusPage(allocator, stream);
         return;
     }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
@@ -1473,7 +1565,7 @@ fn handleConnection(
     // names like "gpt-4" or "claude-opus-4-x" expecting the local server to
     // just respond with whatever it has loaded; the multi-model registry's
     // strict-id semantics are opt-in by sending an id we registered.
-    var requested_model_id = parseModelFromBody(request_body) orelse "";
+    var requested_model_id = parseModelFromRequest(request_body, request_content_type) orelse "";
     // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
     //    its host byte-for-byte, model field rewritten to the bare id.
     //    Any DIRECT client may initiate the hop (loopback app, the
@@ -1540,6 +1632,15 @@ fn handleConnection(
                 try handlePropsNoModel(allocator, stream);
                 return;
             }
+            // An endpoint that doesn't exist is a 404 whether or not a model is
+            // loaded. Resolution runs ahead of dispatch, so without this an
+            // unknown path never reaches the chain's own 404 and reports "no
+            // model" — which reads to any endpoint-probing client as a
+            // catch-all server that implements everything.
+            if (!routeExists(path)) {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
+                return;
+            }
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
             return;
         },
@@ -1600,10 +1701,7 @@ fn handleConnection(
         return;
     }
 
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
-        log.debug("GET  / -> 200 (status page)\n", .{});
-        try handleStatusPage(allocator, stream, lm);
-    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
@@ -1654,6 +1752,19 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .image);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/edits")) {
+        // OpenAI's image-EDIT surface: multipart/form-data, not JSON. Translated
+        // into the `/v1/images/generations` edit body (gen.openaiEditFormToJson)
+        // and served by the identical path — no second inference route.
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const ct = findHeaderValue(request[0..header_end], "content-type") orelse "";
+        const body = request[header_end + 4 .. total_read];
+        const json = media_mod.openaiEditFormToJson(allocator, body, ct) catch |err| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", media_mod.editFormErrorMessage(err), 400);
+            return;
+        };
+        defer allocator.free(json);
+        try handleGen(allocator, stream, json, lm, .image);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -3269,97 +3380,44 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-/// Render the human-friendly landing page at `GET /`. Lists the API
-/// surface (OpenAI Chat + Responses, Anthropic Messages, embeddings,
-/// utility endpoints) and the loaded model's key facts. No JS, no
-/// external assets — single self-contained document.
-fn handleStatusPage(
-    allocator: std.mem.Allocator,
-    stream: *Conn,
-    lm: *LoadedModel,
-) !void {
-    const config = lm.config.?;
-    const chat_config = lm.chat_config.?;
-
-    // Memory + capabilities
-    var active_mem: usize = 0;
-    var peak_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
-    _ = mlx.mlx_get_peak_memory(&peak_mem);
-    const ctx_len = getEffectiveContextLength(config);
-    const has_chat = readyHasChat(
-        config.is_encoder_only,
-        chat_config.chat_template.len,
-        lm.ds4_engine != null or lm.llama_engine != null,
-    );
-    const has_vision = lm.vision_encoder != null;
-    const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
-
-    const model_id: []const u8 = if (lm.id.len > 0) lm.id else config.model_type;
-    const model_id_esc = try htmlEscape(allocator, model_id);
-    defer allocator.free(model_id_esc);
-    const arch_esc = try htmlEscape(allocator, config.model_type);
-    defer allocator.free(arch_esc);
+/// Render the built-in console at `GET /`: a chat playground, image
+/// generate/edit and audio tools, the live metrics panel, and the full API
+/// reference. Self-contained — no external assets, no CDN.
+///
+/// Takes NO model. Everything model-shaped (the picker, capabilities, memory)
+/// is fetched client-side from `/v1/models` + `/props`, which is what lets the
+/// page render on a server with nothing loaded — the default boot mode — and
+/// what makes the picker follow loads/unloads without a refresh.
+fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     const version_esc = try htmlEscape(allocator, build_options.version);
     defer allocator.free(version_esc);
 
-    // Capability pills
-    var caps_buf = std.ArrayList(u8).empty;
-    defer caps_buf.deinit(allocator);
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>chat</span>");
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>tool use</span>");
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>streaming</span>");
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>json schema</span>");
-    if (has_vision) try caps_buf.appendSlice(allocator, "<span class=cap>vision</span>");
-    if (has_reasoning) try caps_buf.appendSlice(allocator, "<span class=cap>reasoning</span>");
-    if (config.is_encoder_only) try caps_buf.appendSlice(allocator, "<span class=cap>embeddings</span>");
-
-    const mem_mb: usize = active_mem / (1024 * 1024);
-    const peak_mb: usize = peak_mem / (1024 * 1024);
-
     // Optional live-metrics panel: a mount div + the polling script (which also
-    // carries the panel markup and injects it into the mount). Rendered into the
-    // `{s}` slot right after the "Loaded model" card — but ONLY when --metrics is
-    // on. Off ⇒ empty string, so the page is byte-identical to before. This is a
-    // runtime `{s}` arg, so the JS may contain raw `{`/`}` — std.fmt does not
-    // re-parse it (which is exactly why the panel/JS can't live inline in the
-    // std.fmt-formatted index.html).
+    // carries the panel markup and injects it into the mount). Rendered into
+    // the header's `{s}` slot — but ONLY when --metrics is on; off ⇒ empty
+    // string, so nothing polls a 503 feed.
     const METRICS_SECTION = "\n<div id=mlx-metrics></div>\n<script>\n" ++ @embedFile("html/metrics.js") ++ "\n</script>\n";
     const metrics_section: []const u8 = if (g_metrics != null) METRICS_SECTION else "";
 
-    // The page template lives in src/html/index.html (@embedFile resolves
-    // relative to this source file, so no build.zig change). It is a std.fmt
-    // format string: `{{`/`}}` are literal braces in the <style> block; the
-    // `{s}`/`{d}` slots below fill in model fields, the metrics section, the
-    // curl port + model, and the footer — in this exact order.
+    // The page lives in src/html/index.html (@embedFile resolves relative to
+    // this source file, so no build.zig change) and is a std.fmt FORMAT
+    // STRING: every literal `{`/`}` in it must be doubled. That is exactly why
+    // the CSS and JS are separate files injected as RUNTIME `{s}` args —
+    // std.fmt does not re-parse a runtime argument, so app.css/app.js/
+    // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
     const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
-        // <title>
-        model_id_esc,
-        // version
+        // <title> version
         version_esc,
-        // model card
-        model_id_esc,
-        arch_esc,
-        config.quant_bits,
-        config.quant_group_size,
-        config.num_hidden_layers,
-        config.hidden_size,
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.head_dim,
-        config.vocab_size,
-        ctx_len,
-        config.max_position_embeddings,
-        mem_mb,
-        peak_mb,
-        caps_buf.items,
+        // <style> — src/html/app.css
+        @embedFile("html/app.css"),
+        // header version
+        version_esc,
         // optional live-metrics panel (empty when --metrics is off)
         metrics_section,
-        // curl example
+        // curl example port
         global_port,
-        model_id_esc,
-        // footer
-        model_id_esc,
+        // <script> — src/html/app.js
+        @embedFile("html/app.js"),
     });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "text/html; charset=utf-8", body);
@@ -6326,13 +6384,42 @@ fn logHttpSseData(data: []const u8) void {
     logHttpBody("[http] sse data", data);
 }
 
+/// Cap on how much of a BINARY body reaches the debug log.
+const BODY_LOG_LIMIT = 4096;
+
+/// True when every byte is printable or ordinary whitespace. Multibyte UTF-8
+/// (≥0x80) counts as text, so an emoji in a chat body doesn't demote it.
+fn bodyIsText(body: []const u8) bool {
+    for (body) |c| {
+        if (c == '\n' or c == '\r' or c == '\t') continue;
+        if (c < 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
+/// Bounded, strictly-printable view of a body, copied into `out`.
+fn bodyPreview(out: []u8, body: []const u8) []const u8 {
+    const n = @min(@min(body.len, out.len), BODY_LOG_LIMIT);
+    for (body[0..n], 0..) |c, i| {
+        out[i] = if (c == '\n' or c == '\r' or c == '\t' or (c >= 0x20 and c < 0x7f)) c else '.';
+    }
+    return out[0..n];
+}
+
 fn logHttpBody(label: []const u8, body: []const u8) void {
     if (body.len == 0) return;
-    log.debug("{s} ({d}b):\n{s}\n", .{
-        label,
-        body.len,
-        body,
-    });
+    // Text bodies go out WHOLE — reading a full request body out of the debug
+    // log is the documented way to reproduce a tool-calling bug.
+    if (bodyIsText(body)) {
+        log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, body });
+        return;
+    }
+    // Binary is a different story. `/v1/images/edits` is multipart, so one image
+    // upload wrote raw PNG bytes into the log, and a body near the 64 MB request
+    // cap blew through the 32 MB rotation — taking the post-mortem file with it.
+    var buf: [BODY_LOG_LIMIT]u8 = undefined;
+    const preview = bodyPreview(&buf, body);
+    log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
 }
 
 const GaugeSamplerCtx = struct {
@@ -6419,6 +6506,25 @@ fn findContentLength(headers: []const u8) ?usize {
     return null;
 }
 
+/// Case-insensitive header lookup returning the trimmed VALUE (`Content-Type`
+/// carries the multipart boundary, so `/v1/images/edits` can't be parsed from
+/// the body alone like every other endpoint).
+fn findHeaderValue(headers: []const u8, comptime name_lower: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len <= name_lower.len or line[name_lower.len] != ':') continue;
+        var match = true;
+        for (0..name_lower.len) |j| {
+            if (std.ascii.toLower(line[j]) != name_lower[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return std.mem.trim(u8, line[name_lower.len + 1 ..], " \t");
+    }
+    return null;
+}
+
 // ── API-key auth helpers (used only when --api-key / g_api_key is set) ──
 
 /// True if the connection's peer is a loopback address (127.0.0.0/8, ::1, or an
@@ -6466,13 +6572,13 @@ fn isTunneledRequest(raw_headers: []const u8) bool {
 /// The effective model resolves exactly like dispatch will (unknown/absent
 /// ids fall back to the default model), so the gate can never disagree with
 /// what would actually run.
-fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8, tunneled: bool) ?[]const u8 {
+fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8, content_type: []const u8, tunneled: bool) ?[]const u8 {
     switch (lan_mod.routeClass(method, path)) {
         .open => return null,
         .denied => return "This endpoint is host-local; LAN sharing exposes inference on shared models only",
         .model_gated => {},
     }
-    const mid = parseModelFromBody(body) orelse "";
+    const mid = parseModelFromRequest(body, content_type) orelse "";
     if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model
@@ -6689,29 +6795,148 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     }
 
     // Open routes pass with no model check; host-local ones are denied.
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}", false) != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "", false) != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}", "application/json", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "", "application/json", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "", "application/json", false) != null);
 
     // Shared model allowed; unshared denied — on chat AND media surfaces.
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}", false) != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}", "application/json", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}", "application/json", false) != null);
 
     // Omitted / unknown ids resolve to the default model exactly like
     // dispatch will — here the default is shared, so both pass.
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", "application/json", false) == null);
 
     // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
     // the old blanket deny also 403'd the agent-sandbox guest, which reaches
     // this host over the VM NAT interface (live 2026-07-21). A request that
     // ARRIVED through a peer's tunnel never hops again (the multi-hop bound).
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", true) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", "application/json", true) != null);
+
+    // `/v1/images/edits` is model_gated but its body is multipart, so a
+    // JSON-only scan reads NO id and every edit silently gets default-model
+    // semantics — the gate would then disagree with what dispatch runs, which
+    // is the one thing this function promises it never does.
+    const mp_ct = "multipart/form-data; boundary=B";
+    const mp_unshared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nqwen3.6-27b\r\n--B--\r\n";
+    const mp_shared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngemma-4-e4b-it-4bit\r\n--B--\r\n";
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_unshared, mp_ct, false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
+}
+
+test "routeExists answers endpoint existence without consulting the model" {
+    // Whether a path EXISTS has nothing to do with which models are loaded, but
+    // model resolution runs ahead of dispatch — so on a headless boot (`--serve
+    // --model-dir`, no `--model`, how the app always launches) an unknown path
+    // never reached the 404 branch and came back 503 "No default model
+    // configured". Any client that maps endpoints by probing them then concludes
+    // the server implements EVERYTHING (llmprobe: "server answers unknown paths
+    // with HTTP 503" → every surface scored absent, live 2026-07-25).
+    try std.testing.expect(routeExists("/v1/chat/completions"));
+    try std.testing.expect(routeExists("/v1/images/edits"));
+    try std.testing.expect(routeExists("/v1/embeddings"));
+    try std.testing.expect(routeExists("/health"));
+    // `/v1/responses/{id}` is served by prefix, not by an exact literal.
+    try std.testing.expect(routeExists("/v1/responses/resp_abc123"));
+    try std.testing.expect(routeExists("/v1/responses/compact"));
+
+    try std.testing.expect(!routeExists("/v1/__llmprobe_no_such_endpoint__"));
+    try std.testing.expect(!routeExists("/v1/audio/transcriptions")); // real OpenAI route we don't serve
+    try std.testing.expect(!routeExists("/nope"));
+    try std.testing.expect(!routeExists(""));
+}
+
+test "ROUTE_PATHS covers every path the dispatch chain compares (drift guard)" {
+    // Two lists that must agree is the drift class this file already warns about
+    // elsewhere. Rather than trust a comment, read the dispatch chain itself: a
+    // new path-equality arm that nobody adds to ROUTE_PATHS makes that endpoint
+    // a 404 on a headless server — the exact failure this table exists to
+    // prevent, inverted. (This test scans for the literal call form, so don't
+    // write one inside a comment: it would be scanned like real code.)
+    const src = @embedFile("server.zig");
+    const needle = "std.mem.eql(u8, path, \"";
+    var i: usize = 0;
+    var checked: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
+        const start = at + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, src, start, '"') orelse break;
+        const literal = src[start..end];
+        i = end;
+        checked += 1;
+        if (!routeExists(literal)) {
+            std.debug.print("dispatched path missing from ROUTE_PATHS: {s}\n", .{literal});
+            return error.RoutePathNotRegistered;
+        }
+    }
+    // The scan itself must not silently find nothing.
+    try std.testing.expect(checked >= 30);
+}
+
+test "the index page documents every endpoint the server serves (drift guard)" {
+    // The API reference on `GET /` is hand-written prose, so it drifts the
+    // moment a route ships without someone remembering the page: it documented
+    // 22 of 31 endpoints and had silently omitted the ENTIRE Ollama `/api/*`
+    // surface (nine paths) since that surface was added. "Are we missing
+    // endpoints?" has to be a test, not an inspection.
+    //
+    // Same shape as the ROUTE_PATHS↔dispatch-chain guard above: two lists that
+    // must agree, checked against the file rather than trusted.
+    const page = @embedFile("html/index.html");
+    for (ROUTE_PATHS) |p| {
+        // "/" is the page itself — trivially present and not worth documenting
+        // as an endpoint row.
+        if (std.mem.eql(u8, p, "/")) continue;
+        if (std.mem.indexOf(u8, page, p) == null) {
+            std.debug.print("endpoint missing from the index page: {s}\n", .{p});
+            return error.EndpointNotDocumented;
+        }
+    }
+}
+
+test "parseModelFromRequest reads the model out of a multipart form, not just JSON" {
+    // `/v1/images/edits` is the ONE endpoint whose body is multipart, and model
+    // resolution runs BEFORE the route translates that form to JSON. A JSON-only
+    // scan finds no `"model":` key, so the request silently ran against the
+    // DEFAULT model: live via Open WebUI (2026-07-25) an edit naming a Mage-Flow
+    // model hit the default chat model and 400'd "Target model does not support
+    // this media modality"; headless with no default it 503'd instead.
+    const ct = "multipart/form-data; boundary=abc123";
+    // aiohttp (Open WebUI's client) writes the scalar fields first, each with
+    // its own Content-Type line, and the file part last.
+    const body =
+        "--abc123\r\nContent-Type: text/plain; charset=utf-8\r\n" ++
+        "Content-Disposition: form-data; name=\"model\"\r\n\r\nddalcu/Mage-Flow-Edit-Turbo-MLX-Serve-8bit\r\n" ++
+        "--abc123\r\nContent-Type: text/plain; charset=utf-8\r\n" ++
+        "Content-Disposition: form-data; name=\"prompt\"\r\n\r\nmake it winter\r\n" ++
+        "--abc123\r\nContent-Disposition: form-data; name=\"image\"; filename=\"i.png\"\r\n" ++
+        "Content-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n\x00\r\n--abc123--\r\n";
+    try std.testing.expectEqualStrings(
+        "ddalcu/Mage-Flow-Edit-Turbo-MLX-Serve-8bit",
+        parseModelFromRequest(body, ct) orelse "",
+    );
+
+    // A form with no `model` part is "use the default", same as JSON.
+    const no_model = "--abc123\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n--abc123--\r\n";
+    try std.testing.expect(parseModelFromRequest(no_model, ct) == null);
+    // An empty value is not an id either (aiohttp sends str(None) as "None",
+    // but an unset field arrives empty).
+    const empty = "--abc123\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n\r\n--abc123--\r\n";
+    try std.testing.expect(parseModelFromRequest(empty, ct) == null);
+
+    // JSON bodies are untouched — same answers as the JSON-only scanner, for
+    // every other endpoint we serve.
+    try std.testing.expectEqualStrings("m1", parseModelFromRequest("{\"model\":\"m1\"}", "application/json") orelse "");
+    try std.testing.expectEqualStrings("m1", parseModelFromRequest("{\"model\":\"m1\"}", "") orelse "");
+    try std.testing.expect(parseModelFromRequest("{\"prompt\":\"x\"}", "application/json") == null);
+    // A multipart content-type with a JSON body (or a truncated form) degrades
+    // to "no id" rather than misreading one.
+    try std.testing.expect(parseModelFromRequest("{\"model\":\"m1\"}", ct) == null);
 }
 
 test "isTunneledRequest keys on the lan.tunnel marker header, case-insensitive" {
@@ -11425,6 +11650,39 @@ test "findContentLength case insensitive" {
 test "findContentLength returns null when missing" {
     try testing.expect(findContentLength("Host: localhost\r\nAccept: */*") == null);
     try testing.expect(findContentLength("") == null);
+}
+
+test "debug body log bounds BINARY but never truncates text (multipart PNG class)" {
+    // `/v1/images/edits` is the first binary body we serve. `logHttpBody` dumped
+    // whatever it got verbatim, so at --log-level debug one image upload wrote
+    // raw PNG bytes into the log — and a body near the 64 MB request cap blew
+    // straight through the 32 MB rotation, taking the post-mortem file with it.
+    //
+    // Text bodies must stay WHOLE: reading a full request body out of the debug
+    // log is the documented way to reproduce a tool-calling bug.
+    try testing.expect(bodyIsText("{\"model\":\"x\",\"prompt\":\"hi\"}"));
+    try testing.expect(bodyIsText("multi\nline\twith\r\nwhitespace"));
+    try testing.expect(bodyIsText("utf8 stays text: é ✓ 🎉")); // multibyte, not control
+    try testing.expect(!bodyIsText("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
+    // The real shape: text multipart framing wrapped around a binary payload.
+    try testing.expect(!bodyIsText("--B\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\n\x89PNG\x00\x01\r\n--B--"));
+
+    // A binary preview is bounded AND strictly printable ASCII.
+    var buf: [64]u8 = undefined;
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\xffbinary tail";
+    const p = bodyPreview(&buf, png);
+    try testing.expect(p.len <= buf.len);
+    for (p) |c| try testing.expect(c == '\n' or c == '\r' or c == '\t' or (c >= 0x20 and c < 0x7f));
+
+    // Larger than the sink → truncated, never streamed.
+    const big = try testing.allocator.alloc(u8, 1024 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    try testing.expectEqual(@as(usize, buf.len), bodyPreview(&buf, big).len);
+    // The cap is the SMALLER of the caller's buffer and the byte limit, so a
+    // generous buffer can't reintroduce the megabyte dump.
+    var huge: [BODY_LOG_LIMIT * 2]u8 = undefined;
+    try testing.expectEqual(@as(usize, BODY_LOG_LIMIT), bodyPreview(&huge, big).len);
 }
 
 test "extractJsonField extracts array" {
