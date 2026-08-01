@@ -533,10 +533,15 @@ pub const Generator = struct {
     pld_attempted: u64 = 0,
     pld_accepted_tokens: u64 = 0,
     /// DeepSeek-V4 DSpark: init armed the native block-parallel draft mode
-    /// (dsv4 checkpoint shipping mtp.* stages + a clean-greedy request).
+    /// (dsv4 checkpoint shipping mtp.* stages + a clean request).
     /// Mutually exclusive with pld/drafter/mtp by the chokepoint's
     /// construction; `nextDspark` declines to the serial step when false.
     dspark_enabled: bool = false,
+    /// Sampled-request acceptance (the MTP one-hot Leviathan rule over
+    /// filtered target probs) instead of raw argmax equality. Set by the
+    /// chokepoint when the request samples (temp ≥ 0.01, top_k ≠ 1) and the
+    /// stochastic arm isn't env-killed; meaningless unless `dspark_enabled`.
+    dspark_stochastic: bool = false,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
 
@@ -1007,6 +1012,45 @@ pub const Generator = struct {
         return lookup_prompt orelse prompt_ids;
     }
 
+    /// Which DSpark accept rule (if any) the dsv4 chokepoint may arm for a
+    /// request. Pure over its inputs so every arm is unit-testable.
+    pub const DsparkArm = enum { off, greedy, stochastic };
+
+    /// `clean` = nothing consumes logits beyond plain sampling: penalties,
+    /// grammar and logprobs stay serial on BOTH arms (matching the greedy-only
+    /// contract this generalizes). A clean greedy request (temp < 0.01 or
+    /// top_k == 1) gets the raw argmax-equality accept; a clean SAMPLED
+    /// request gets the stochastic arm (MTP one-hot Leviathan acceptance over
+    /// filtered target probs) unless `stoch_enabled` is false — the
+    /// MLX_SERVE_DSV4_DSPARK_STOCH=0 kill switch, which restores greedy-only
+    /// gating.
+    pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32, stoch_enabled: bool) DsparkArm {
+        const clean = sampling.repeat_penalty == 1.0 and
+            sampling.presence_penalty == 0.0 and
+            sampling.constraint == null and
+            logprobs_n == 0;
+        if (!clean) return .off;
+        const greedy = sampling.temperature < 0.01 or sampling.top_k == 1;
+        if (greedy) return .greedy;
+        return if (stoch_enabled) .stochastic else .off;
+    }
+
+    /// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
+    /// restores the greedy-only chokepoint gate for A/Bs.
+    var dspark_stoch_cache: ?bool = null;
+    pub fn dsparkStochEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
+    fn dsparkStochEnabled() bool {
+        if (dspark_stoch_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |p| std.mem.span(p) else null;
+        const on = dsparkStochEnabledFromEnv(raw);
+        dspark_stoch_cache = on;
+        return on;
+    }
+
     pub fn initWithOptions(
         io: std.Io,
         allocator: std.mem.Allocator,
@@ -1029,24 +1073,31 @@ pub const Generator = struct {
         // about).
         var options = options_in;
         var dspark_active = false;
+        var dspark_stochastic = false;
         if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled)) {
             // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
             // snapshot rollback inside deepseek_v4.zig) may engage when the
-            // checkpoint ships stages and the request is clean greedy — the
-            // accept rule is raw argmax equality, so any logit-modifying
-            // sampling (penalties, grammar, logprobs) stays serial. PLD /
-            // drafter / qwen-MTP remain hard-off regardless: their verify
-            // forwards go through machinery this arch cannot roll back.
+            // checkpoint ships stages and the request is CLEAN (no
+            // penalties, grammar or logprobs — those consume logits the
+            // draft path never shapes and stay serial). Greedy requests get
+            // the raw argmax-equality accept; sampled requests get the
+            // stochastic arm (MTP one-hot Leviathan acceptance over the
+            // request's own filtered probs — the agent-default temp 0.6
+            // traffic that otherwise always ran serial), env-killable via
+            // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
+            // remain hard-off regardless: their verify forwards go through
+            // machinery this arch cannot roll back.
             const mdl_ds = xfm.dsv4.?;
             const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
-            const greedy_clean = (sampling.temperature < 0.01 or sampling.top_k == 1) and
-                sampling.repeat_penalty == 1.0 and
-                sampling.presence_penalty == 0.0 and
-                sampling.constraint == null and
-                options.logprobs_n == 0;
-            if (mdl_ds.n_mtp > 0 and !dspark_env_off and greedy_clean) {
+            const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+            if (mdl_ds.n_mtp > 0 and !dspark_env_off and arm != .off) {
                 dspark_active = true;
-                log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                dspark_stochastic = arm == .stochastic;
+                if (dspark_stochastic) {
+                    log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                } else {
+                    log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+                }
             } else {
                 log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
             }
@@ -1607,6 +1658,7 @@ pub const Generator = struct {
                 .prompt_ids_alloc = allocator,
                 .pld_enabled = pld_active,
                 .dspark_enabled = dspark_active,
+                .dspark_stochastic = dspark_stochastic,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .mtp = if (mtp_active) options.mtp else null,
@@ -1965,7 +2017,10 @@ pub const Generator = struct {
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
         const mdl = self.xfm.dsv4.?;
         const t1 = self.next_token_id;
-        var round = try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1);
+        var round = if (self.dspark_stochastic)
+            try self.dsparkStochasticRound(allocator, mdl, t1)
+        else
+            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1);
         errdefer round.deinit(allocator);
         // dsparkRound advanced the module state — mirror it on the shell
         // cache verbatim so a later serial fallback (or the fresh-request
@@ -1979,6 +2034,97 @@ pub const Generator = struct {
         self.next_token_id = round.next_token;
         // tokens ownership transfers to the caller (scheduler frees).
         return DrafterStepResult{ .tokens = round.tokens, .accepted_tokens = round.accepted };
+    }
+
+    /// One stochastic DSpark round: dsv4's own greedy stage draft (a one-hot
+    /// proposal) verified with the MTP acceptance machinery — filtered target
+    /// probs at EVERY verify position (`probsAllPositions`, the request's own
+    /// temperature/top-k/top-p), accept draft k with prob `min(1, p_k)`,
+    /// first reject at `a` corrected from `normalize(max(p_a − onehot, 0))`,
+    /// full accept sampled from the bonus row — corrections pre-sampled in
+    /// ONE batched graph (`mtpBatchedAcceptGraph`, one-hot arm) so the round
+    /// pays ONE bounded sync. The output distribution equals serial sampling
+    /// (the toy-vocab exactness test's invariant), and the correction always
+    /// derives from the ORIGINAL verify logits at the acceptance point — the
+    /// house partial-accept invariant in sampled form.
+    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32) !dsv4_mod.DsparkRound {
+        const s = self.xfm.s;
+        var pending = try dsv4_mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
+        defer pending.deinit();
+        const b: u32 = @intCast(pending.b);
+
+        // Filtered target probs over every verify row: [b+1, V] → [1, b+1, V].
+        const vshape = [_]c_int{ 1, @intCast(pending.b + 1), @intCast(mdl.vocab) };
+        var vl3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vl3);
+        try mlx.check(mlx.mlx_reshape(&vl3, pending.vl_g, &vshape, 3, s));
+        const probs_all = try probsAllPositions(vl3, self.sampling, s);
+        defer _ = mlx.mlx_array_free(probs_all);
+
+        var accepted: u32 = 0;
+        var next_token: u32 = undefined;
+        if (b == 0) {
+            // The confidence gate submitted nothing: this round verifies t1
+            // alone and row 0 IS the bonus row — sample the next trunk token
+            // from it directly.
+            var log_p = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(log_p);
+            try mlx.check(mlx.mlx_log(&log_p, probs_all, s));
+            const null_key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(null_key);
+            var sampled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sampled);
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, null_key, s));
+            var samp_i = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(samp_i);
+            try mlx.check(mlx.mlx_astype(&samp_i, sampled, .int32, s));
+            try mlx.check(mlx.mlx_array_eval(samp_i));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, samp_i));
+            next_token = @intCast(v);
+        } else {
+            // [1] int32 arrays of the draft ids (already realized host values
+            // — dsv4 drafts synchronously, unlike the MTP head's lazy chain).
+            var draft_arrs: [16]mlx.mlx_array = undefined;
+            var n_arrs: usize = 0;
+            defer for (draft_arrs[0..n_arrs]) |arr| {
+                _ = mlx.mlx_array_free(arr);
+            };
+            const idshape = [_]c_int{1};
+            for (0..pending.b) |k| {
+                const idv = [_]i32{@intCast(pending.verify[k + 1])};
+                draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
+                n_arrs += 1;
+            }
+            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, s);
+            defer bg.deinit();
+
+            // ONE bounded sync: the accept vector + pre-sampled corrections
+            // (and the whole verify graph beneath them) in one batched eval.
+            {
+                const ev = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(ev);
+                _ = mlx.mlx_vector_array_append_value(ev, bg.accept_p);
+                _ = mlx.mlx_vector_array_append_value(ev, bg.corr_samples);
+                try mlx.check(mlx.mlx_async_eval(ev));
+            }
+            try mlx.check(mlx.mlx_array_eval(bg.accept_p));
+            const p_data = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.MlxArrayDataNull;
+            while (accepted < b) {
+                const accept_prob: f32 = @min(1.0, p_data[accepted]);
+                const u: f32 = self.prng.random().float(f32);
+                if (u >= accept_prob) break;
+                accepted += 1;
+            }
+            try mlx.check(mlx.mlx_array_eval(bg.corr_samples));
+            const corr = mlx.mlx_array_data_int32(bg.corr_samples) orelse return error.MlxArrayDataNull;
+            next_token = @intCast(corr[accepted]);
+        }
+        pending.lapVerify(mdl);
+
+        const round = try dsv4_mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
+        dsv4_mod.dsparkObserve(mdl, round.phases);
+        return round;
     }
 
     pub fn nextPld(
@@ -8425,4 +8571,158 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
         }
         std.debug.print("dsv4 nextDspark (generator): first_div={d}/{d}, rounds={d}, accepts={d}\n", .{ first_div, want, gen.dspark_attempted, gen.dspark_accepted_tokens });
     }
+}
+
+test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill switch restores greedy-only" {
+    // Greedy clean → the argmax-equality arm (temp 0 or top_k 1), with or
+    // without the stochastic arm enabled.
+    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.0 }, 0, true));
+    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_k = 1 }, 0, true));
+    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.0 }, 0, false));
+    // Sampled clean → stochastic (the checkpoint-default temp 0.6 agent
+    // shape: pi and friends omit temperature, generation_config fills 0.6).
+    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_p = 0.95 }, 0, true));
+    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 1.0, .top_k = 40 }, 0, true));
+    // Kill switch: sampled requests fall back to serial-only.
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_p = 0.95 }, 0, false));
+    // Penalties / grammar / logprobs stay serial on BOTH arms — the
+    // pre-stochastic contract, unchanged.
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0, true));
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .presence_penalty = 0.5 }, 0, true));
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6 }, 5, true));
+    var c: Constraint = undefined;
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .constraint = &c }, 0, true));
+    // Env parser: unset/empty/anything-but-0 → on, "0" → off.
+    try testing.expect(Generator.dsparkStochEnabledFromEnv(null));
+    try testing.expect(Generator.dsparkStochEnabledFromEnv(""));
+    try testing.expect(Generator.dsparkStochEnabledFromEnv("1"));
+    try testing.expect(!Generator.dsparkStochEnabledFromEnv("0"));
+}
+
+test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit invariant (DSV4_MINI)" {
+    // The motivating traffic shape: the checkpoint ships generation_config
+    // temp 0.6 and agent CLIs omit temperature, so every real agent request
+    // ran serial while only pinned `--temp 0` earned DSpark. The stochastic
+    // arm ports the MTP probsAllPositions acceptance (one-hot Leviathan over
+    // filtered target probs) onto dsv4's own draft stages. Engagement is
+    // COUNTED (dspark_attempted) — a silent serial fallback emits perfectly
+    // plausible tokens.
+    _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    if (mlx.noGpuBackend()) return;
+    const path = std.mem.span(path_z);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
+    defer allocator.free(cfg_path);
+    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    file.close(io);
+    defer allocator.free(cfg_json);
+    const cfg = try model_mod.parseConfigFromJson(allocator, cfg_json);
+    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
+    defer allocator.free(shard_path);
+    var weights = try model_mod.loadWeightsSingleFile(allocator, shard_path);
+    defer weights.deinit();
+
+    // Never read by the Generator (stored only) — see the field comment.
+    var tok_dummy: Tokenizer = undefined;
+
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*v, i| v.* = @intCast(i);
+    // The agent-default request shape, seeded so the run is reproducible.
+    const sampled = SamplingParams{ .temperature = 0.6, .top_p = 0.95, .seed = 0xD54A };
+
+    // The kill-switch cache is process-global (set at first chokepoint use),
+    // so honor whatever env this test binary was LAUNCHED with and assert
+    // the matching behavior — that makes the `MLX_SERVE_DSV4_DSPARK_STOCH=0`
+    // run a real test of the fallback, not a skip.
+    const stoch_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |p| std.mem.span(p) else null;
+    const stoch_on = Generator.dsparkStochEnabledFromEnv(stoch_raw);
+
+    var xfm = try Transformer.init(io, allocator, cfg, &weights);
+    defer xfm.deinit();
+    var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 64, sampled, &.{}, .{
+        .pld_enabled = true,
+        .mtp_enabled = true,
+        .skip_lazy_preforward = true,
+        .lookup_prompt = &prompt,
+    });
+    defer gen.deinit(allocator);
+
+    if (!stoch_on) {
+        // Kill-switch arm: the chokepoint declines the sampled request and
+        // nextDspark serves the defensive serial step.
+        try testing.expect(!gen.dspark_enabled);
+        const r = (try gen.nextDspark(allocator)) orelse return error.TestExpectedResult;
+        defer allocator.free(r.tokens);
+        try testing.expectEqual(@as(usize, 1), r.tokens.len);
+        try testing.expectEqual(@as(u64, 0), gen.dspark_attempted);
+        return;
+    }
+
+    try testing.expect(gen.dspark_enabled);
+    try testing.expect(gen.dspark_stochastic);
+
+    const mdl = xfm.dsv4.?;
+    const want: usize = 10;
+    var n: usize = 0;
+    while (n < want) {
+        const t1 = gen.next_token_id;
+        const r = (try gen.nextDspark(allocator)) orelse break;
+        defer allocator.free(r.tokens);
+        try testing.expect(r.tokens.len >= 1);
+        try testing.expectEqual(t1, r.tokens[0]);
+        try testing.expect(r.accepted_tokens <= mdl.ds_block);
+        for (r.tokens) |tok| {
+            try testing.expect(tok < mdl.vocab);
+            n += 1;
+        }
+        // Module state and the shell-cache mirror stay in lockstep with
+        // exactly what was committed (the v2 spec exit invariant).
+        try testing.expectEqual(prompt.len + n, mdl.dec_state.?.n);
+        try testing.expectEqual(mdl.dec_state.?.n, gen.ctx.cache.step);
+    }
+    try testing.expect(n >= want);
+    // ENGAGEMENT: count rounds, never output shape.
+    try testing.expect(gen.dspark_attempted >= 1);
+    // Exit invariant survives a hand-off: a following serial step decodes a
+    // valid token (finite logits) from the state the rounds left behind.
+    const t = (try gen.next(allocator)) orelse return error.TestExpectedResult;
+    try testing.expect(t < mdl.vocab);
+    std.debug.print("dsv4 stochastic dspark (generator): {d} tokens over {d} rounds, {d} drafts accepted\n", .{ n, gen.dspark_attempted, gen.dspark_accepted_tokens });
+
+    // b==0 arm: an over-threshold confidence gate submits NOTHING — the round
+    // verifies t1 alone, commits it, and samples the next trunk token from
+    // row 0's filtered probs (the stochastic sibling of the greedy
+    // confidence-gate test). The env is read at initModel, so this needs a
+    // fresh Transformer; unset after — test order must not inherit the gate.
+    _ = setenv("MLX_SERVE_DSV4_DSPARK_CONF", "999999", 1);
+    defer _ = unsetenv("MLX_SERVE_DSV4_DSPARK_CONF");
+    var xfm2 = try Transformer.init(io, allocator, cfg, &weights);
+    defer xfm2.deinit();
+    var gen2 = try Generator.initWithOptions(io, allocator, &xfm2, &tok_dummy, &prompt, 64, sampled, &.{}, .{
+        .pld_enabled = true,
+        .mtp_enabled = true,
+        .skip_lazy_preforward = true,
+        .lookup_prompt = &prompt,
+    });
+    defer gen2.deinit(allocator);
+    try testing.expect(gen2.dspark_enabled);
+    var n2: usize = 0;
+    while (n2 < 4) {
+        const r = (try gen2.nextDspark(allocator)) orelse break;
+        defer allocator.free(r.tokens);
+        try testing.expectEqual(@as(u32, 0), r.accepted_tokens);
+        try testing.expectEqual(@as(usize, 1), r.tokens.len);
+        try testing.expect(r.tokens[0] < mdl.vocab);
+        n2 += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), n2);
+    try testing.expect(gen2.dspark_attempted >= 4);
+    try testing.expectEqual(xfm2.dsv4.?.dec_state.?.n, gen2.ctx.cache.step);
+    std.debug.print("dsv4 stochastic dspark (b==0 gate): {d} single-token rounds\n", .{n2});
 }

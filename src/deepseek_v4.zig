@@ -3821,6 +3821,67 @@ test "dsv4: extendStateAllLogits rows match serial decode at every position (DSV
     }
 }
 
+test "dsv4: extendChunk .all_gpu + host read matches .all_host bytes (DSV4_MINI)" {
+    testEnableDspark();
+    // Pins the mode-enum refactor directly: `.all_host` is `.all_gpu` +
+    // toHostF32 by construction (headLogitsBatchGpu wraps headLogitsBatchG),
+    // so the two must agree BYTE-for-byte from the same entry state — same
+    // graph, same kernels, only who owns the sync differs. Runs both arms
+    // from one snapshot so state bytes are identical by construction.
+    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    const path = std.mem.span(path_z);
+    const allocator = testing.allocator;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
+    defer allocator.free(cfg_path);
+    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    file.close(io);
+    defer allocator.free(cfg_json);
+    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
+    defer allocator.free(shard_path);
+    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    defer weights.deinit();
+
+    for ([_]bool{ false, true }) |use_gpu| {
+        if (use_gpu and mlx.noGpuBackend()) continue;
+        const dw = try loadDsv4Weights(allocator, &cfg, &weights);
+        const s = if (use_gpu) mlx.gpuStream() else mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        var mdl = try initModel(allocator, &cfg, dw, s);
+        defer mdl.deinit();
+
+        var rng = std.Random.DefaultPrng.init(311);
+        var prefix: [10]u32 = undefined;
+        for (&prefix) |*v| v.* = rng.random().uintLessThan(u32, @intCast(mdl.vocab));
+        var block: [5]u32 = undefined;
+        for (&block) |*v| v.* = rng.random().uintLessThan(u32, @intCast(mdl.vocab));
+
+        var st = try initDecodeState(&mdl, allocator);
+        defer deinitDecodeState(&st);
+        const pl = try prefillIntoState(&mdl, allocator, &st, &prefix);
+        defer allocator.free(pl);
+        var snap = try snapshotDecodeState(&st, allocator);
+        defer snap.deinit();
+
+        const vl_host = try extendStateAllLogits(&mdl, allocator, &st, &block);
+        defer allocator.free(vl_host);
+
+        restoreDecodeState(&st, &snap);
+        const vl_g = try extendChunk(&mdl, allocator, &st, &block, .all_gpu);
+        defer _ = mlx.mlx_array_free(vl_g);
+        const vl_read = try toHostF32(allocator, vl_g, block.len * mdl.vocab, mdl.s);
+        defer allocator.free(vl_read);
+
+        try testing.expectEqualSlices(f32, vl_host, vl_read);
+        std.debug.print("dsv4 extendChunk all_gpu==all_host (gpu={}): {d} logits byte-equal\n", .{ use_gpu, vl_host.len });
+    }
+}
+
 test "dsv4: dsparkRound greedy-equivalence with serial decode (DSV4_MINI)" {
     testEnableDspark();
     // The verify/accept loop end-to-end: from the same prefix, rounds of
@@ -7989,7 +8050,12 @@ const PREFILL_SUB: usize = 512;
 /// sorted MoE gather (small-M qmm efficiency) at the cost of larger
 /// attention-gather transients. Cached once per process.
 var prefill_sub_state: ?usize = null;
-fn prefillSub() usize {
+/// Pub: server.zig's prefill memory guard bills the SUB-chunk this arch
+/// actually forwards (dsv4PrefillMemoryNeeded), and it must read the same
+/// env-overridable value the engine runs — billing a stale constant while
+/// MLX_SERVE_DSV4_PREFILL_SUB raises the real width under-bills into an
+/// uncatchable Metal OOM.
+pub fn prefillSub() usize {
     if (prefill_sub_state) |v| return v;
     var v: usize = PREFILL_SUB;
     if (std.c.getenv("MLX_SERVE_DSV4_PREFILL_SUB")) |e| {
@@ -8021,7 +8087,7 @@ pub fn extendState(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
     while (done < ids.len) {
         const c_tokens = @min(prefillSub(), ids.len - done);
         if (logits) |l| gpa.free(l);
-        logits = try extendChunk(m, gpa, st, ids[done .. done + c_tokens], false);
+        logits = try extendChunk(m, gpa, st, ids[done .. done + c_tokens], .last_host);
         done += c_tokens;
         if (extendChunkShouldClearCache(c_tokens)) _ = mlx.mlx_clear_cache();
     }
@@ -8033,10 +8099,22 @@ pub fn extendState(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
 /// DSpark verify block is ≤ block_size+1 tokens.
 pub fn extendStateAllLogits(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids: []const u32) ![]f32 {
     std.debug.assert(ids.len <= prefillSub());
-    return extendChunk(m, gpa, st, ids, true);
+    return extendChunk(m, gpa, st, ids, .all_host);
 }
 
-fn extendChunk(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids: []const u32, comptime all_logits: bool) ![]f32 {
+/// What extendChunk hands back. `.last_host`/`.all_host` sync and return
+/// host f32 (last row / every row); `.all_gpu` returns the LAZY `[C, vocab]`
+/// logits array un-synced — the stochastic verify feeds it straight into the
+/// filtered-probs + accept graph so the round pays ONE bounded sync at its
+/// end. `.all_host` is `.all_gpu` + toHostF32 by construction
+/// (headLogitsBatchGpu wraps headLogitsBatchG): same graph, same sync point.
+const ExtendMode = enum { last_host, all_host, all_gpu };
+
+fn ExtendRet(comptime mode: ExtendMode) type {
+    return if (mode == .all_gpu) mlx.mlx_array else []f32;
+}
+
+fn extendChunk(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids: []const u32, comptime mode: ExtendMode) !ExtendRet(mode) {
     var chunk_clk: DsparkClock = if (m.ds_prof != null) DsparkClock.init() else undefined;
     if (m.ds_prof != null) m.ds_prof_comp_sync_ns = 0;
     const tracing = dsv4TraceEnabled();
@@ -8140,7 +8218,12 @@ fn extendChunk(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids:
         try appendDsparkMainKv(m, st, mh, C, &rr_plain);
     }
     if (m.ds_prof != null) m.ds_prof_layers_ns = chunk_clk.lap();
-    const out = if (all_logits)
+    const out = if (comptime mode == .all_gpu)
+        // Lazy: the caller owns the sync, so under profiling the head lap
+        // below measures BUILD only — the eval lands in the caller's
+        // verify lap (DsparkPending.lapVerify).
+        try headLogitsBatchG(m, a, stream_g, C)
+    else if (comptime mode == .all_host)
         try headLogitsBatchGpu(m, gpa, a, stream_g, C)
     else blk: {
         // head on the last position
@@ -8169,6 +8252,15 @@ fn extendChunk(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids:
 /// → final norm → shared head on EVERY position. Returns [C * vocab] f32.
 /// The C==1 sibling is headLogitsGpu; the verify loop needs all positions.
 fn headLogitsBatchGpu(m: *const Dsv4Model, gpa: std.mem.Allocator, alloc: std.mem.Allocator, stream_g: mlx.mlx_array, C: usize) ![]f32 {
+    const logits_g = try headLogitsBatchG(m, alloc, stream_g, C);
+    defer _ = mlx.mlx_array_free(logits_g);
+    return try toHostF32(gpa, logits_g, C * m.vocab, m.s);
+}
+
+/// Lazy sibling: builds the SAME `[C, vocab]` graph and returns it un-synced
+/// (caller owns the handle and the eventual eval). On a GPU stream nothing
+/// here syncs; the CPU-stream arm still pays its host pre-weight loop.
+fn headLogitsBatchG(m: *const Dsv4Model, alloc: std.mem.Allocator, stream_g: mlx.mlx_array, C: usize) !mlx.mlx_array {
     const hcm = m.hc;
     const d = m.dim;
     const cc: c_int = @intCast(C);
@@ -8215,9 +8307,7 @@ fn headLogitsBatchGpu(m: *const Dsv4Model, gpa: std.mem.Allocator, alloc: std.me
     try mlx.check(mlx.mlx_sum_axis(&hout, weighted, 1, false, m.s)); // [C, d]
     const hn = try gpuRms(hout, m.final_norm_g, m.eps, m.s);
     defer _ = mlx.mlx_array_free(hn);
-    const logits_g = try gpuQmmB(&m.dw.head, hn, m.s);
-    defer _ = mlx.mlx_array_free(logits_g);
-    return try toHostF32(gpa, logits_g, C * m.vocab, m.s);
+    return try gpuQmmB(&m.dw.head, hn, m.s);
 }
 
 // ── DSpark draft (forward_spec at start_pos > 0, greedy) ───────────────
@@ -8782,6 +8872,120 @@ pub const DsparkRound = struct {
     }
 };
 
+/// An in-flight round between `dsparkBegin`/`dsparkBeginWith` and
+/// `dsparkFinish`: the draft ran, the state snapshot + anchors are armed,
+/// the verify block was appended to `st`, and `vl_g` holds the LAZY
+/// `[b+1, vocab]` verify logits — un-synced, so the caller can build its
+/// accept decision (host argmax read, or the stochastic filtered-probs +
+/// accept graph) on top and pay ONE bounded sync. The caller always
+/// `deinit`s (finish borrows the snapshot for rollback, it does not free).
+pub const DsparkPending = struct {
+    snap: Dsv4Snapshot,
+    /// Lazy `[b+1, vocab]` verify logits (every position, trunk head).
+    vl_g: mlx.mlx_array,
+    /// Drafts submitted this round (≤ ds_block; the confidence gate may
+    /// have truncated the block, possibly to 0).
+    b: usize,
+    /// The verify ids `[t1, d1..db]` — everything an accept loop needs
+    /// from the draft.
+    verify: [16]u32,
+    phases: DsparkPhases,
+    clk: DsparkClock,
+    prof_on: bool,
+
+    /// Called by the consumer right after ITS host sync of `vl_g`'s graph —
+    /// the honest place for the verify lap now that begin returns lazy.
+    /// `verify_head_ns` is build-only under the split (the head eval lands
+    /// in this lap); `verify_ns` still covers the whole verify as before.
+    pub fn lapVerify(self: *DsparkPending, m: *const Dsv4Model) void {
+        if (!self.prof_on) return;
+        self.phases.verify_ns = self.clk.lap();
+        self.phases.verify_head_ns = m.ds_prof_head_ns;
+        self.phases.verify_comp_sync_ns = m.ds_prof_comp_sync_ns;
+    }
+
+    pub fn deinit(self: *DsparkPending) void {
+        self.snap.deinit();
+        _ = mlx.mlx_array_free(self.vl_g);
+    }
+};
+
+/// Front half of a round: draft from the stages, then arm the verify
+/// (snapshot + anchors + batched extend with LAZY all-position logits).
+/// Entry invariant as `dsparkRound`: `t1` NOT in state, pending empty.
+pub fn dsparkBegin(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32) !DsparkPending {
+    const prof_on = m.ds_prof != null;
+    var clk: DsparkClock = if (prof_on) DsparkClock.init() else undefined;
+    var draft = try dsparkDraft(m, gpa, st, t1);
+    defer draft.deinit(gpa);
+    const draft_ns: u64 = if (prof_on) clk.lap() else 0;
+    var pending = try dsparkBeginWith(m, gpa, st, t1, &draft);
+    pending.phases.draft_ns = draft_ns;
+    pending.phases.markov_ns = draft.markov_ns;
+    return pending;
+}
+
+/// The verify-arming half with the draft injected — the seam the FULL-ACCEPT
+/// test (and `dsparkRound`'s own draft) drives. Borrows the draft: the ids
+/// the accept loop needs are copied into `pending.verify`.
+pub fn dsparkBeginWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, draft: *const DsparkDraft) !DsparkPending {
+    // The block the confidence gate actually submitted (≤ ds_block).
+    const B = draft.len;
+    std.debug.assert(B <= m.ds_block and st.dspark != null);
+    const prof_on = m.ds_prof != null;
+    var clk: DsparkClock = if (prof_on) DsparkClock.init() else undefined;
+    var ph = DsparkPhases{};
+
+    var snap = try snapshotDecodeState(st, gpa);
+    errdefer snap.deinit();
+    // Per-position anchors: a rejected tail becomes a truncate instead of a
+    // second batched forward over the accepted prefix. Sized to the FULL
+    // block so the buffers are allocated once and reused whatever the
+    // confidence gate submits this round.
+    try armAnchors(m, st, m.ds_block);
+    if (prof_on) ph.snapshot_ns = clk.lap();
+
+    var verify: [16]u32 = undefined;
+    verify[0] = t1;
+    @memcpy(verify[1 .. B + 1], draft.ids[1 .. B + 1]);
+    std.debug.assert(B + 1 <= prefillSub());
+    const vl_g = try extendChunk(m, gpa, st, verify[0 .. B + 1], .all_gpu);
+    return .{ .snap = snap, .vl_g = vl_g, .b = B, .verify = verify, .phases = ph, .clk = clk, .prof_on = prof_on };
+}
+
+/// Back half: commit/rollback against the accept decision. `accepted` drafts
+/// (≤ pending.b) survive; a partial accept truncates to the per-position
+/// anchor, a full accept disarms them (the verify appends ARE the state).
+/// `next_token` is the caller's — correction or bonus, always derived from
+/// the ORIGINAL verify logits at the acceptance point (the house
+/// partial-accept invariant; sampled form on the stochastic arm).
+pub fn dsparkFinish(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, pending: *DsparkPending, accepted: usize, next_token: u32) !DsparkRound {
+    _ = m;
+    std.debug.assert(accepted <= pending.b);
+    if (accepted < pending.b) {
+        if (pending.prof_on) _ = pending.clk.lap(); // the accept scan is host-only bookkeeping
+        restoreToAnchor(st, &pending.snap, accepted);
+        if (pending.prof_on) pending.phases.rollback_ns = pending.clk.lap();
+    } else if (st.anchors) |*an| an.armed = false;
+
+    const tokens = try gpa.alloc(u32, accepted + 1);
+    @memcpy(tokens, pending.verify[0 .. accepted + 1]);
+    pending.phases.accepted = @intCast(accepted);
+    pending.phases.committed = @intCast(accepted + 1);
+    pending.phases.submitted = @intCast(pending.b);
+    return .{ .tokens = tokens, .next_token = next_token, .accepted = @intCast(accepted), .phases = pending.phases };
+}
+
+/// Feed a finished round's phases into the profile (armed via
+/// MLX_SERVE_DSPARK_PROFILE=1) — shared by the greedy wrapper here and the
+/// stochastic arm in generate.zig.
+pub fn dsparkObserve(m: *Dsv4Model, ph: DsparkPhases) void {
+    if (m.ds_prof) |*p| {
+        p.observe(ph);
+        if (p.rounds % 16 == 0) p.report();
+    }
+}
+
 /// One greedy draft/verify round. Entry: st holds prompt+emitted positions
 /// and `t1` (the trunk-sampled token) is NOT in the state. Draft B ids from
 /// t1, batch-verify `[t1, d1..dB]` through the trunk, accept the longest
@@ -8797,46 +9001,27 @@ pub fn dsparkRound(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
     defer draft.deinit(gpa);
     const draft_ns: u64 = if (prof_on) clk.lap() else 0;
     const round = try dsparkRoundWith(m, gpa, st, t1, &draft);
-    if (m.ds_prof) |*p| {
+    if (m.ds_prof != null) {
         var ph = round.phases;
         ph.draft_ns = draft_ns;
         ph.markov_ns = draft.markov_ns;
-        p.observe(ph);
-        if (p.rounds % 16 == 0) p.report();
+        dsparkObserve(m, ph);
     }
     return round;
 }
 
 /// The verify/accept half of a round, with the draft injected — the seam the
 /// FULL-ACCEPT test drives (the random mini's own drafts never match, so
-/// only this entry can exercise the no-rollback branch hermetically).
+/// only this entry can exercise the no-rollback branch hermetically). Built
+/// ON TOP of the begin/finish split so the greedy and stochastic arms share
+/// one verify seam: begin → host read → argmax accept loop → finish.
 fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, draft: *const DsparkDraft) !DsparkRound {
-    // The block the confidence gate actually submitted (≤ ds_block).
-    const B = draft.len;
-    std.debug.assert(B <= m.ds_block and st.dspark != null);
-    const prof_on = m.ds_prof != null;
-    var clk: DsparkClock = if (prof_on) DsparkClock.init() else undefined;
-    var ph = DsparkPhases{};
-
-    var snap = try snapshotDecodeState(st, gpa);
-    defer snap.deinit();
-    // Per-position anchors: a rejected tail becomes a truncate instead of a
-    // second batched forward over the accepted prefix. Sized to the FULL
-    // block so the buffers are allocated once and reused whatever the
-    // confidence gate submits this round.
-    try armAnchors(m, st, m.ds_block);
-    if (prof_on) ph.snapshot_ns = clk.lap();
-
-    var verify: [16]u32 = undefined;
-    verify[0] = t1;
-    @memcpy(verify[1 .. B + 1], draft.ids[1 .. B + 1]);
-    const vl = try extendStateAllLogits(m, gpa, st, verify[0 .. B + 1]);
+    var pending = try dsparkBeginWith(m, gpa, st, t1, draft);
+    defer pending.deinit();
+    const B = pending.b;
+    const vl = try toHostF32(gpa, pending.vl_g, (B + 1) * m.vocab, m.s);
     defer gpa.free(vl);
-    if (prof_on) {
-        ph.verify_ns = clk.lap();
-        ph.verify_head_ns = m.ds_prof_head_ns;
-        ph.verify_comp_sync_ns = m.ds_prof_comp_sync_ns;
-    }
+    pending.lapVerify(m);
 
     var accepted: usize = 0;
     while (accepted < B) {
@@ -8877,18 +9062,7 @@ fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
         });
     }
 
-    if (accepted < B) {
-        if (prof_on) _ = clk.lap(); // the accept scan is host-only bookkeeping
-        restoreToAnchor(st, &snap, accepted);
-        if (prof_on) ph.rollback_ns = clk.lap();
-    } else if (st.anchors) |*an| an.armed = false;
-
-    const tokens = try gpa.alloc(u32, accepted + 1);
-    @memcpy(tokens, verify[0 .. accepted + 1]);
-    ph.accepted = @intCast(accepted);
-    ph.committed = @intCast(accepted + 1);
-    ph.submitted = @intCast(B);
-    return .{ .tokens = tokens, .next_token = @intCast(next_am), .accepted = @intCast(accepted), .phases = ph };
+    return dsparkFinish(m, gpa, st, &pending, accepted, @intCast(next_am));
 }
 
 // ── GPU-side QAT sims + rope (consolidation round) ─────────────────────
