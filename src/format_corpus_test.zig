@@ -326,6 +326,56 @@ const corpus = [_]Expect{
         .tool_arg_absent = "content",
     },
     .{
+        // Verbatim capture (2026-08-01, agent session on
+        // DeepSeek-V4-Flash-0731): the model emitted a COMPLETE DSML call
+        // INSIDE its think block, closed the block, then issued a different
+        // call in content. Tool parse runs on the post-think text only, so the
+        // in-thought block is deliberately NOT executed — but it rode out
+        // verbatim as reasoning_content and, because clients round-trip
+        // reasoning into history, re-entered every later prompt teaching the
+        // model to call tools from inside thinking.
+        .family = "dsv4-dsml",
+        .name = "in-thought DSML block never leaks into reasoning",
+        .raw = "\n\nLet me first check the working directory structure.<｜DSML｜tool_calls>\n" ++
+            "<｜DSML｜invoke name=\"listFiles\">\n" ++
+            "<｜DSML｜parameter name=\"path\" string=\"true\">quake</｜DSML｜parameter>\n" ++
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls></think>I'll build the page.\n\n" ++
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"writeFile\">\n" ++
+            "<｜DSML｜parameter name=\"path\" string=\"true\">index.html</｜DSML｜parameter>\n" ++
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        .thinking = true,
+        .opened_by_template = true,
+        .reasoning_contains = "working directory structure",
+        .tool_name = "writeFile",
+        .tool_count = 1,
+        .tool_arg_key = "path",
+        .tool_arg_value = "index.html",
+    },
+    .{
+        // Verbatim capture (2026-08-01, same session): the model answered a
+        // plain question and then emitted a BARE DSML marker with no call
+        // behind it. Nothing parses, so the buffered tail flushes as visible
+        // content — raw marker included.
+        .family = "dsv4-dsml",
+        .name = "bare DSML marker with no call never leaks into content",
+        .raw = "\n\n<｜DSML｜\n",
+        .no_tool_calls = true,
+        .content_exact = "",
+    },
+    .{
+        // Verbatim capture (2026-07-31 log): the model mangled the opener
+        // (`<｜DSML｜toolinvoke name"` where the spec is
+        // `<｜DSML｜tool_calls>\n<｜DSML｜invoke name=`), so no call parses and
+        // the whole block became the visible answer.
+        .family = "dsv4-dsml",
+        .name = "mangled DSML opener never leaks into content",
+        .raw = "\n\n<｜DSML｜toolinvoke name\">\n" ++
+            "<｜DSML｜parameter name=\"timezone\" string=\"true\">Asia/Tokyo</｜DSML｜parameter>\n" ++
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        .no_tool_calls = true,
+        .content_exact = "",
+    },
+    .{
         // JSON-typed parameter (string="false") must arrive as its declared
         // type, not a stringified spelling.
         .family = "dsv4-dsml",
@@ -1198,6 +1248,14 @@ const leak_tags = [_][]const u8{
     "<｜DSML｜",
 };
 
+/// Tool-call wrapper openers that must never appear in reasoning_content
+/// either. Mirrors `chat.tool_markup_openers` (the cut list) — kept spelled
+/// out here so the guard fails if the cut list is narrowed.
+const reasoning_leak_tags = [_][]const u8{
+    "<｜DSML｜",  "<|tool_call", "<tool_call",
+    "<tool_calls:", "<|content_invoke_tool_json|>",
+};
+
 fn fail(entry: Expect, comptime what: []const u8, got: []const u8) !void {
     std.debug.print("\n[{s}] {s}: " ++ what ++ "\n  got: {s}\n", .{ entry.family, entry.name, got });
     return error.FormatCorpusExpectFailed;
@@ -1355,6 +1413,28 @@ test "format corpus: recorded model outputs across families" {
         for (leak_tags) |tag| {
             if (std.mem.indexOf(u8, content, tag) != null) {
                 try fail(entry, "control tag leaked into visible content", content);
+            }
+        }
+
+        // …and reasoning_content never carries TOOL-CALL markup. Reasoning is
+        // not an internal scratch field: clients render it AND round-trip it
+        // into the next request's history (assistant-history reasoning rule),
+        // so a call block the parser skipped — one the model emitted inside
+        // its think block — re-enters every later prompt and teaches the model
+        // to keep calling tools from inside thinking (live 2026-08-01, DSV4
+        // agent session).
+        //
+        // KNOWN GAP: a re-opened `<|channel>thought` marker can still sit
+        // INSIDE reasoning (the "multiple unclosed thought openers" entry
+        // below). Removing an interior marker needs an allocation the
+        // alloc-free ThinkSplit contract doesn't have, and Gemma's template
+        // strips history reasoning, so it is a rendering wart rather than a
+        // prompt contaminant.
+        for (reasoning_leak_tags) |tag| {
+            if (split.reasoning_content) |r| {
+                if (std.mem.indexOf(u8, r, tag) != null) {
+                    try fail(entry, "tool markup leaked into reasoning_content", r);
+                }
             }
         }
 

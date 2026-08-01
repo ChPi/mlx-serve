@@ -1060,8 +1060,53 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
     return if (lt + l == text.len) l else null;
 }
 
+/// Tool-call WRAPPER openers that must never survive into text a client
+/// renders. Every entry is the opening marker of a call block, so whatever
+/// follows it is call payload, not prose — parseToolCalls has already run by
+/// the time these matter, so a marker still present means the block did not
+/// parse (a mangled opener, a bare marker with no call behind it, or a call
+/// the model emitted inside its think block, which the parser deliberately
+/// skips). The whole tail is cut rather than excised: a wrapper we could not
+/// parse has no reliable end, and shipping half of it is the same leak.
+const tool_markup_openers = [_][]const u8{
+    "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
+    "<|tool_call", // Gemma 4
+    "<tool_call", // Hermes XML + the plural/suffixed variants
+    "<tool_calls:", // Hy3 suffixed wrapper
+    INKLING_INVOKE_TAG,
+};
+
+/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
+/// slice (no alloc); text with no marker is returned untouched.
+pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+    var cut: usize = text.len;
+    var is_inkling = false;
+    for (tool_markup_openers) |m| {
+        if (std.mem.indexOf(u8, text, m)) |p| {
+            if (p < cut) {
+                cut = p;
+                is_inkling = std.mem.eql(u8, m, INKLING_INVOKE_TAG);
+            }
+        }
+    }
+    if (cut == text.len) return text;
+    // Inkling puts the tool NAME immediately BEFORE its invoke marker, so the
+    // cut takes the trailing identifier run with it — otherwise the bare name
+    // is what the client renders as the answer.
+    if (is_inkling) {
+        while (cut > 0 and inklingIsNameChar(text[cut - 1])) cut -= 1;
+    }
+    return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
+}
+
 /// Strip `<think>...</think>` or `<|channel>thought\n...<channel|>` block from model output.
 pub fn stripThinkBlock(text: []const u8) []const u8 {
+    return trimLeakedToolMarkup(stripThinkBlockKeepingMarkup(text));
+}
+
+/// The strip WITHOUT the leaked-markup cut — for the one caller that feeds the
+/// result back to `parseToolCalls` (the /v1/messages non-streaming path).
+pub fn stripThinkBlockKeepingMarkup(text: []const u8) []const u8 {
     // Inkling message channels: same arm as splitThinkBlock (content only).
     if (splitInklingChannels(text)) |split| return split.content;
     const base = stripThinkBlockLeading(text);
@@ -1202,6 +1247,19 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
 /// think opener (see `promptTailOpensThink`), so output with no literal opener
 /// and no close tag is still reasoning — generation started inside the block.
 pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    const split = splitThinkBlockKeepingMarkup(text, thinking, opened_by_template);
+    const reasoning: ?[]const u8 = if (split.reasoning_content) |r| blk: {
+        const t = trimLeakedToolMarkup(r);
+        break :blk if (t.len > 0) t else null;
+    } else null;
+    return .{ .reasoning_content = reasoning, .content = trimLeakedToolMarkup(split.content) };
+}
+
+/// The split WITHOUT the leaked-markup cut — for the one caller that feeds the
+/// content back to `parseToolCalls` (the /v1/messages non-streaming path).
+/// Every arm below returns raw slices; the cut is applied ONCE in the wrapper
+/// above so a new arm cannot forget it.
+pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
     // Inkling (inkling_mm_model) message channels: the model emits role-less
     // MESSAGES — `<|content_thinking|>R<|end_message|>` then
     // `<|message_model|><|content_text|>C<|end_message|>` — not a tag pair.
@@ -5785,8 +5843,14 @@ test "splitThinkBlock with think block before tool call" {
     const text = "<think>I need to call the calculator</think>\n<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"a\": 5}}\n</tool_call>";
     const result = splitThinkBlock(text, false, false);
     try testing.expectEqualStrings("I need to call the calculator", result.reasoning_content.?);
-    // Content should be the tool call text
-    try testing.expect(std.mem.startsWith(u8, result.content, "<tool_call>"));
+    // `content` is VISIBLE text, so the call block is cut: parseToolCalls runs
+    // on the raw output, and whatever it leaves behind is markup the client
+    // must never render.
+    try testing.expectEqualStrings("", result.content);
+    // The keeping-markup variant is what the one parse-from-content caller
+    // (/v1/messages non-streaming) uses, and it still hands over the block.
+    const raw = splitThinkBlockKeepingMarkup(text, false, false);
+    try testing.expect(std.mem.startsWith(u8, raw.content, "<tool_call>"));
 }
 
 test "splitThinkBlock with think block before regular content" {
@@ -5807,7 +5871,8 @@ test "splitThinkBlock no think tags with tool call" {
     const text = "<tool_call>\n{\"name\": \"search\", \"arguments\": {}}\n</tool_call>";
     const result = splitThinkBlock(text, false, false);
     try testing.expect(result.reasoning_content == null);
-    try testing.expectEqualStrings(text, result.content);
+    try testing.expectEqualStrings("", result.content);
+    try testing.expectEqualStrings(text, splitThinkBlockKeepingMarkup(text, false, false).content);
 }
 
 test "parseToolCalls with think block" {
@@ -5935,6 +6000,68 @@ test "stripThinkBlock trailing unclosed thought opener does not leak" {
     try testing.expectEqualStrings("Here is the design.", stripThinkBlock("Here is the design.\n<|channel>thought"));
     try testing.expectEqualStrings("Here is the design.", stripThinkBlock("Here is the design.\n<|channel>thought\nI should now write"));
     try testing.expectEqualStrings("Done.", stripThinkBlock("Done.\n<think>hmm"));
+}
+
+test "trimLeakedToolMarkup cuts at the first unparsed tool-call opener" {
+    // Untouched when there is no marker (the overwhelmingly common case —
+    // the returned slice must be the input itself, not a trimmed copy).
+    try testing.expectEqualStrings("plain prose", trimLeakedToolMarkup("plain prose"));
+    try testing.expectEqualStrings("ends in a tag <b>", trimLeakedToolMarkup("ends in a tag <b>"));
+
+    // Every wrapper family cuts, and the trailing whitespace before the
+    // marker goes with it.
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"x\">"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<|tool_call>{}"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<tool_call>{}"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<tool_calls:opensource>"));
+    // Inkling's NAME sits before the marker, so it goes with the cut.
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done. shell<|content_invoke_tool_json|>{}"));
+
+    // A marker with nothing before it leaves nothing behind — a bare marker
+    // is not an answer (live: DSV4 answered a question and then emitted a
+    // lone `<｜DSML｜` with no call behind it).
+    try testing.expectEqualStrings("", trimLeakedToolMarkup("\n\n<｜DSML｜\n"));
+
+    // Earliest marker wins when several families appear.
+    try testing.expectEqualStrings("a", trimLeakedToolMarkup("a<tool_call>b<｜DSML｜c"));
+}
+
+test "in-thought tool markup never rides out as reasoning" {
+    // Live 2026-08-01 (DeepSeek-V4-Flash-0731 agent session): the model
+    // emitted a complete DSML call INSIDE its think block, closed the block,
+    // then issued a different call in content. parseToolCalls works on the
+    // post-think text, so the in-thought call is deliberately skipped — but
+    // it rode out verbatim in reasoning_content, and the client round-tripped
+    // it into every later prompt.
+    const raw = "Let me check the directory.<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"listFiles\">\n" ++
+        "<｜DSML｜parameter name=\"path\" string=\"true\">quake</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls></think>I'll build it.";
+    const split = splitThinkBlock(raw, true, true);
+    try testing.expectEqualStrings("Let me check the directory.", split.reasoning_content.?);
+    try testing.expectEqualStrings("I'll build it.", split.content);
+
+    // Reasoning that is NOTHING but markup reports no reasoning at all.
+    const only_markup = splitThinkBlock("<｜DSML｜tool_calls>\n</｜DSML｜tool_calls></think>answer", true, true);
+    try testing.expectEqual(@as(?[]const u8, null), only_markup.reasoning_content);
+    try testing.expectEqualStrings("answer", only_markup.content);
+}
+
+test "a tool marker split across tokens is only visible once concatenated" {
+    // The streaming tools flush holds a tail that looked like a tool call and
+    // ships it when nothing parses. DSV4 spells the DSML marker as `<` then
+    // `｜DSML｜` (two tokens), so a per-token filter sees neither piece as a
+    // marker and both went out as visible content (live 2026-08-01). The
+    // flush concatenates first for exactly this reason.
+    const pieces = [_][]const u8{ "My name is", "<", "｜DSML｜", "\n" };
+    var joined: [64]u8 = undefined;
+    var n: usize = 0;
+    for (pieces) |p| {
+        @memcpy(joined[n .. n + p.len], p);
+        n += p.len;
+    }
+    for (pieces) |p| try testing.expectEqualStrings(p, trimLeakedToolMarkup(p));
+    try testing.expectEqualStrings("My name is", trimLeakedToolMarkup(joined[0..n]));
 }
 
 test "splitThinkBlock re-opened thought opener right after close does not leak" {

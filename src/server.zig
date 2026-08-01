@@ -6460,8 +6460,20 @@ fn handleStreamingGeneration(
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null, null);
                 }
             } else {
+                // Thinking off: the held tail flushes verbatim. It was held
+                // BECAUSE it looked like a tool call, and nothing parsed — so
+                // the markers in it are unparsed wreckage. Concatenate and cut
+                // once (a per-token loop cannot see a marker the tokenizer
+                // split across tokens: live 2026-08-01, DSV4 emitted `<` then
+                // `｜DSML｜` and both went out as visible content).
+                var flush_text = std.ArrayList(u8).empty;
+                defer flush_text.deinit(allocator);
                 for (token_texts.items) |t| {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = t }, null, null, null);
+                    try flush_text.appendSlice(allocator, t);
+                }
+                const visible = chat_mod.trimLeakedToolMarkup(flush_text.items);
+                if (visible.len > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = visible }, null, null, null);
                 }
             }
         }
@@ -8952,10 +8964,21 @@ fn handleAnthropicNonStreaming(
 
     var block_count: u32 = 0;
 
-    // Thinking block
+    // Thinking block.
+    //
+    // The split/strip here KEEP unparsed tool markup: unlike every other
+    // surface, this path reassigns `final_text` from the result and hands it
+    // to parseToolCallsForRequest below. Cutting the markup first would make a
+    // real call unparseable. The visible text block is cut at emission instead
+    // (`chat_mod.trimLeakedToolMarkup`), which is where the leak matters.
     if (enable_thinking) {
-        const think_split = chat_mod.splitThinkBlock(final_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
-        if (think_split.reasoning_content) |reasoning| {
+        const think_split = chat_mod.splitThinkBlockKeepingMarkup(final_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+        // Reasoning is never fed back to the parser, so it is cut here.
+        const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
+            const t = chat_mod.trimLeakedToolMarkup(r);
+            break :blk if (t.len > 0) t else null;
+        } else null;
+        if (split_reasoning) |reasoning| {
             // Apply budget truncation
             var truncated_reasoning = reasoning;
             var trunc_allocated = false;
@@ -8979,10 +9002,10 @@ fn handleAnthropicNonStreaming(
             block_count += 1;
             final_text = think_split.content;
         } else {
-            final_text = chat_mod.stripThinkBlock(final_text);
+            final_text = chat_mod.stripThinkBlockKeepingMarkup(final_text);
         }
     } else {
-        final_text = chat_mod.stripThinkBlock(final_text);
+        final_text = chat_mod.stripThinkBlockKeepingMarkup(final_text);
     }
 
     // Check for tool calls
@@ -9019,9 +9042,10 @@ fn handleAnthropicNonStreaming(
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
-            // No tool calls — emit text block
+            // No tool calls — emit text block. Nothing parsed, so any tool
+            // markup still in here is unparsed wreckage: cut it at emission.
             if (block_count > 0) try content.append(allocator, ',');
-            const esc_text = try jsonEscape(allocator, final_text);
+            const esc_text = try jsonEscape(allocator, chat_mod.trimLeakedToolMarkup(final_text));
             defer allocator.free(esc_text);
             const text_block = try std.fmt.allocPrint(allocator,
                 \\{{"type":"text","text":{s}}}
@@ -9032,7 +9056,7 @@ fn handleAnthropicNonStreaming(
     } else {
         // No tools — emit text block
         if (block_count > 0) try content.append(allocator, ',');
-        const esc_text = try jsonEscape(allocator, final_text);
+        const esc_text = try jsonEscape(allocator, chat_mod.trimLeakedToolMarkup(final_text));
         defer allocator.free(esc_text);
         const text_block = try std.fmt.allocPrint(allocator,
             \\{{"type":"text","text":{s}}}
@@ -9687,7 +9711,14 @@ fn handleAnthropicStreaming(
                     try emitAnthropicTextDelta(allocator, stream, block_index, think_split.content);
                 }
             } else {
-                for (token_texts.items) |t| {
+                // Same cut as the chat-completions flush: the held tail is
+                // unparsed tool markup, and a marker can be split across
+                // tokens, so concatenate before cutting.
+                var flush_text = std.ArrayList(u8).empty;
+                defer flush_text.deinit(allocator);
+                for (token_texts.items) |t| try flush_text.appendSlice(allocator, t);
+                const visible = chat_mod.trimLeakedToolMarkup(flush_text.items);
+                if (visible.len > 0) {
                     if (!text_block_open) {
                         const sd = try std.fmt.allocPrint(allocator,
                             \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -9696,7 +9727,7 @@ fn handleAnthropicStreaming(
                         try sendAnthropicEvent(stream, "content_block_start", sd);
                         text_block_open = true;
                     }
-                    try emitAnthropicTextDelta(allocator, stream, block_index, t);
+                    try emitAnthropicTextDelta(allocator, stream, block_index, visible);
                 }
             }
         }

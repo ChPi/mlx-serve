@@ -127,3 +127,59 @@ The lesson generalizes past this family: when A/B-ing a transcription against a
 reference implementation, convert the INPUT shapes to each side's own contract and
 compare only the OUTPUT. Every remaining difference is then a real defect in one of
 the two — and here the whitespace one was ours, silently, in production shapes.
+
+## reasoning_content is a client-visible, history-round-tripped field (DSV4, 2026-08-01)
+
+A live agent session on DeepSeek-V4-Flash-0731 came back with a full DSML call block
+sitting inside `reasoning_content`:
+
+```
+"reasoning_content": "…Let me first check the working directory structure.
+<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"listFiles\">\n
+<｜DSML｜parameter name=\"path\" string=\"true\">quake</｜DSML｜parameter>\n
+</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+```
+
+The model had emitted a complete tool call INSIDE its think block, closed the block,
+then issued two different calls in content. `parseToolCalls` works on the post-think
+text by design, so the in-thought call is deliberately skipped — but nothing then
+removed it, and `splitThinkBlock` handed the whole thing back as reasoning. The client
+round-tripped it into the next request's history (the assistant-history reasoning
+rule), so from that turn on the model was being shown its own malformed markup as an
+example of what thinking looks like. Same family as the Inkling error-echo loop: the
+server taught the model the mistake.
+
+Two more shapes from the same log, same class, different field:
+
+- **A marker split across tokens beats a per-token filter.** DSV4 spells the marker as
+  `<` then `｜DSML｜`. With tools declared the stream buffers correctly (`<` is a
+  tail-prefix), but the END-of-stream flush — reached because nothing parsed — looped
+  the held tokens straight out as content deltas. `isChannelMarkerToken` cannot help:
+  neither piece IS a marker. The flush now concatenates first, then cuts.
+- **A mangled opener leaks the whole block.** `<｜DSML｜toolinvoke name">…` (the model
+  fused `tool_calls>\n<｜DSML｜invoke name=`) parses as nothing and became the visible
+  answer verbatim.
+
+Fix: `chat.trimLeakedToolMarkup` cuts visible text at the first tool-call WRAPPER
+opener (`<｜DSML｜`, `<|tool_call`, `<tool_call`, `<tool_calls:`, Inkling's invoke
+marker — plus, for Inkling, the trailing identifier run before it, since the NAME
+precedes the marker there). It is applied ONCE, in a wrapper around `splitThinkBlock`
+/ `stripThinkBlock`, so a new split arm cannot forget it. The whole tail goes rather
+than just the block: a wrapper we could not parse has no reliable end, and shipping
+half of it is the same leak.
+
+The one caller that must NOT get the cut is `/v1/messages` non-streaming — alone among
+the surfaces it reassigns its working text from the split result and then hands that
+to `parseToolCallsForRequest`, so cutting first would make a real call unparseable.
+That path uses `splitThinkBlockKeepingMarkup` / `stripThinkBlockKeepingMarkup` and cuts
+at the text-block emission instead. Every other surface (chat non-stream + stream,
+`/v1/responses`, `/v1/messages` streaming) already parses from the raw text.
+
+Guards: three verbatim-capture corpus entries and a SECOND universal corpus invariant —
+`reasoning_content` is checked against the tool-markup list exactly as content is
+checked against `leak_tags`. KNOWN GAP recorded in the test: a re-opened
+`<|channel>thought` marker can still sit INSIDE reasoning (excising an interior marker
+needs an allocation the alloc-free `ThinkSplit` contract doesn't have, and Gemma's
+template strips history reasoning, so it is a rendering wart, not a prompt
+contaminant). Second gap: streaming with NO tools declared has no buffer to cut from,
+so a model emitting call markup unprompted still streams it.
