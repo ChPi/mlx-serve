@@ -1289,11 +1289,18 @@ private struct PerformanceSectionContent: View {
             SettingsRow(
                 title: m.title,
                 explainer: m.explainer,
-                isDirty: dirty.dirty(\.decodeAttnQuant)
+                isDirty: dirty.dirty(\.decodeAttnQuantChoice)
             ) {
-                Toggle("", isOn: opts.decodeAttnQuant)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
+                // Tri-state under a binary toggle: untouched (nil) RENDERS as
+                // the server default (on); touching it stores an explicit
+                // choice — which is exactly what the positive flag form means
+                // (it opts dsv4's characterization-gated requant in).
+                Toggle("", isOn: Binding(
+                    get: { appState.serverOptions.decodeAttnQuantChoice ?? true },
+                    set: { appState.serverOptions.decodeAttnQuantChoice = $0 }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
             }
         }
         if let m = meta["kvQuant"] {

@@ -1047,23 +1047,44 @@ extension ServerOptionsTests {
         XCTAssertEqual(back, o)
     }
 
-    /// Decode attention requant (`--decode-attn-quant`): server default is ON
-    /// (transformer.zig DECODE_ATTN_QUANT_DEFAULT), so a default launch emits
-    /// NOTHING and only the user's OFF emits the flag. A stored blob that
-    /// predates the field decodes to the default (tolerant decoder).
-    func testDecodeAttnQuantMirrorsServerDefaultAndEmitsOnlyOff() throws {
+    /// Decode attention requant is TRI-STATE (`decodeAttnQuantChoice`): the
+    /// server distinguishes the flag's silent default (laguna requant on,
+    /// dsv4 comp_in dense) from an EXPLICIT `--decode-attn-quant` (which
+    /// also opts dsv4's characterization-gated comp_in requant in), so the
+    /// app must too — a plain Bool can't tell "not decided" from "switched
+    /// on" (the drafterOptOut class). nil emits nothing, true emits the
+    /// positive flag, false emits `--no-decode-attn-quant`.
+    func testDecodeAttnQuantTriStateEmitsExplicitChoicesOnly() throws {
         var opts = ServerOptions()
-        XCTAssertTrue(opts.decodeAttnQuant)  // transformer.zig DECODE_ATTN_QUANT_DEFAULT
+        XCTAssertNil(opts.decodeAttnQuantChoice)  // undecided = server default
         XCTAssertFalse(opts.toCLIArgs().contains("--decode-attn-quant"))
         XCTAssertFalse(opts.toCLIArgs().contains("--no-decode-attn-quant"))
 
-        opts.decodeAttnQuant = false
+        opts.decodeAttnQuantChoice = false
         XCTAssertTrue(opts.toCLIArgs().contains("--no-decode-attn-quant"))
         XCTAssertFalse(opts.toCLIArgs().contains("--decode-attn-quant"))
 
-        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
-        XCTAssertTrue(legacy.decodeAttnQuant)
+        opts.decodeAttnQuantChoice = true
+        XCTAssertTrue(opts.toCLIArgs().contains("--decode-attn-quant"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--no-decode-attn-quant"))
+
+        // explicit choices round-trip through the NEW storage key
         let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(opts))
-        XCTAssertEqual(back.decodeAttnQuant, false)
+        XCTAssertEqual(back.decodeAttnQuantChoice, true)
+    }
+
+    /// Legacy blobs always stored `decodeAttnQuant` (synthesized encode wrote
+    /// the default for every user who saved settings once), so a stored TRUE
+    /// is indistinguishable from "never touched" and must decode to nil —
+    /// never to an explicit opt-in that would silently enable dsv4's lossy
+    /// comp_in requant behind the user. A stored FALSE was a real choice and
+    /// survives as explicit off.
+    func testLegacyDecodeAttnQuantBlobMigratesWithoutInventingAnOptIn() throws {
+        let ambiguous = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"decodeAttnQuant": true}"#.utf8))
+        XCTAssertNil(ambiguous.decodeAttnQuantChoice)
+        let explicitOff = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"decodeAttnQuant": false}"#.utf8))
+        XCTAssertEqual(explicitOff.decodeAttnQuantChoice, false)
+        let empty = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertNil(empty.decodeAttnQuantChoice)
     }
 }

@@ -40,6 +40,24 @@ pub const Q = struct {
     qp: QuantParams,
 };
 
+/// A Q reshaped to per-group slabs [og, ol, ·] for the grouped low-rank O
+/// batched quantized_matmul. OWNING view handles (freed in deinit); qp is
+/// the parent Q's.
+const Q3 = struct {
+    w: mlx.mlx_array,
+    s: mlx.mlx_array,
+    b: mlx.mlx_array,
+};
+
+/// int8-g32 side copy of a layer's combined compressor-input operand
+/// (`comp_in_t`), served at decode/verify widths under the user-facing
+/// `--decode-attn-quant` config flag. OWNING handles (freed in deinit).
+const CompInQ = struct {
+    w: mlx.mlx_array,
+    s: mlx.mlx_array,
+    b: mlx.mlx_array,
+};
+
 /// Learned gated-pooling KV compressor (bf16 weights — the compression path
 /// is fp32-sensitive, the converter never quantizes it).
 pub const CompressorW = struct {
@@ -570,6 +588,9 @@ const HostComp = struct {
     // transposed [dim, coff*d] bf16 views for GPU-side x @ w.T
     wkv_t: mlx.mlx_array,
     wgate_t: mlx.mlx_array,
+    // GPU window-emission operands: norm weight (f32) + ape rows [ratio, cd]
+    norm_g: mlx.mlx_array,
+    ape_g: mlx.mlx_array,
 };
 const HostLayer = struct {
     // GPU-side transposed f32 operands for the per-token host matmuls
@@ -627,8 +648,26 @@ pub const Dsv4Model = struct {
     dec_state: ?Dsv4DecodeState = null,
     // per-layer wo_a dequantized as batched-matmul operands [og, gin, ol]
     // bf16 (built once at init — dequantizing 134 MB per layer per TOKEN was
-    // the v0 decode's dominant cost)
+    // the v0 decode's dominant cost). EMPTY when wo_a is served quantized
+    // (the default): the bf16 slabs were 67 MB/layer = 2.9 GB of the ~7.8 GB
+    // read per serial token, the single largest read in the forward.
     wo_a_deq: []mlx.mlx_array,
+    // per-layer wo_a quantized triples reshaped to per-group slabs
+    // [og, ol, ·] (pure views of the checkpoint arrays — batched
+    // quantized_matmul reads the 8-bit weight in place). Empty when
+    // `MLX_SERVE_DSV4_WO_QMM=0` restores the dequantized operands.
+    wo_a_q3: []Q3,
+    // per-layer int8-g32 side copies of comp_in_t served at decode/verify
+    // widths (C ≤ 32) under the user-facing --decode-attn-quant flag; big
+    // prefill chunks keep the dense bf16 operand (quality anchor). LOSSY by
+    // design (the laguna decode-attn-quant contract). Empty when the flag is
+    // off or on CPU streams (host-reference/test path stays dense).
+    comp_in_q: []?CompInQ,
+    // Lazy-decode GPU embed table [V, d] bf16 (GPU streams only; ~1 GB on
+    // the real mirror — the RAM the retired wo_a_deq freed): the sampled
+    // token id never touches the host, so decode logits stay a lazy graph
+    // and generate.zig's pipelined next() overlaps build with GPU execution.
+    embed_g: ?mlx.mlx_array = null,
     // GPU decode-chain constants
     ones_hd_g: mlx.mlx_array, // [hd] f32 ones (param-free per-head RMS weight)
     final_norm_g: mlx.mlx_array,
@@ -636,6 +675,14 @@ pub const Dsv4Model = struct {
     hada_g: ?mlx.mlx_array, // [ihd, ihd] f32 Hadamard matrix (x @ H == FWHT)
     // fused Sinkhorn kernel (GPU streams; null → host-sync fallback)
     sink_k: ?SinkhornK = null,
+    // fused Sinkhorn + y-collapse kernel (`MLX_SERVE_DSV4_SINKY=0` kills;
+    // falls back to sink_k + the composed multiply/sum tail)
+    sink_y_k: ?SinkhornK = null,
+    sink_y_logged: bool = false,
+    // fused hc_post kernel (`MLX_SERVE_DSV4_HCPOST=0` kills; needs sink_y_k
+    // for the pack input — falls back to the composed matmul/multiply/add)
+    hc_post_k: ?SinkhornK = null,
+    hc_post_logged: bool = false,
     sink_consts: mlx.mlx_array, // [hd_full, rms_eps, hc_eps] f32
     sink_logged: bool = false,
     // geometry (copied from config)
@@ -688,6 +735,8 @@ pub const Dsv4Model = struct {
     /// Sinkhorn kernel configs owned by the model, indexed by token count
     /// (slot 0 = the prefill sub-chunk). See `sinkhornCfgFor`.
     sink_cfg: [SINK_CFG_MAX + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null),
+    sink_y_cfg: [SINK_CFG_MAX + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null),
+    hc_post_cfg: [SINK_CFG_MAX + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null),
     /// Confidence LOGIT below which a drafted position is not submitted for
     /// verification (see `dsparkConfThreshold`). Tests move it to ±inf to pin
     /// the open/shut ends.
@@ -717,13 +766,28 @@ pub const Dsv4Model = struct {
             if (h.comp) |*c| {
                 _ = mlx.mlx_array_free(c.wkv_t);
                 _ = mlx.mlx_array_free(c.wgate_t);
+                _ = mlx.mlx_array_free(c.norm_g);
+                _ = mlx.mlx_array_free(c.ape_g);
             }
             if (h.idx_comp) |*c| {
                 _ = mlx.mlx_array_free(c.wkv_t);
                 _ = mlx.mlx_array_free(c.wgate_t);
+                _ = mlx.mlx_array_free(c.norm_g);
+                _ = mlx.mlx_array_free(c.ape_g);
             }
         }
         for (self.wo_a_deq) |h| _ = mlx.mlx_array_free(h);
+        for (self.wo_a_q3) |q3| {
+            _ = mlx.mlx_array_free(q3.w);
+            _ = mlx.mlx_array_free(q3.s);
+            _ = mlx.mlx_array_free(q3.b);
+        }
+        for (self.comp_in_q) |maybe| if (maybe) |q| {
+            _ = mlx.mlx_array_free(q.w);
+            _ = mlx.mlx_array_free(q.s);
+            _ = mlx.mlx_array_free(q.b);
+        };
+        if (self.embed_g) |h| _ = mlx.mlx_array_free(h);
         _ = mlx.mlx_array_free(self.ones_hd_g);
         _ = mlx.mlx_array_free(self.final_norm_g);
         _ = mlx.mlx_array_free(self.hc_head_fn_t);
@@ -733,7 +797,21 @@ pub const Dsv4Model = struct {
             _ = mlx.mlx_fast_metal_kernel_config_free(sk.cfg);
             _ = mlx.mlx_fast_metal_kernel_free(sk.kernel);
         }
+        if (self.sink_y_k) |*sk| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(sk.cfg);
+            _ = mlx.mlx_fast_metal_kernel_free(sk.kernel);
+        }
+        if (self.hc_post_k) |*sk| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(sk.cfg);
+            _ = mlx.mlx_fast_metal_kernel_free(sk.kernel);
+        }
         for (self.sink_cfg) |c| if (c) |cfg| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        };
+        for (self.sink_y_cfg) |c| if (c) |cfg| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        };
+        for (self.hc_post_cfg) |c| if (c) |cfg| {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         };
         if (self.ds_main_norm_g) |h| _ = mlx.mlx_array_free(h);
@@ -794,6 +872,15 @@ fn buildHadamardF32(alloc: std.mem.Allocator, n: usize, s: mlx.mlx_stream) !mlx.
 
 fn hostComp(alloc: std.mem.Allocator, c: *const CompressorW, dim: usize, head_dim: usize, ratio: usize, s: mlx.mlx_stream) !HostComp {
     const coff: usize = if (ratio == 4) 2 else 1;
+    const ape_g = blk: {
+        const f = try f32Handle(c.ape, s);
+        defer _ = mlx.mlx_array_free(f);
+        var r = mlx.mlx_array_new();
+        const shp = [_]c_int{ @intCast(ratio), @intCast(coff * head_dim) };
+        try mlx.check(mlx.mlx_reshape(&r, f, &shp, 2, s));
+        try mlx.check(mlx.mlx_array_eval(r));
+        break :blk r;
+    };
     return .{
         .wkv = try toHostF32(alloc, c.wkv, coff * head_dim * dim, s),
         .wgate = try toHostF32(alloc, c.wgate, coff * head_dim * dim, s),
@@ -803,6 +890,8 @@ fn hostComp(alloc: std.mem.Allocator, c: *const CompressorW, dim: usize, head_di
         .head_dim = head_dim,
         .wkv_t = try transposedF32(c.wkv, s),
         .wgate_t = try transposedF32(c.wgate, s),
+        .norm_g = try f32Handle(c.norm, s),
+        .ape_g = ape_g,
     };
 }
 
@@ -938,27 +1027,99 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
         }
         _ = li;
     }
-    // wo_a: dequant once, reshape to per-group slabs, transpose to matmul
-    // operand layout [og, gin, ol] (dense matmul reads strided views fine).
+    // wo_a: per-group slabs for the grouped low-rank O. Default = quantized
+    // VIEWS [og, ol, ·] read in place by batched quantized_matmul (the bf16
+    // wo_a_deq slabs were 2.9 GB of the ~7.8 GB read per serial token);
+    // `MLX_SERVE_DSV4_WO_QMM=0` restores the dequantized [og, gin, ol]
+    // operands (dense matmul reads strided views fine).
     const og: c_int = @intCast(cfg.dsv4_o_groups);
     const ol: c_int = @intCast(cfg.dsv4_o_lora_rank);
     const gin: c_int = @intCast(cfg.num_attention_heads * cfg.head_dim / cfg.dsv4_o_groups);
-    const wo_a_deq = try a.alloc(mlx.mlx_array, dw.layers.len);
-    for (wo_a_deq, dw.layers) |*hnd, *ly| {
-        var dq = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(dq);
-        const emp = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(emp);
-        try mlx.check(mlx.mlx_dequantize(&dq, ly.wo_a.w, ly.wo_a.s, ly.wo_a.b, mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.group_size)), mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.bits)), "affine", emp, mlx.mlx_optional_dtype{}, s));
-        var rs2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(rs2);
-        const shp = [_]c_int{ og, ol, gin };
-        try mlx.check(mlx.mlx_reshape(&rs2, dq, &shp, 3, s));
-        var tr = mlx.mlx_array_new();
-        const axes = [_]c_int{ 0, 2, 1 };
-        try mlx.check(mlx.mlx_transpose_axes(&tr, rs2, &axes, 3, s));
-        try mlx.check(mlx.mlx_array_eval(tr));
-        hnd.* = tr;
+    var wo_a_deq: []mlx.mlx_array = &.{};
+    var wo_a_q3: []Q3 = &.{};
+    // GPU streams only: the CPU stream is the host-reference/test path, whose
+    // numerics the python oracle models with dequantized operands (and whose
+    // decode-equivalence gate is strict BECAUSE both sides hit one gemm).
+    if (woAQmmEnabled() and mlx.streamIsGpu(s)) {
+        wo_a_q3 = try a.alloc(Q3, dw.layers.len);
+        for (wo_a_q3, dw.layers) |*q3, *ly| {
+            q3.* = .{
+                .w = try reshapeQ3(ly.wo_a.w, og, ol, s),
+                .s = try reshapeQ3(ly.wo_a.s, og, ol, s),
+                .b = try reshapeQ3(ly.wo_a.b, og, ol, s),
+            };
+        }
+    } else {
+        wo_a_deq = try a.alloc(mlx.mlx_array, dw.layers.len);
+        for (wo_a_deq, dw.layers) |*hnd, *ly| {
+            var dq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(dq);
+            const emp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(emp);
+            try mlx.check(mlx.mlx_dequantize(&dq, ly.wo_a.w, ly.wo_a.s, ly.wo_a.b, mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.group_size)), mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.bits)), "affine", emp, mlx.mlx_optional_dtype{}, s));
+            var rs2 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(rs2);
+            const shp = [_]c_int{ og, ol, gin };
+            try mlx.check(mlx.mlx_reshape(&rs2, dq, &shp, 3, s));
+            var tr = mlx.mlx_array_new();
+            const axes = [_]c_int{ 0, 2, 1 };
+            try mlx.check(mlx.mlx_transpose_axes(&tr, rs2, &axes, 3, s));
+            try mlx.check(mlx.mlx_array_eval(tr));
+            hnd.* = tr;
+        }
+    }
+
+    // comp_in int8-g32 side copies (decode/verify widths), gated on the
+    // user-facing --decode-attn-quant flag in its EXPLICIT form: the
+    // 2026-08-01 characterization moved one answer (a duplicated paragraph
+    // on 1/7 greedy prompts) against +7-8% decode, so dsv4 requires the
+    // user to actually ask — the flag's silent default stays dense here
+    // while laguna keeps its clean-characterization default. Built EAGERLY
+    // (evaled here) so the copies land inside the load-time budget, never
+    // first-touch mid-request (the lazy-stage-weights class). GPU streams
+    // only — the CPU stream is the host-reference/test path whose strict
+    // gates assume the dense operand.
+    var comp_in_q: []?CompInQ = &.{};
+    if (transformer.decodeAttnQuantExplicit() and mlx.streamIsGpu(s)) {
+        comp_in_q = try a.alloc(?CompInQ, dw.layers.len);
+        var q_bytes: usize = 0;
+        for (comp_in_q, hl) |*slot, *h| {
+            slot.* = null;
+            const cin = h.comp_in_t orelse continue;
+            // eligibility is the weight's own shape/dtype (house rule).
+            // comp_in_t is f32 BY CONSTRUCTION (transposedF32 upcasts the
+            // bf16 checkpoint weights for the f32 decode stream) — f32 is
+            // the expected dtype here, bf16/f16 accepted for robustness.
+            const dt = mlx.mlx_array_dtype(cin);
+            if (dt != .float32 and dt != .bfloat16 and dt != .float16) continue;
+            if (dim % 32 != 0) continue;
+            var wt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_transpose(&wt, cin, s)); // [W, dim] for transposed qmm
+            var qv = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(qv);
+            const emp2 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(emp2);
+            try mlx.check(mlx.mlx_quantize(&qv, wt, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "affine", emp2, s));
+            var qw = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(qw);
+            try mlx.check(mlx.mlx_vector_array_get(&qw, qv, 0));
+            var qs = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(qs);
+            try mlx.check(mlx.mlx_vector_array_get(&qs, qv, 1));
+            var qb = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(qb);
+            try mlx.check(mlx.mlx_vector_array_get(&qb, qv, 2));
+            try mlx.check(mlx.mlx_array_eval(qw));
+            try mlx.check(mlx.mlx_array_eval(qs));
+            try mlx.check(mlx.mlx_array_eval(qb));
+            q_bytes += mlx.mlx_array_size(qw) * mlx.mlx_array_itemsize(qw) +
+                mlx.mlx_array_size(qs) * mlx.mlx_array_itemsize(qs) +
+                mlx.mlx_array_size(qb) * mlx.mlx_array_itemsize(qb);
+            slot.* = .{ .w = qw, .s = qs, .b = qb };
+        }
+        if (q_bytes > 0)
+            log.info("dsv4: comp_in int8 side copies built ({d} MB; --no-decode-attn-quant restores dense)\n", .{q_bytes / (1024 * 1024)});
     }
 
     var embed_deq = mlx.mlx_array_new();
@@ -966,6 +1127,15 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     const empty = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(empty);
     try mlx.check(mlx.mlx_dequantize(&embed_deq, dw.embed.w, dw.embed.s, dw.embed.b, mlx.mlx_optional_int.some(@intCast(dw.embed.qp.group_size)), mlx.mlx_optional_int.some(@intCast(dw.embed.qp.bits)), "affine", empty, mlx.mlx_optional_dtype{}, s));
+    // lazy-decode GPU embed table (bf16; host embed_f32 = f32 of the same
+    // bf16 values, so the two lookup paths feed bit-identical rows)
+    var embed_g: ?mlx.mlx_array = null;
+    if (mlx.streamIsGpu(s) and lazyDecodeEnabled()) {
+        var eb = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&eb, embed_deq, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(eb));
+        embed_g = eb;
+    }
     const ones_hd_g = blk: {
         var o = mlx.mlx_array_new();
         const shp = [_]c_int{@intCast(cfg.head_dim)};
@@ -983,6 +1153,16 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     const sink_env_off = if (std.c.getenv("MLX_SERVE_DSV4_SINKHORN")) |v| v[0] == '0' else false;
     const sink_k = if (mlx.streamIsGpu(s) and !sink_env_off)
         buildSinkhornKernel(hc, cfg.dsv4_hc_sinkhorn_iters)
+    else
+        null;
+    const sink_y_env_off = if (std.c.getenv("MLX_SERVE_DSV4_SINKY")) |v| v[0] == '0' else false;
+    const sink_y_k = if (sink_k != null and !sink_y_env_off)
+        buildSinkhornYKernel(hc, cfg.dsv4_hc_sinkhorn_iters, dim)
+    else
+        null;
+    const hc_post_env_off = if (std.c.getenv("MLX_SERVE_DSV4_HCPOST")) |v| v[0] == '0' else false;
+    const hc_post_k = if (sink_y_k != null and !hc_post_env_off)
+        buildHcPostKernel(hc, dim)
     else
         null;
     // DSpark stage weights sit OUTSIDE every warmup/serial forward — left
@@ -1034,11 +1214,16 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
         .dw = dw,
         .hl = hl,
         .wo_a_deq = wo_a_deq,
+        .wo_a_q3 = wo_a_q3,
+        .comp_in_q = comp_in_q,
+        .embed_g = embed_g,
         .ones_hd_g = ones_hd_g,
         .final_norm_g = try f32Handle(dw.final_norm, s),
         .hc_head_fn_t = try transposedF32(dw.hc_head_fn, s),
         .hada_g = if (cfg.dsv4_index_head_dim > 0) try buildHadamardF32(gpa, cfg.dsv4_index_head_dim, s) else null,
         .sink_k = sink_k,
+        .sink_y_k = sink_y_k,
+        .hc_post_k = hc_post_k,
         .sink_consts = sink_consts,
         .history = std.array_list.Managed(u32).init(gpa),
         .final_norm = try toHostF32(a, dw.final_norm, dim, s),
@@ -1414,9 +1599,8 @@ fn woAApply(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, o: []const
     }
     const ob = try hostToBf16(gm, &.{ @intCast(og), @intCast(s_len), @intCast(gin) }, m.s);
     defer _ = mlx.mlx_array_free(ob);
-    var res = mlx.mlx_array_new();
+    const res = try woAMatmul(m, li, ob);
     defer _ = mlx.mlx_array_free(res);
-    try mlx.check(mlx.mlx_matmul(&res, ob, m.wo_a_deq[li], m.s));
     const rh = try toHostF32(alloc, res, og * s_len * ol, m.s);
     defer alloc.free(rh);
     const out = try alloc.alloc(f32, s_len * og * ol);
@@ -1455,6 +1639,199 @@ fn compDeferEnabled() bool {
     return v;
 }
 
+/// wo_a served quantized (`MLX_SERVE_DSV4_WO_QMM=0` → the bf16 wo_a_deq
+/// slabs, the pre-quantized behavior). LOAD-time decision: the enabled path
+/// never builds the 2.9 GB of dequantized operands. Cached once per process.
+var wo_qmm_state: ?bool = null;
+var wo_qmm_logged: bool = false;
+fn woAQmmEnabled() bool {
+    if (wo_qmm_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_WO_QMM")) |e| e[0] != '0' else true;
+    wo_qmm_state = v;
+    return v;
+}
+
+/// Reshape one member of a wo_a quantized triple [og*ol, X] → [og, ol, X]
+/// (contiguous row-major → pure view, no copy).
+fn reshapeQ3(arr: mlx.mlx_array, og: c_int, ol: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const x: c_int = mlx.mlx_array_shape(arr)[1];
+    var out = mlx.mlx_array_new();
+    const shp = [_]c_int{ og, ol, x };
+    try mlx.check(mlx.mlx_reshape(&out, arr, &shp, 3, s));
+    return out;
+}
+
+/// Grouped low-rank O tail shared by decode/batch/DSpark-stage attention and
+/// the host reference: [og, M, gin] bf16 @ wo_a → [og, M, ol]. Default reads
+/// the checkpoint's quantized wo_a in place (batched quantized_matmul over
+/// the og slabs); the kill switch restores the dequantized bf16 operands.
+fn woAMatmul(m: *const Dsv4Model, li: usize, ob: mlx.mlx_array) !mlx.mlx_array {
+    if (m.wo_a_q3.len > 0) {
+        if (!wo_qmm_logged) {
+            wo_qmm_logged = true;
+            log.info("dsv4: wo_a batched-qmm path engaged\n", .{});
+        }
+        const q3 = &m.wo_a_q3[li];
+        const qp = &m.dw.layers[li].wo_a.qp;
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_quantized_matmul(&out, ob, q3.w, q3.s, q3.b, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", m.s));
+        return out;
+    }
+    return try gpuOp2(mlx.mlx_matmul, ob, m.wo_a_deq[li], m.s);
+}
+
+/// GPU window emission kill switch (`MLX_SERVE_DSV4_GPU_EMIT=0` → host
+/// emission with the in-layer blocking sync, the pre-GPU behavior). Cached.
+var gpu_emit_state: ?bool = null;
+var gpu_emit_logged: bool = false;
+fn gpuEmitEnabled() bool {
+    if (gpu_emit_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_GPU_EMIT")) |e| e[0] != '0' else true;
+    gpu_emit_state = v;
+    return v;
+}
+
+/// GPU emission serves GPU streams only: the CPU stream is the host
+/// reference/test path whose strict gates assume host emission.
+fn gpuEmitActive(m: *const Dsv4Model) bool {
+    return gpuEmitEnabled() and mlx.streamIsGpu(m.s);
+}
+
+/// Fused window-emission kernel kill switch (`MLX_SERVE_DSV4_EMIT_KERNEL=0`
+/// → the composed ~60-op emission graph, the pre-kernel behavior). Cached.
+var emit_kernel_state: ?bool = null;
+var emit_kernel_logged: bool = false;
+/// Engagement counter (tests assert the kernel actually ran — a silent
+/// decline is output-identical to the fallback, house rule).
+var emit_kernel_hits: usize = 0;
+fn emitKernelEnabled() bool {
+    if (emit_kernel_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_EMIT_KERNEL")) |e| e[0] != '0' else true;
+    emit_kernel_state = v;
+    return v;
+}
+/// Test hook: force the fused-emission arm on/off (null = re-read the env).
+fn emitKernelSetForTest(v: ?bool) void {
+    emit_kernel_state = v;
+}
+
+/// Fused decode-chain kernel kill switch (`MLX_SERVE_DSV4_DEC_CHAIN=0` → the
+/// composed per-head RMS/rope/sim op chains, the pre-kernel behavior). Cached.
+var dec_chain_state: ?bool = null;
+var dec_chain_logged: bool = false;
+var dec_chain_hits: usize = 0;
+fn decChainEnabled() bool {
+    if (dec_chain_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_DEC_CHAIN")) |e| e[0] != '0' else true;
+    dec_chain_state = v;
+    return v;
+}
+/// Test hook: force the decode-chain arm on/off (null = re-read the env).
+fn decChainSetForTest(v: ?bool) void {
+    dec_chain_state = v;
+}
+
+/// Fused MoE gate+up gather — OPT-IN (`MLX_SERVE_DSV4_MOE_GATEUP=1`): the
+/// same-boot A/B on the real 2-bit gs64 trunk measured it ~2.5% SLOWER than
+/// the two stock gather_qmm dispatches + clippedSwigluG (29.6 → 28.9 tok/s,
+/// 2026-08-01) — the house "stock gather wins where O(bank) doesn't dominate
+/// the expert math" outcome, re-measured here because MLX's 2/3-bit kernels
+/// are its slowest. Kept behind the switch for future geometries. Cached.
+var moe_gateup_state: ?bool = null;
+var moe_gateup_logged: bool = false;
+var moe_gateup_hits: usize = 0;
+fn moeGateUpEnabled() bool {
+    if (moe_gateup_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_MOE_GATEUP")) |e| e[0] == '1' else false;
+    moe_gateup_state = v;
+    return v;
+}
+/// Test hook: force the MoE gate+up arm on/off (null = re-read the env).
+fn moeGateUpSetForTest(v: ?bool) void {
+    moe_gateup_state = v;
+}
+
+/// Fused sink-softmax — OPT-IN (`MLX_SERVE_DSV4_SINK_SOFTMAX=1`): the
+/// same-boot A/B measured it NEUTRAL-to-slightly-negative (~29.6 vs ~29.8
+/// tok/s composed, 2026-08-01) — the composed 4-dispatch chain is already
+/// overlapped by the GPU (the fusedAttnGate on-chain-but-overlapped class),
+/// and the kernel is not bit-identical (softmax reduction tree). A
+/// byte-changing lever with no measured win stays off. Cached.
+var sink_softmax_state: ?bool = null;
+var sink_softmax_logged: bool = false;
+var sink_softmax_hits: usize = 0;
+fn sinkSoftmaxEnabled() bool {
+    if (sink_softmax_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_SINK_SOFTMAX")) |e| e[0] == '1' else false;
+    sink_softmax_state = v;
+    return v;
+}
+/// Test hook: force the sink-softmax arm on/off (null = re-read the env).
+fn sinkSoftmaxSetForTest(v: ?bool) void {
+    sink_softmax_state = v;
+}
+
+/// comp_in decode-side int8 requant engagement counter — the serving arm is
+/// gated by the user-facing `--decode-attn-quant` config flag
+/// (`transformer.decodeAttnQuantEnabled`), same contract as the laguna
+/// attention side copies: decode/verify widths only, prefill keeps dense.
+var comp_in_q_hits: usize = 0;
+var comp_in_q_logged: bool = false;
+
+/// comp_in projection: the int8-g32 side copy at decode/verify widths
+/// (C ≤ 32 — serial decode, DSpark verify blocks, and tiny suffix prefills,
+/// which must all see the SAME weights or spec-on/off diverges at temp 0,
+/// the laguna rule), dense bf16 otherwise. The copies exist only when
+/// --decode-attn-quant was on at load, so this is a null-check per call.
+fn compInProj(m: *const Dsv4Model, h: *const HostLayer, li: usize, x_g: mlx.mlx_array, C: usize) !mlx.mlx_array {
+    if (C <= 32 and m.comp_in_q.len > li) {
+        if (m.comp_in_q[li]) |q| {
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_quantized_matmul(&out, x_g, q.w, q.s, q.b, true, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "affine", m.s));
+            comp_in_q_hits += 1;
+            if (!comp_in_q_logged) {
+                comp_in_q_logged = true;
+                log.info("dsv4: comp_in decode requant engaged (int8 g32, decode/verify widths; --no-decode-attn-quant restores dense)\n", .{});
+            }
+            return out;
+        }
+    }
+    return try gpuOp2(mlx.mlx_matmul, x_g, h.comp_in_t.?, m.s);
+}
+
+/// Lazy pipelined decode kill switch (`MLX_SERVE_DSV4_LAZY_DECODE=0` → the
+/// synchronous decodeStep with per-token host logits). Cached.
+var lazy_decode_state: ?bool = null;
+var lazy_decode_logged: bool = false;
+fn lazyDecodeEnabled() bool {
+    if (lazy_decode_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_LAZY_DECODE")) |e| e[0] != '0' else true;
+    lazy_decode_state = v;
+    return v;
+}
+
+/// Per-token/per-chunk phase trace (`MLX_SERVE_DSV4_TRACE=1`): decode logs
+/// pos, build/head/defer/comp µs + the gap since the previous step returned;
+/// extendChunk logs C, layers/comp/defer/head ms. Wall-clock only, no extra
+/// evals — everything is lazy until the head sync, so "build" is honest CPU
+/// graph-construction time (plus any in-layer compressor barrier, which is
+/// exactly what the mod-4 pattern is meant to expose).
+var dsv4_trace_state: ?bool = null;
+fn dsv4TraceEnabled() bool {
+    if (dsv4_trace_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_TRACE")) |e| e[0] == '1' else false;
+    dsv4_trace_state = v;
+    return v;
+}
+/// Compressor barrier time (sync + host pushes) accumulated inside the layer
+/// loop; single inference thread, reset by the caller per token/chunk.
+var trace_comp_ns: u64 = 0;
+/// End timestamp of the previous decodeStep (gap = host sampling/dispatch
+/// time between steps, GPU idle).
+var trace_last_end: ?std.Io.Timestamp = null;
+
 const RouteG = struct {
     ind: mlx.mlx_array, // [C, k] int32 expert indices
     w: mlx.mlx_array, // [C, k, 1, 1] f32 normalized route weights × route_scale
@@ -1480,6 +1857,8 @@ fn routeGpu(
     scores_g: mlx.mlx_array,
     gate_bias: ?mlx.mlx_array,
     tid2eid: ?[]const i64,
+    tid2eid_g: ?mlx.mlx_array,
+    id_arr: ?mlx.mlx_array,
     ids: []const u32,
     E: usize,
     k: usize,
@@ -1501,7 +1880,23 @@ fn routeGpu(
     defer _ = mlx.mlx_array_free(sp);
     try mlx.check(mlx.mlx_sqrt(&sp, sp_raw, s));
 
-    if (tid2eid) |tid| {
+    if (tid2eid != null and id_arr != null) {
+        // lazy single-token hash lookup: tid2eid row via take on device
+        std.debug.assert(seq == 1);
+        const t2 = tid2eid_g.?;
+        const t2_shape = [_]c_int{ @intCast(mlx.mlx_array_size(t2) / k), @intCast(k) };
+        var t2v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(t2v);
+        try mlx.check(mlx.mlx_reshape(&t2v, t2, &t2_shape, 2, s));
+        const fshape = [_]c_int{1};
+        var idf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(idf);
+        try mlx.check(mlx.mlx_reshape(&idf, id_arr.?, &fshape, 1, s));
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_take_axis(&row, t2v, idf, 0, s)); // [1, k]
+        try mlx.check(mlx.mlx_astype(&ind, row, .int32, s));
+    } else if (tid2eid) |tid| {
         const hi = try alloc.alloc(i32, seq * k);
         defer alloc.free(hi);
         for (ids, 0..) |id, t| {
@@ -1551,6 +1946,16 @@ fn gatherQmmE(q: *const Q, xin: mlx.mlx_array, indices_: mlx.mlx_array, s: mlx.m
     return out;
 }
 
+/// gatherQmmE with PRE-SORTED expert indices (x already gathered into slot
+/// order): the sorted hint lets consecutive slots stream one expert bank.
+fn gatherQmmESorted(q: *const Q, xin: mlx.mlx_array, indices_: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const empty = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(empty);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_gather_qmm(&out, xin, q.w, q.s, q.b, empty, indices_, true, mlx.mlx_optional_int.some(@intCast(q.qp.group_size)), mlx.mlx_optional_int.some(@intCast(q.qp.bits)), "affine", true, s));
+    return out;
+}
+
 /// Clipped SwiGLU in f32 (reference computes it in float32), back to bf16.
 fn clippedSwigluG(gate_in: mlx.mlx_array, up_in: mlx.mlx_array, limit: f32, s: mlx.mlx_stream) !mlx.mlx_array {
     const lim = mlx.mlx_array_new_float(limit);
@@ -1583,6 +1988,194 @@ fn clippedSwigluG(gate_in: mlx.mlx_array, up_in: mlx.mlx_array, limit: f32, s: m
     try mlx.check(mlx.mlx_multiply(&act32, silu, u_cl, s));
     var act = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&act, act32, .bfloat16, s));
+    return act;
+}
+
+/// The transformer.zig `gatherQmvGateUp` body with dsv4's clipped SwiGLU
+/// tail: accumulators round to T exactly where the composed gather_qmm pair
+/// wrote T(acc), then the f32 clip chain with the sigmoid read from an exact
+/// bf16-indexed table of mlx_sigmoid values (the swigluSigTable rule — a
+/// metal::exp transcendental is a rounding apart from the metallib).
+const MOE_GATEUP_KERNEL_SOURCE =
+    \\auto lane = thread_index_in_simdgroup;
+    \\uint n = thread_position_in_grid.y;      // output row within the expert
+    \\uint e = thread_position_in_grid.z;      // top-K slot
+    \\
+    \\int K = KS;
+    \\int N = NS;
+    \\int VPW = 32 / BITS;
+    \\int K_by_p = K / VPW;
+    \\int K_by_gs = K / GS;
+    \\uint mask = (1u << BITS) - 1u;
+    \\
+    \\uint eid = uint(inds[e]);
+    \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_p + (size_t)n * (size_t)K_by_p;
+    \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
+    \\
+    \\float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+    \\float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+    \\for (int pack = int(lane); pack < K_by_p; pack += 32) {
+    \\  uint32_t packed_g = wg_q[wbase + (size_t)pack];
+    \\  uint32_t packed_u = wu_q[wbase + (size_t)pack];
+    \\  int k_base = pack * VPW;
+    \\  int gi = k_base / GS;
+    \\  float sjg = float(g_scales[gbase + (size_t)gi]);
+    \\  float bjg = float(g_biases[gbase + (size_t)gi]);
+    \\  float sju = float(u_scales[gbase + (size_t)gi]);
+    \\  float bju = float(u_biases[gbase + (size_t)gi]);
+    \\  for (int ki = 0; ki < VPW; ki += 4) {
+    \\    size_t xi = (size_t)(k_base + ki);
+    \\    uint32_t qg = packed_g >> (ki * BITS);
+    \\    uint32_t qu = packed_u >> (ki * BITS);
+    \\    float x0 = float(x[xi + 0]);
+    \\    float x1 = float(x[xi + 1]);
+    \\    float x2 = float(x[xi + 2]);
+    \\    float x3 = float(x[xi + 3]);
+    \\    g0 += x0 * (float((qg >> (0 * BITS)) & mask) * sjg + bjg);
+    \\    g1 += x1 * (float((qg >> (1 * BITS)) & mask) * sjg + bjg);
+    \\    g2 += x2 * (float((qg >> (2 * BITS)) & mask) * sjg + bjg);
+    \\    g3 += x3 * (float((qg >> (3 * BITS)) & mask) * sjg + bjg);
+    \\    u0 += x0 * (float((qu >> (0 * BITS)) & mask) * sju + bju);
+    \\    u1 += x1 * (float((qu >> (1 * BITS)) & mask) * sju + bju);
+    \\    u2 += x2 * (float((qu >> (2 * BITS)) & mask) * sju + bju);
+    \\    u3 += x3 * (float((qu >> (3 * BITS)) & mask) * sju + bju);
+    \\  }
+    \\}
+    \\float acc_g = simd_sum((g0 + g1) + (g2 + g3));
+    \\float acc_u = simd_sum((u0 + u1) + (u2 + u3));
+    \\if (lane == 0) {
+    \\  // Round exactly where the composed pair wrote T(acc), then the f32
+    \\  // clip chain: gate clips HIGH only, up clips both sides (reference).
+    \\  T gt = T(acc_g);
+    \\  T ut = T(acc_u);
+    \\  float g32 = float(gt);
+    \\  float u32 = float(ut);
+    \\  float gc = metal::min(g32, consts[0]);
+    \\  float uc = metal::clamp(u32, -consts[0], consts[0]);
+    \\  float sig = sigtab[as_type<ushort>(T(gc))];
+    \\  y[(size_t)e * (size_t)N + (size_t)n] = T((gc * sig) * uc);
+    \\}
+;
+
+var moe_gateup_obj: ?mlx.mlx_fast_metal_kernel = null;
+var moe_gateup_build_failed: bool = false;
+fn moeGateUpObj() ?mlx.mlx_fast_metal_kernel {
+    if (moe_gateup_build_failed) return null;
+    if (moe_gateup_obj) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "consts" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_moe_gateup", in_vec, out_vec, MOE_GATEUP_KERNEL_SOURCE, "", true, false);
+    if (kernel.ctx == null) {
+        moe_gateup_build_failed = true;
+        log.warn("dsv4: fused MoE gate+up kernel failed to build — composed gathers fallback\n", .{});
+        return null;
+    }
+    moe_gateup_obj = kernel;
+    return kernel;
+}
+
+/// f32 sigmoid over every bf16-representable input, computed ONCE by
+/// mlx_sigmoid itself (256 KB) so the kernel's activation cannot disagree
+/// with the composed chain's transcendental. Never freed: process-lifetime.
+var moe_sigtab: ?mlx.mlx_array = null;
+fn moeSigTableF32(s: mlx.mlx_stream) !mlx.mlx_array {
+    if (moe_sigtab) |t| return t;
+    const vals = try std.heap.c_allocator.alloc(f32, 65536);
+    defer std.heap.c_allocator.free(vals);
+    for (vals, 0..) |*v, i| {
+        const bits: u32 = @as(u32, @intCast(i)) << 16; // bf16 → f32 is exact widening
+        v.* = @bitCast(bits);
+    }
+    const shape = [_]c_int{65536};
+    const raw = uploadF32(vals, &shape);
+    defer _ = mlx.mlx_array_free(raw);
+    var sig = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, raw, s));
+    try mlx.check(mlx.mlx_array_eval(sig));
+    moe_sigtab = sig;
+    return sig;
+}
+
+const MoeGateUpKey = struct { topk: u32, n: u32, ks: u32, bits: u32, gs: u32 };
+var moe_gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var moe_gateup_cfg_key: MoeGateUpKey = std.mem.zeroes(MoeGateUpKey);
+
+/// Fused decode gate+up gather + clipped SwiGLU: both expert dot products in
+/// one simdgroup (x loaded once, dequant chains interleaved), activation
+/// applied before the write — the transformer.zig `gatherQmvGateUp` pattern
+/// with dsv4's clipped SwiGLU (f32 chain, sigmoid via an exact bf16-indexed
+/// table). Returns [1, TOPK, 1, N] bf16 (the composed `act` shape), or null
+/// to decline (kill switch, ineligible geometry, build failure).
+fn moeGateUpFused(m: *const Dsv4Model, xe: mlx.mlx_array, q_gate: *const Q, q_up: *const Q, ind: mlx.mlx_array, k: usize) !?mlx.mlx_array {
+    if (!moeGateUpEnabled() or !mlx.streamIsGpu(m.s)) return null;
+    const bits = q_gate.qp.bits;
+    const gs = q_gate.qp.group_size;
+    // eligibility is the kernel's own conditions, never a model list
+    if (bits != 2 and bits != 4 and bits != 8) return null;
+    if (gs % (32 / bits) != 0) return null;
+    if (q_up.qp.bits != bits or q_up.qp.group_size != gs) return null;
+    if (q_gate.b.ctx == null or q_up.b.ctx == null) return null;
+    if (mlx.mlx_array_dtype(xe) != .bfloat16) return null; // sigtab is bf16-indexed
+    const idt = mlx.mlx_array_dtype(ind);
+    if (idt != .int32 and idt != .uint32) return null;
+    if (mlx.mlx_array_ndim(q_gate.w) != 3 or mlx.mlx_array_ndim(q_up.w) != 3) return null;
+    const wsh = mlx.mlx_array_shape(q_gate.w);
+    const ush = mlx.mlx_array_shape(q_up.w);
+    for (0..3) |i| if (wsh[i] != ush[i]) return null;
+    const N: usize = @intCast(wsh[1]);
+    const K: usize = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
+    if (K % gs != 0 or N % 8 != 0) return null;
+    const kernel = moeGateUpObj() orelse return null;
+    const key = MoeGateUpKey{ .topk = @intCast(k), .n = @intCast(N), .ks = @intCast(K), .bits = bits, .gs = gs };
+    if (moe_gateup_cfg == null or !std.meta.eql(moe_gateup_cfg_key, key)) {
+        if (moe_gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        moe_gateup_cfg = null;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        const y_shape = [_]c_int{ @intCast(k), @intCast(N) };
+        if (mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, .bfloat16) != 0 or
+            mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, @intCast(N), @intCast(k)) != 0 or
+            mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 8, 1) != 0 or
+            mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16) != 0 or
+            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(gs)) != 0 or
+            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)) != 0 or
+            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KS", @intCast(K)) != 0 or
+            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NS", @intCast(N)) != 0)
+        {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            return null;
+        }
+        moe_gateup_cfg = cfg;
+        moe_gateup_cfg_key = key;
+    }
+    const sigtab = try moeSigTableF32(m.s);
+    const lim_arr = [_]f32{m.swiglu_limit};
+    const lshape = [_]c_int{1};
+    const lim_g = uploadF32(&lim_arr, &lshape);
+    defer _ = mlx.mlx_array_free(lim_g);
+    const inputs_arr = [_]mlx.mlx_array{ xe, q_gate.w, q_gate.s, q_gate.b, q_up.w, q_up.s, q_up.b, ind, sigtab, lim_g };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, moe_gateup_cfg.?, m.s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    const act_shape = [_]c_int{ 1, @intCast(k), 1, @intCast(N) };
+    var act = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(act);
+    try mlx.check(mlx.mlx_reshape(&act, y, &act_shape, 4, m.s));
+    moe_gateup_hits += 1;
+    if (!moe_gateup_logged) {
+        moe_gateup_logged = true;
+        log.info("dsv4: fused MoE gate+up kernel engaged (topk={d} inter={d} bits={d} gs={d})\n", .{ k, N, bits, gs });
+    }
     return act;
 }
 
@@ -2278,6 +2871,214 @@ test "dsv4: incremental decode matches full re-forward (DSV4_MINI)" {
         try testing.expect(agree * 10 >= steps * 8);
         std.debug.print("dsv4 decode-equivalence (gpu={}): OK through n=34, argmax {d}/{d} (window 8, ratios 4/16 crossed)\n", .{ use_gpu, agree, steps });
     }
+}
+
+test "dsv4: wo_a batched qmm slabs match the dequantized operands (no worse than bf16 ref)" {
+    // The grouped low-rank O tail's two servings of the SAME checkpoint
+    // weight: dequantized bf16 slabs [og, gin, ol] (matmul) vs quantized
+    // views [og, ol, ·] (batched quantized_matmul). Both compared against
+    // f32 dequant ground truth — never kernel-vs-kernel (house rule): the
+    // qmm arm must not be meaningfully worse than the bf16 arm it replaces.
+    const allocator = testing.allocator;
+    const og: usize = 4;
+    const ol: usize = 8;
+    const gin: usize = 128;
+    const M: usize = 3;
+    const s = if (!mlx.noGpuBackend()) mlx.gpuStream() else mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    var rng = std.Random.DefaultPrng.init(7);
+    const wf = try allocator.alloc(f32, og * ol * gin);
+    defer allocator.free(wf);
+    for (wf) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+    const xf = try allocator.alloc(f32, og * M * gin);
+    defer allocator.free(xf);
+    for (xf) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+
+    const wshape = [_]c_int{ @intCast(og * ol), @intCast(gin) };
+    const w32 = uploadF32(wf, &wshape);
+    defer _ = mlx.mlx_array_free(w32);
+    var wb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wb);
+    try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s)); // bf16 scales, like the checkpoint
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, s));
+    var q_w = mlx.mlx_array_new();
+    var q_s = mlx.mlx_array_new();
+    var q_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_w);
+    defer _ = mlx.mlx_array_free(q_s);
+    defer _ = mlx.mlx_array_free(q_b);
+    try mlx.check(mlx.mlx_vector_array_get(&q_w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&q_s, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&q_b, triple, 2));
+
+    const gs64 = mlx.mlx_optional_int.some(64);
+    const b8 = mlx.mlx_optional_int.some(8);
+    const emp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emp);
+    var dq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq);
+    try mlx.check(mlx.mlx_dequantize(&dq, q_w, q_s, q_b, gs64, b8, "affine", emp, mlx.mlx_optional_dtype{}, s));
+
+    // f32 ground truth: x [og, M, gin] @ deq-f32 [og, gin, ol]
+    const xshape = [_]c_int{ @intCast(og), @intCast(M), @intCast(gin) };
+    const x32 = uploadF32(xf, &xshape);
+    defer _ = mlx.mlx_array_free(x32);
+    const ref = blk: {
+        var dq32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dq32);
+        try mlx.check(mlx.mlx_astype(&dq32, dq, .float32, s));
+        var r3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r3);
+        const shp3 = [_]c_int{ @intCast(og), @intCast(ol), @intCast(gin) };
+        try mlx.check(mlx.mlx_reshape(&r3, dq32, &shp3, 3, s));
+        var tr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tr);
+        const axes = [_]c_int{ 0, 2, 1 };
+        try mlx.check(mlx.mlx_transpose_axes(&tr, r3, &axes, 3, s));
+        var out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_matmul(&out, x32, tr, s));
+        break :blk try toHostF32(allocator, out, og * M * ol, s);
+    };
+    defer allocator.free(ref);
+
+    var xb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xb);
+    try mlx.check(mlx.mlx_astype(&xb, x32, .bfloat16, s));
+
+    // arm A: the bf16 dequantized-slab matmul (the wo_a_deq path)
+    const arm_a = blk: {
+        var r3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r3);
+        const shp3 = [_]c_int{ @intCast(og), @intCast(ol), @intCast(gin) };
+        try mlx.check(mlx.mlx_reshape(&r3, dq, &shp3, 3, s));
+        var tr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tr);
+        const axes = [_]c_int{ 0, 2, 1 };
+        try mlx.check(mlx.mlx_transpose_axes(&tr, r3, &axes, 3, s));
+        var out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_matmul(&out, xb, tr, s));
+        break :blk try toHostF32(allocator, out, og * M * ol, s);
+    };
+    defer allocator.free(arm_a);
+
+    // arm B: quantized views + batched qmm (the wo_a_q3 path)
+    const arm_b = blk: {
+        const v_w = try reshapeQ3(q_w, @intCast(og), @intCast(ol), s);
+        defer _ = mlx.mlx_array_free(v_w);
+        const v_s = try reshapeQ3(q_s, @intCast(og), @intCast(ol), s);
+        defer _ = mlx.mlx_array_free(v_s);
+        const v_b = try reshapeQ3(q_b, @intCast(og), @intCast(ol), s);
+        defer _ = mlx.mlx_array_free(v_b);
+        var out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_quantized_matmul(&out, xb, v_w, v_s, v_b, true, gs64, b8, "affine", s));
+        break :blk try toHostF32(allocator, out, og * M * ol, s);
+    };
+    defer allocator.free(arm_b);
+
+    var err_a: f64 = 0;
+    var err_b: f64 = 0;
+    for (ref, arm_a, arm_b) |r, va, vb| {
+        try testing.expect(std.math.isFinite(vb));
+        err_a += @abs(@as(f64, va) - r);
+        err_b += @abs(@as(f64, vb) - r);
+    }
+    // qmm dequantizes in f32 on the fly — it should be no worse than the
+    // bf16-rounded operands (1.5x slack absorbs reduction-order noise).
+    try testing.expect(err_b <= err_a * 1.5 + 1e-3);
+}
+
+test "dsv4: lazy pipelined decode matches decodeStep at every position (DSV4_MINI)" {
+    // Two states, same prefill, same fed ids: decodeStepLazy (GPU token id,
+    // lazy logits, deferred ring drains) must produce the same argmax as the
+    // synchronous decodeStep every step, crossing ratio-4/16 boundaries so
+    // the drain-before-emission path runs. GPU stream only — the lazy path
+    // requires it by contract.
+    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    if (mlx.noGpuBackend()) return;
+    const path = std.mem.span(path_z);
+    const allocator = testing.allocator;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
+    defer allocator.free(cfg_path);
+    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    file.close(io);
+    defer allocator.free(cfg_json);
+    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
+    defer allocator.free(shard_path);
+    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    defer weights.deinit();
+
+    const dw = try loadDsv4Weights(allocator, &cfg, &weights);
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    _ = unsetenv("MLX_SERVE_DSV4_DSPARK"); // test-order hygiene: lazy needs DSpark off
+    var mdl = try initModel(allocator, &cfg, dw, s);
+    defer mdl.deinit();
+    try testing.expect(mdl.embed_g != null);
+
+    var rng = std.Random.DefaultPrng.init(21);
+    var ids: [33]u32 = undefined;
+    for (&ids) |*v| v.* = rng.random().uintLessThan(u32, @intCast(mdl.vocab));
+
+    var st_sync = try initDecodeState(&mdl, allocator);
+    defer deinitDecodeState(&st_sync);
+    var st_lazy = try initDecodeState(&mdl, allocator);
+    defer deinitDecodeState(&st_lazy);
+    try testing.expect(lazyDecodeReady(&mdl, &st_lazy));
+    {
+        const p1 = try prefillIntoState(&mdl, allocator, &st_sync, ids[0..17]);
+        allocator.free(p1);
+        const p2 = try prefillIntoState(&mdl, allocator, &st_lazy, ids[0..17]);
+        allocator.free(p2);
+    }
+    var agree: usize = 0;
+    var steps: usize = 0;
+    for (17..ids.len) |n| {
+        const sync_logits = try decodeStep(&mdl, allocator, &st_sync, ids[n]);
+        defer allocator.free(sync_logits);
+        const idv: i32 = @intCast(ids[n]);
+        const ishape = [_]c_int{ 1, 1 };
+        const id_arr = mlx.mlx_array_new_data(&idv, &ishape, 2, .int32);
+        defer _ = mlx.mlx_array_free(id_arr);
+        const lazy_g = try decodeStepLazy(&mdl, allocator, &st_lazy, id_arr);
+        defer _ = mlx.mlx_array_free(lazy_g);
+        const lazy_logits = try toHostF32(allocator, lazy_g, @intCast(mdl.vocab), s);
+        defer allocator.free(lazy_logits);
+        var am_s: usize = 0;
+        var am_l: usize = 0;
+        var dot: f64 = 0;
+        var na: f64 = 0;
+        var nb: f64 = 0;
+        for (sync_logits, lazy_logits, 0..) |a2, b2, i| {
+            try testing.expect(std.math.isFinite(b2));
+            dot += @as(f64, a2) * b2;
+            na += @as(f64, a2) * a2;
+            nb += @as(f64, b2) * b2;
+            if (a2 > sync_logits[am_s]) am_s = i;
+            if (b2 > lazy_logits[am_l]) am_l = i;
+        }
+        const cos = dot / (@sqrt(na) * @sqrt(nb) + 1e-30);
+        steps += 1;
+        if (am_s == am_l) agree += 1;
+        try testing.expect(cos > 0.999);
+    }
+    // the graphs are op-identical (same inputs, same order) — argmax must
+    // agree everywhere; cos gate above catches wiring bugs with a message
+    try testing.expectEqual(steps, agree);
+    // teardown-drain path: pending rows may remain after the last token
+    try drainPending(&mdl, &st_lazy);
+    try testing.expectEqual(@as(usize, 0), st_lazy.pending.items.len);
 }
 
 test "dsv4: GpuRows.truncate is offset-only and appends overwrite stale rows" {
@@ -3571,7 +4372,16 @@ pub const Dsv4DecodeState = struct {
     /// verify chunk (null everywhere else — prefill pays one null check per
     /// token per layer). See `DsparkAnchors`.
     anchors: ?DsparkAnchors = null,
+    /// Lazy-decode: compressor-input rows whose HOST push is still pending
+    /// (position order). Drained by `drainPending` before any consumer of the
+    /// host rings runs — the next window-boundary token's emission build, a
+    /// prefill/verify chunk, or state teardown.
+    pending: std.ArrayList(PendingComp) = .empty,
 };
+
+/// One deferred compressor-input row awaiting its host ring push (lazy
+/// decode). `arr` is the [1, comp_in_w] GPU row for layer `li` at `pos`.
+pub const PendingComp = struct { li: usize, arr: mlx.mlx_array, pos: usize };
 
 /// A batched verify integrates B+1 tokens at once, but a partial accept must
 /// keep only a prefix. Everything the chunk mutates rolls back by OFFSET
@@ -3741,6 +4551,8 @@ pub fn initDecodeState(m: *const Dsv4Model, alloc: std.mem.Allocator) !Dsv4Decod
 }
 
 pub fn deinitDecodeState(st: *Dsv4DecodeState) void {
+    for (st.pending.items) |p| _ = mlx.mlx_array_free(p.arr);
+    st.pending.deinit(st.alloc);
     for (st.layers) |*ls| {
         ls.kv.deinit();
         ls.kv_gpu.deinit();
@@ -3946,6 +4758,32 @@ fn compressorPush(m: *const Dsv4Model, c: *const HostComp, cs: *CompDecState, kv
     try emitCompSlot(m, c, cs, combined, pos + 1 - ratio, rotate, fr);
 }
 
+/// Ring-only mirror of `compressorPush` for when the GPU emission owns the
+/// emitted bytes: identical ring writes (memcpy + ape add + boundary shift),
+/// but the emitted slot advances the host cache by LENGTH only (zeros).
+/// Nothing on the GPU stream reads host cache CONTENT — the mirror appends
+/// are suppressed, snapshots/anchors compare lengths, restore only
+/// truncates — while the combine/norm/rope/QAT-sim host arithmetic this
+/// skips measured as ~95% of a 512-token prefill chunk's wall time.
+fn compressorPushLight(c: *const HostComp, cs: *CompDecState, kv_in: []const f32, sc_in: []const f32, pos: usize, ratio: usize) !void {
+    const d = c.head_dim;
+    const cd = c.coff * d;
+    const r_in = pos % ratio;
+    const overlap = c.coff == 2;
+    const slot = if (overlap) ratio + r_in else r_in;
+    @memcpy(cs.kv_pend[slot * cs.width ..][0..cd], kv_in[0..cd]);
+    const dst = cs.sc_pend[slot * cs.width ..][0..cd];
+    for (dst, sc_in[0..cd], c.ape[r_in * cd ..][0..cd]) |*o, sv, av| o.* = sv + av;
+    if ((pos + 1) % ratio != 0) return;
+    if (overlap) {
+        for (0..ratio) |r2| {
+            @memcpy(cs.kv_pend[r2 * cs.width ..][0..cs.width], cs.kv_pend[(ratio + r2) * cs.width ..][0..cs.width]);
+            @memcpy(cs.sc_pend[r2 * cs.width ..][0..cs.width], cs.sc_pend[(ratio + r2) * cs.width ..][0..cs.width]);
+        }
+    }
+    try cs.cache.appendNTimes(0, d);
+}
+
 /// Lazily grown rope tables for decode (per kind), stored on the model.
 fn freqsFor(m: *Dsv4Model, comptime kind: enum { plain, yarn }, upto: usize, alloc: std.mem.Allocator) !*const Freqs {
     const slot = switch (kind) {
@@ -4033,6 +4871,98 @@ fn gpuRms(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.
 // Reference = hcSplitSinkhorn (golden-tested); metal::exp differs from libm
 // by ~1 ulp — the comb path is continuous (no quantizer downstream), and the
 // decode-equivalence gate arbitrates. Kill: MLX_SERVE_DSV4_SINKHORN=0.
+/// SINKHORN + y-collapse in one dispatch: the composed tail (pre slice →
+/// reshape → multiply → sum) was 4 strictly-serial dispatches per sublayer,
+/// ~350/token at hc-chain depth. Grid (S, D); each threadgroup's lane-0
+/// thread recomputes the tiny per-token Sinkhorn into threadgroup memory
+/// (HC=4: ~700 flops, negligible), then every thread emits one y channel:
+/// y[t, j] = Σ_c pre[c]·stream[t, c, j] — ascending c, product rounded per
+/// step, matching the composed multiply+sum reduction. `out` (pre|post|combT
+/// pack) is written by the j==0 threadgroup only.
+const SINKHORN_Y_KERNEL_SOURCE =
+    \\int t = thread_position_in_grid.x;
+    \\int j = thread_position_in_grid.y;
+    \\if (t >= S || j >= D) return;
+    \\const int PACK = 2 * HC + HC * HC;
+    \\const int MIX = (2 + HC) * HC;
+    \\threadgroup float tg_pre[HC];
+    \\if (thread_position_in_threadgroup.y == 0) {
+    \\  float rsq = metal::rsqrt(ssq[t] / consts[0] + consts[1]);
+    \\  const float heps = consts[2];
+    \\  float pre_v[HC];
+    \\  float post_v[HC];
+    \\  float comb[HC * HC];
+    \\  for (int c = 0; c < HC; ++c) {
+    \\    float mj = mixes[t * MIX + c] * rsq;
+    \\    pre_v[c] = 1.0f / (1.0f + metal::exp(-(mj * scale[0] + base[c]))) + heps;
+    \\    float mp = mixes[t * MIX + HC + c] * rsq;
+    \\    post_v[c] = 2.0f / (1.0f + metal::exp(-(mp * scale[1] + base[HC + c])));
+    \\  }
+    \\  for (int c = 0; c < HC * HC; ++c) {
+    \\    comb[c] = mixes[t * MIX + 2 * HC + c] * rsq * scale[2] + base[2 * HC + c];
+    \\  }
+    \\  for (int c = 0; c < HC; ++c) {
+    \\    float mx = comb[c * HC];
+    \\    for (int q = 1; q < HC; ++q) mx = metal::max(mx, comb[c * HC + q]);
+    \\    float sum = 0.0f;
+    \\    for (int q = 0; q < HC; ++q) {
+    \\      comb[c * HC + q] = metal::exp(comb[c * HC + q] - mx);
+    \\      sum += comb[c * HC + q];
+    \\    }
+    \\    for (int q = 0; q < HC; ++q) comb[c * HC + q] = comb[c * HC + q] / sum + heps;
+    \\  }
+    \\  for (int it = 0; it < ITERS; ++it) {
+    \\    if (it > 0) {
+    \\      for (int c = 0; c < HC; ++c) {
+    \\        float sum = 0.0f;
+    \\        for (int q = 0; q < HC; ++q) sum += comb[c * HC + q];
+    \\        for (int q = 0; q < HC; ++q) comb[c * HC + q] /= (sum + heps);
+    \\      }
+    \\    }
+    \\    for (int q = 0; q < HC; ++q) {
+    \\      float sum = 0.0f;
+    \\      for (int c = 0; c < HC; ++c) sum += comb[c * HC + q];
+    \\      for (int c = 0; c < HC; ++c) comb[c * HC + q] /= (sum + heps);
+    \\    }
+    \\  }
+    \\  for (int c = 0; c < HC; ++c) tg_pre[c] = pre_v[c];
+    \\  if (j == 0) {
+    \\    for (int c = 0; c < HC; ++c) {
+    \\      out[t * PACK + c] = pre_v[c];
+    \\      out[t * PACK + HC + c] = post_v[c];
+    \\    }
+    \\    for (int c = 0; c < HC; ++c) {
+    \\      for (int q = 0; q < HC; ++q) out[t * PACK + 2 * HC + q * HC + c] = comb[c * HC + q];
+    \\    }
+    \\  }
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\float acc = 0.0f;
+    \\for (int c = 0; c < HC; ++c) {
+    \\  float p = tg_pre[c] * stream_in[(t * HC + c) * D + j];
+    \\  acc = acc + p;
+    \\}
+    \\y[t * D + j] = acc;
+;
+
+/// hc_post in one dispatch: ns[t,c,j] = Σ_q combT[t,c,q]·stream[t,q,j] +
+/// post[t,c]·out[t,j], reading post/combT straight from the sinkhorn pack —
+/// replaces the per-sublayer slice/reshape/matmul/multiply/add tail.
+const HCPOST_KERNEL_SOURCE =
+    \\int t = thread_position_in_grid.x;
+    \\int c = thread_position_in_grid.y;
+    \\int j = thread_position_in_grid.z;
+    \\if (t >= S || c >= HC || j >= D) return;
+    \\const int PACK = 2 * HC + HC * HC;
+    \\float acc = 0.0f;
+    \\for (int q = 0; q < HC; ++q) {
+    \\  float p = pk[t * PACK + 2 * HC + c * HC + q] * stream_in[(t * HC + q) * D + j];
+    \\  acc = acc + p;
+    \\}
+    \\acc = acc + pk[t * PACK + HC + c] * out_v[t * D + j];
+    \\ns[(t * HC + c) * D + j] = acc;
+;
+
 const SINKHORN_KERNEL_SOURCE =
     \\int t = thread_position_in_grid.x;
     \\if (t >= S) return;
@@ -4097,7 +5027,7 @@ const SinkhornK = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_
 const SINK_CFG_MAX: usize = 32;
 
 fn sinkhornCfgCacheable(tokens: usize) bool {
-    return (tokens >= 1 and tokens <= SINK_CFG_MAX) or tokens == PREFILL_SUB;
+    return (tokens >= 1 and tokens <= SINK_CFG_MAX) or tokens == prefillSub();
 }
 
 /// Cached `sinkhornCfg`, keyed by the token count it bakes into the output
@@ -4109,7 +5039,7 @@ fn sinkhornCfgCacheable(tokens: usize) bool {
 fn sinkhornCfgFor(m: *Dsv4Model, tokens: usize) !mlx.mlx_fast_metal_kernel_config {
     if (!sinkhornCfgCacheable(tokens))
         return sinkhornCfg(m.hc, m.hc_iters, tokens) orelse error.MetalKernelConfigFailed;
-    const slot: usize = if (tokens == PREFILL_SUB) 0 else tokens;
+    const slot: usize = if (tokens == prefillSub()) 0 else tokens;
     if (m.sink_cfg[slot]) |c| return c;
     const c = sinkhornCfg(m.hc, m.hc_iters, tokens) orelse return error.MetalKernelConfigFailed;
     m.sink_cfg[slot] = c;
@@ -4132,6 +5062,129 @@ fn sinkhornCfg(hc: usize, iters: u32, tokens: usize) ?mlx.mlx_fast_metal_kernel_
         return null;
     }
     return cfg;
+}
+
+fn sinkhornYCfg(hc: usize, iters: u32, tokens: usize, d: usize) ?mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    const pack: c_int = @intCast(2 * hc + hc * hc);
+    const out_shape = [_]c_int{ @intCast(tokens), pack };
+    const y_shape = [_]c_int{ @intCast(tokens), @intCast(d) };
+    const tgy: c_int = @intCast(@min(d, 256));
+    if (mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 2, .float32) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, .float32) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(tokens), @intCast(d), 1) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1, tgy, 1) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", @intCast(hc)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ITERS", @intCast(iters)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "S", @intCast(tokens)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", @intCast(d)) != 0)
+    {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        return null;
+    }
+    return cfg;
+}
+
+/// Cached `sinkhornYCfg` (same slot policy as `sinkhornCfgFor`).
+fn sinkhornYCfgFor(m: *Dsv4Model, tokens: usize) !mlx.mlx_fast_metal_kernel_config {
+    if (!sinkhornCfgCacheable(tokens))
+        return sinkhornYCfg(m.hc, m.hc_iters, tokens, m.dim) orelse error.MetalKernelConfigFailed;
+    const slot: usize = if (tokens == prefillSub()) 0 else tokens;
+    if (m.sink_y_cfg[slot]) |c| return c;
+    const c = sinkhornYCfg(m.hc, m.hc_iters, tokens, m.dim) orelse return error.MetalKernelConfigFailed;
+    m.sink_y_cfg[slot] = c;
+    return c;
+}
+
+fn hcPostCfg(hc: usize, tokens: usize, d: usize) ?mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    const ns_shape = [_]c_int{ @intCast(tokens), @intCast(hc), @intCast(d) };
+    const tgz: c_int = @intCast(@min(d, 256));
+    if (mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &ns_shape, 3, .float32) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(tokens), @intCast(hc), @intCast(d)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1, 1, tgz) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", @intCast(hc)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "S", @intCast(tokens)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", @intCast(d)) != 0)
+    {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        return null;
+    }
+    return cfg;
+}
+
+/// Cached `hcPostCfg` (same slot policy as `sinkhornCfgFor`).
+fn hcPostCfgFor(m: *Dsv4Model, tokens: usize) !mlx.mlx_fast_metal_kernel_config {
+    if (!sinkhornCfgCacheable(tokens))
+        return hcPostCfg(m.hc, tokens, m.dim) orelse error.MetalKernelConfigFailed;
+    const slot: usize = if (tokens == prefillSub()) 0 else tokens;
+    if (m.hc_post_cfg[slot]) |c| return c;
+    const c = hcPostCfg(m.hc, tokens, m.dim) orelse return error.MetalKernelConfigFailed;
+    m.hc_post_cfg[slot] = c;
+    return c;
+}
+
+fn buildHcPostKernel(hc: usize, d: usize) ?SinkhornK {
+    const input_names = [_][*:0]const u8{ "pk", "stream_in", "out_v" };
+    const output_names = [_][*:0]const u8{"ns"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_hc_post", in_vec, out_vec, HCPOST_KERNEL_SOURCE, "", true, false);
+    if (kernel.ctx == null) return null;
+    const cfg = hcPostCfg(hc, 1, d) orelse {
+        _ = mlx.mlx_fast_metal_kernel_free(kernel);
+        return null;
+    };
+    return .{ .kernel = kernel, .cfg = cfg };
+}
+
+fn applyHcPost(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, pk: mlx.mlx_array, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const inputs_arr = [_]mlx.mlx_array{ pk, stream_g, out_g };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, sk.kernel, inputs_vec, cfg, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    return out;
+}
+
+fn buildSinkhornYKernel(hc: usize, iters: u32, d: usize) ?SinkhornK {
+    const input_names = [_][*:0]const u8{ "mixes", "ssq", "scale", "base", "consts", "stream_in" };
+    const output_names = [_][*:0]const u8{ "out", "y" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_sinkhorn_y", in_vec, out_vec, SINKHORN_Y_KERNEL_SOURCE, "", true, false);
+    if (kernel.ctx == null) return null;
+    const cfg = sinkhornYCfg(hc, iters, 1, d) orelse {
+        _ = mlx.mlx_fast_metal_kernel_free(kernel);
+        return null;
+    };
+    return .{ .kernel = kernel, .cfg = cfg };
+}
+
+/// Apply the fused sinkhorn+collapse kernel: returns the packed
+/// [pre|post|combT] rows AND y [tokens, d] (both owned).
+fn applySinkhornY(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, mixes_g: mlx.mlx_array, ss_g: mlx.mlx_array, scale_g: mlx.mlx_array, base_g: mlx.mlx_array, consts_g: mlx.mlx_array, stream_g: mlx.mlx_array, s: mlx.mlx_stream) !struct { pk: mlx.mlx_array, y: mlx.mlx_array } {
+    const inputs_arr = [_]mlx.mlx_array{ mixes_g, ss_g, scale_g, base_g, consts_g, stream_g };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, sk.kernel, inputs_vec, cfg, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+    var pk = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(pk);
+    try mlx.check(mlx.mlx_vector_array_get(&pk, outputs_vec, 0));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 1));
+    return .{ .pk = pk, .y = y };
 }
 
 /// Build the fused Sinkhorn kernel + its decode (tokens=1) config. Owned by
@@ -4167,7 +5220,14 @@ fn applySinkhorn(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, mi
     return out;
 }
 
-const HcPreG = struct { y: mlx.mlx_array, post_g: mlx.mlx_array, combT_g: mlx.mlx_array };
+const HcPreG = struct {
+    y: mlx.mlx_array,
+    post_g: mlx.mlx_array,
+    combT_g: mlx.mlx_array,
+    /// The raw sinkhorn pack when the fused hc_post kernel will consume it
+    /// directly (post_g/combT_g stay EMPTY handles then).
+    pk: ?mlx.mlx_array = null,
+};
 
 /// hc_pre for ONE token with the stream resident on GPU. With the fused
 /// Sinkhorn kernel (GPU streams) there is NO host hop at all; the fallback
@@ -4195,7 +5255,27 @@ fn hcPreGpu(m: *Dsv4Model, alloc: std.mem.Allocator, stream_g: mlx.mlx_array, fn
     errdefer _ = mlx.mlx_array_free(combT_g);
     const col_shape = [_]c_int{ @intCast(hcm), 1 };
     const comb_shape = [_]c_int{ @intCast(hcm), @intCast(hcm) };
-    if (m.sink_k) |*sk| {
+    if (m.sink_y_k) |*sk| {
+        // sinkhorn + y collapse in ONE dispatch — the composed 4-op tail
+        // (pre slice/reshape/multiply/sum) sat serially on the hc chain
+        if (!m.sink_y_logged) {
+            m.sink_y_logged = true;
+            log.info("dsv4: fused sinkhorn+collapse kernel engaged\n", .{});
+        }
+        const r = try applySinkhornY(sk, sk.cfg, mixes_g, ss, scale_g, base_g, m.sink_consts, stream_g, m.s);
+        if (m.hc_post_k != null) {
+            // the fused hc_post consumes the pack directly — no slices
+            return .{ .y = r.y, .post_g = post_g, .combT_g = combT_g, .pk = r.pk };
+        }
+        defer _ = mlx.mlx_array_free(r.pk);
+        const post_flat = try gpuSliceCols(r.pk, 1, hcm, 2 * hcm, m.s);
+        defer _ = mlx.mlx_array_free(post_flat);
+        try mlx.check(mlx.mlx_reshape(&post_g, post_flat, &col_shape, 2, m.s));
+        const comb_flat = try gpuSliceCols(r.pk, 1, 2 * hcm, 2 * hcm + hcm * hcm, m.s);
+        defer _ = mlx.mlx_array_free(comb_flat);
+        try mlx.check(mlx.mlx_reshape(&combT_g, comb_flat, &comb_shape, 2, m.s));
+        return .{ .y = r.y, .post_g = post_g, .combT_g = combT_g };
+    } else if (m.sink_k) |*sk| {
         const pk = try applySinkhorn(sk, sk.cfg, mixes_g, ss, scale_g, base_g, m.sink_consts, m.s);
         defer _ = mlx.mlx_array_free(pk);
         if (!m.sink_logged) {
@@ -4244,10 +5324,23 @@ fn freeHcPre(pre: *const HcPreG) void {
     _ = mlx.mlx_array_free(pre.y);
     _ = mlx.mlx_array_free(pre.post_g);
     _ = mlx.mlx_array_free(pre.combT_g);
+    if (pre.pk) |p| _ = mlx.mlx_array_free(p);
 }
 
-/// hc_post on GPU: new_stream = combᵀ @ residual + post·out.
-fn hcPostGpu(m: *const Dsv4Model, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, pre: *const HcPreG) !mlx.mlx_array {
+/// hc_post on GPU: new_stream = combᵀ @ residual + post·out. With the fused
+/// kernel (pre.pk set) the whole tail is ONE dispatch.
+fn hcPostGpu(m: *Dsv4Model, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, pre: *const HcPreG) !mlx.mlx_array {
+    if (pre.pk) |pk| {
+        const sk = &m.hc_post_k.?;
+        if (!m.hc_post_logged) {
+            m.hc_post_logged = true;
+            log.info("dsv4: fused hc_post kernel engaged\n", .{});
+        }
+        const ns3 = try applyHcPost(sk, sk.cfg, pk, stream_g, out_g, m.s); // [1, hc, d]
+        defer _ = mlx.mlx_array_free(ns3);
+        const shape2 = [_]c_int{ @intCast(m.hc), @intCast(m.dim) };
+        return try gpuReshape(ns3, &shape2, m.s);
+    }
     const res = try gpuOp2(mlx.mlx_matmul, pre.combT_g, stream_g, m.s);
     defer _ = mlx.mlx_array_free(res);
     const po = try gpuOp2(mlx.mlx_multiply, pre.post_g, out_g, m.s);
@@ -4277,6 +5370,17 @@ fn traceMemMb(comptime which: enum { active, cache, peak }) usize {
 }
 
 fn moeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx.mlx_array, ids: []const u32) !mlx.mlx_array {
+    return moeGpuImpl(m, alloc, li, x_g, ids, null);
+}
+
+/// `moeGpu` with the token id as a LAZY GPU array (single token): hash-layer
+/// routing looks the tid2eid row up via take on device, so the id never
+/// touches the host (the lazy decode path's requirement).
+fn moeGpuLazy(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx.mlx_array, id_arr: mlx.mlx_array) !mlx.mlx_array {
+    return moeGpuImpl(m, alloc, li, x_g, &.{0}, id_arr);
+}
+
+fn moeGpuImpl(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx.mlx_array, ids: []const u32, id_arr: ?mlx.mlx_array) !mlx.mlx_array {
     const ly = &m.dw.layers[li];
     const h = &m.hl[li];
     const E = m.n_experts;
@@ -4292,12 +5396,12 @@ fn moeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx.mlx
     var w_arr = mlx.mlx_array_new(); // [C, k, 1, 1] f32 route weights
     defer _ = mlx.mlx_array_free(w_arr);
 
-    if (moeRouteGpuEnabled()) {
+    if (moeRouteGpuEnabled() or id_arr != null) {
         if (!moe_route_gpu_logged) {
             moe_route_gpu_logged = true;
             log.info("dsv4: GPU MoE routing engaged\n", .{});
         }
-        var rg = try routeGpu(m.s, alloc, scores_g, ly.gate_bias, h.tid2eid, ids, E, k, m.route_scale);
+        var rg = try routeGpu(m.s, alloc, scores_g, ly.gate_bias, h.tid2eid, ly.tid2eid, id_arr, ids, E, k, m.route_scale);
         defer rg.deinit();
         try mlx.check(mlx.mlx_array_set(&ind, rg.ind));
         try mlx.check(mlx.mlx_array_set(&w_arr, rg.w));
@@ -4320,23 +5424,90 @@ fn moeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx.mlx
         try mlx.check(mlx.mlx_array_set(&w_arr, wu));
     }
 
-    const xshape = [_]c_int{ @intCast(seq), 1, 1, @intCast(m.dim) };
-    const xr = try gpuReshape(x_g, &xshape, m.s);
-    defer _ = mlx.mlx_array_free(xr);
-    var xe = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xe);
-    try mlx.check(mlx.mlx_astype(&xe, xr, .bfloat16, m.s));
-    const gate_arr = try gatherQmmE(&ly.experts_w1, xe, ind, m.s);
-    defer _ = mlx.mlx_array_free(gate_arr);
-    const up_arr = try gatherQmmE(&ly.experts_w3, xe, ind, m.s);
-    defer _ = mlx.mlx_array_free(up_arr);
-    const act = try clippedSwigluG(gate_arr, up_arr, m.swiglu_limit, m.s);
-    defer _ = mlx.mlx_array_free(act);
-    const down_arr = try gatherQmmE(&ly.experts_w2, act, ind, m.s);
-    defer _ = mlx.mlx_array_free(down_arr);
     var down32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(down32);
-    try mlx.check(mlx.mlx_astype(&down32, down_arr, .float32, m.s));
+    if (seq > 1) {
+        // ── global-sort gather (mlx-lm's _gather_sort; the moeMLP2 /
+        // inklingExpertsApply pattern): argsort the flattened (token, expert)
+        // pairs so consecutive gather_qmm slots hit the SAME expert bank and
+        // each routed expert's rows stream from DRAM once per chunk instead
+        // of once per token — the unsorted path re-read ~12x at C=512.
+        const total: c_int = @intCast(seq * k);
+        const flat_shape = [_]c_int{total};
+        var flat_inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat_inds);
+        try mlx.check(mlx.mlx_reshape(&flat_inds, ind, &flat_shape, 1, m.s));
+        var order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(order);
+        try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, m.s));
+        var inv_order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(inv_order);
+        try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, m.s));
+        var sorted_inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sorted_inds);
+        try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, m.s));
+        const k_arr = mlx.mlx_array_new_int(@intCast(k));
+        defer _ = mlx.mlx_array_free(k_arr);
+        var lhs_idx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lhs_idx);
+        try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, m.s));
+        var xb2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xb2);
+        try mlx.check(mlx.mlx_astype(&xb2, x_g, .bfloat16, m.s));
+        var x_gathered = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_gathered);
+        try mlx.check(mlx.mlx_take_axis(&x_gathered, xb2, lhs_idx, 0, m.s));
+        const n1d = [_]c_int{ total, 1, @intCast(m.dim) };
+        const x_rep = try gpuReshape(x_gathered, &n1d, m.s);
+        defer _ = mlx.mlx_array_free(x_rep);
+        const gate_arr = try gatherQmmESorted(&ly.experts_w1, x_rep, sorted_inds, m.s);
+        defer _ = mlx.mlx_array_free(gate_arr);
+        const up_arr = try gatherQmmESorted(&ly.experts_w3, x_rep, sorted_inds, m.s);
+        defer _ = mlx.mlx_array_free(up_arr);
+        const act = try clippedSwigluG(gate_arr, up_arr, m.swiglu_limit, m.s);
+        defer _ = mlx.mlx_array_free(act);
+        const down_arr = try gatherQmmESorted(&ly.experts_w2, act, sorted_inds, m.s);
+        defer _ = mlx.mlx_array_free(down_arr);
+        const nd_shape = [_]c_int{ total, @intCast(m.dim) };
+        const down_flat = try gpuReshape(down_arr, &nd_shape, m.s);
+        defer _ = mlx.mlx_array_free(down_flat);
+        var unsorted = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(unsorted);
+        try mlx.check(mlx.mlx_take_axis(&unsorted, down_flat, inv_order, 0, m.s));
+        var un32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(un32);
+        try mlx.check(mlx.mlx_astype(&un32, unsorted, .float32, m.s));
+        const ckd = [_]c_int{ @intCast(seq), @intCast(k), 1, @intCast(m.dim) };
+        var d4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(d4);
+        try mlx.check(mlx.mlx_reshape(&d4, un32, &ckd, 4, m.s));
+        try mlx.check(mlx.mlx_array_set(&down32, d4));
+    } else {
+        const xshape = [_]c_int{ @intCast(seq), 1, 1, @intCast(m.dim) };
+        const xr = try gpuReshape(x_g, &xshape, m.s);
+        defer _ = mlx.mlx_array_free(xr);
+        var xe = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xe);
+        try mlx.check(mlx.mlx_astype(&xe, xr, .bfloat16, m.s));
+        const topk: usize = @intCast(mlx.mlx_array_shape(ind)[1]);
+        var act = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(act);
+        if (try moeGateUpFused(m, xe, &ly.experts_w1, &ly.experts_w3, ind, topk)) |fused| {
+            defer _ = mlx.mlx_array_free(fused);
+            try mlx.check(mlx.mlx_array_set(&act, fused));
+        } else {
+            const gate_arr = try gatherQmmE(&ly.experts_w1, xe, ind, m.s);
+            defer _ = mlx.mlx_array_free(gate_arr);
+            const up_arr = try gatherQmmE(&ly.experts_w3, xe, ind, m.s);
+            defer _ = mlx.mlx_array_free(up_arr);
+            const composed = try clippedSwigluG(gate_arr, up_arr, m.swiglu_limit, m.s);
+            defer _ = mlx.mlx_array_free(composed);
+            try mlx.check(mlx.mlx_array_set(&act, composed));
+        }
+        const down_arr = try gatherQmmE(&ly.experts_w2, act, ind, m.s);
+        defer _ = mlx.mlx_array_free(down_arr);
+        try mlx.check(mlx.mlx_astype(&down32, down_arr, .float32, m.s));
+    }
     const weighted = try gpuOp2(mlx.mlx_multiply, down32, w_arr, m.s);
     defer _ = mlx.mlx_array_free(weighted);
     var routed = mlx.mlx_array_new();
@@ -4372,13 +5543,11 @@ fn moeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx.mlx
                 return @sqrt(acc);
             }
         }.f;
-        log.info("[dspark-trace] moe li={d} mem(pre)={d}/{d}/{d}MB scores={d:.4} w={d:.4} gate={d:.4} act={d:.4}\n", .{
+        log.info("[dspark-trace] moe li={d} mem(pre)={d}/{d}/{d}MB scores={d:.4} w={d:.4}\n", .{
             li,
             traceMemMb(.active),      traceMemMb(.cache),       traceMemMb(.peak),
             pr(alloc, scores_g, seq * E, m.s),
             pr(alloc, w_arr, seq * k, m.s),
-            pr(alloc, gate_arr, seq * k * m.moe_inter, m.s),
-            pr(alloc, act, seq * k * m.moe_inter, m.s),
         });
         log.info("[dspark-trace] moe li={d} mem(mid)={d}/{d}/{d}MB down={d:.4} routed={d:.4} shared={d:.4} mem(post)={d}/{d}/{d}MB\n", .{
             li,
@@ -4435,6 +5604,7 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
     const q_rot = blk: {
         const q_flat = try gpuQmmB(&ly.wq_b, qr_n, m.s);
         defer _ = mlx.mlx_array_free(q_flat);
+        if (try decChainKernel(m, q_flat, nh, hd, rd, m.ones_hd_g, 0, false, rr)) |fused| break :blk fused;
         const qshape = [_]c_int{ @intCast(nh), @intCast(hd) };
         const q_r = try gpuReshape(q_flat, &qshape, m.s);
         defer _ = mlx.mlx_array_free(q_r);
@@ -4448,6 +5618,10 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
     {
         const kv0 = try gpuQmmB(&ly.wkv, x_g, m.s);
         defer _ = mlx.mlx_array_free(kv0);
+        if (try decChainKernel(m, kv0, 1, hd, rd, h.kv_norm_g, 1, false, rr)) |kv_fused| {
+            defer _ = mlx.mlx_array_free(kv_fused);
+            try ls.kv_gpu.appendGpu(kv_fused, 1, m.s);
+        } else {
         const kv_n = try gpuRms(kv0, h.kv_norm_g, m.eps, m.s);
         defer _ = mlx.mlx_array_free(kv_n);
         const kv_rot = try gpuRopeTail(kv_n, rd, rr.cos, rr.sin, false, m.s);
@@ -4461,6 +5635,7 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
         const kv_fin = try gpuConcat2(head_sim, tail, 1, m.s);
         defer _ = mlx.mlx_array_free(kv_fin);
         try ls.kv_gpu.appendGpu(kv_fin, 1, m.s);
+        }
     }
 
     // compressor rings: ONE sync feeds the attn AND indexer wkv/wgate rows —
@@ -4471,11 +5646,23 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
     // (`processDeferredComp`) instead of stalling the pipeline per layer
     // (~41 blocking round-trips/token at steady state before this).
     if (ratio != 0) {
-        const comp_in = try gpuOp2(mlx.mlx_matmul, x_g, h.comp_in_t.?, m.s);
+        const comp_in = try compInProj(m, h, li, x_g, 1);
         const boundary_attn = (pos + 1) % ratio == 0;
         const boundary_idx = ls.idx_comp != null and (pos + 1) % 4 == 0;
-        if (boundary_attn or boundary_idx or !compDeferEnabled()) {
+        if (gpuEmitActive(m)) {
+            // window emission stays pure GPU graph (the emitted slot is
+            // same-token-visible to the selection below via the mirror);
+            // the host pushes defer to end-of-token like every other row.
+            const cdd = h.comp.?.coff * h.comp.?.head_dim;
+            if (boundary_attn)
+                try emitWindowsGpu(m, &h.comp.?, &ls.comp.?, &ls.comp_gpu, comp_in, 0, pos, 1, ratio, false, fr, alloc);
+            if (boundary_idx)
+                try emitWindowsGpu(m, &h.idx_comp.?, &ls.idx_comp.?, &ls.idx_gpu, comp_in, 2 * cdd, pos, 1, 4, true, fr, alloc);
+            errdefer _ = mlx.mlx_array_free(comp_in);
+            try deferred.append(alloc, .{ .li = li, .arr = comp_in });
+        } else if (boundary_attn or boundary_idx or !compDeferEnabled()) {
             defer _ = mlx.mlx_array_free(comp_in);
+            var cclk: DsparkClock = if (dsv4TraceEnabled()) DsparkClock.init() else undefined;
             const row = try toHostF32(alloc, comp_in, h.comp_in_w, m.s);
             defer alloc.free(row);
             const c = &h.comp.?;
@@ -4495,6 +5682,7 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
                 if (csx.cache.items.len > before)
                     try ls.idx_gpu.append(csx.cache.items[before..], m.s);
             }
+            if (dsv4TraceEnabled()) trace_comp_ns += cclk.lap();
         } else {
             errdefer _ = mlx.mlx_array_free(comp_in);
             try deferred.append(alloc, .{ .li = li, .arr = comp_in });
@@ -4515,6 +5703,7 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
             const qi_sim = blk: {
                 const qi = try gpuQmmB(&ly.idx.?.wq_b, qr_n, m.s);
                 defer _ = mlx.mlx_array_free(qi);
+                if (try decChainKernel(m, qi, ih, ihd, rd, null, 2, false, rr)) |fused| break :blk fused;
                 const qsh = [_]c_int{ @intCast(ih), @intCast(ihd) };
                 const qi_r = try gpuReshape(qi, &qsh, m.s);
                 defer _ = mlx.mlx_array_free(qi_r);
@@ -4535,20 +5724,21 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
             defer _ = mlx.mlx_array_free(zero);
             const relu = try gpuOp2(mlx.mlx_maximum, sc, zero, m.s);
             defer _ = mlx.mlx_array_free(relu);
-            // per-head weights: weights_proj(x)·(ihd·ih)^-1/2 as a column
+            // per-head weights: weights_proj(x)·(ihd·ih)^-1/2 — the head sum
+            // is ONE [1, ih] @ [ih, avail] matmul (replaces the composed
+            // transpose/broadcast-multiply/multiply/sum chain)
             const wts_row = try gpuOp2(mlx.mlx_matmul, x_g, h.idx_wp_t.?, m.s);
             defer _ = mlx.mlx_array_free(wts_row);
-            const wts_col = try gpuOp1(mlx.mlx_transpose, wts_row, m.s);
-            defer _ = mlx.mlx_array_free(wts_col);
             const wscale = mlx.mlx_array_new_float(@floatCast(1.0 / (@sqrt(@as(f64, @floatFromInt(ihd))) * @sqrt(@as(f64, @floatFromInt(ih))))));
             defer _ = mlx.mlx_array_free(wscale);
-            const wts_s = try gpuOp2(mlx.mlx_multiply, wts_col, wscale, m.s);
+            const wts_s = try gpuOp2(mlx.mlx_multiply, wts_row, wscale, m.s);
             defer _ = mlx.mlx_array_free(wts_s);
-            const weighted = try gpuOp2(mlx.mlx_multiply, relu, wts_s, m.s);
-            defer _ = mlx.mlx_array_free(weighted);
+            const summed2 = try gpuOp2(mlx.mlx_matmul, wts_s, relu, m.s); // [1, avail]
+            defer _ = mlx.mlx_array_free(summed2);
+            const sshape = [_]c_int{@intCast(avail)};
             var summed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(summed);
-            try mlx.check(mlx.mlx_sum_axis(&summed, weighted, 0, false, m.s));
+            try mlx.check(mlx.mlx_reshape(&summed, summed2, &sshape, 1, m.s));
             const all_slots = try ls.comp_gpu.sliceRows(0, avail, m.s);
             defer _ = mlx.mlx_array_free(all_slots);
             if (avail > k) {
@@ -4595,20 +5785,30 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
     defer _ = mlx.mlx_array_free(kt);
     const scores0 = try gpuOp2(mlx.mlx_matmul, q_rot, kt, m.s);
     defer _ = mlx.mlx_array_free(scores0);
-    const scale_arr = mlx.mlx_array_new_float(@floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd)))));
-    defer _ = mlx.mlx_array_free(scale_arr);
-    const scaled = try gpuOp2(mlx.mlx_multiply, scores0, scale_arr, m.s);
-    defer _ = mlx.mlx_array_free(scaled);
-    const with_sink = try gpuConcat2(scaled, h.sink_gpu, 1, m.s);
-    defer _ = mlx.mlx_array_free(with_sink);
-    var probs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(probs);
-    try mlx.check(mlx.mlx_softmax_axis(&probs, with_sink, -1, true, m.s));
-    const probs_real = try gpuSliceCols(probs, nh, 0, tk, m.s);
+    const scale_f: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd))));
+    var probs_real = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(probs_real);
+    if (try sinkSoftmaxKernel(m, scores0, h.sink_gpu, nh, tk, scale_f)) |fused| {
+        defer _ = mlx.mlx_array_free(fused);
+        try mlx.check(mlx.mlx_array_set(&probs_real, fused));
+    } else {
+        const scale_arr = mlx.mlx_array_new_float(scale_f);
+        defer _ = mlx.mlx_array_free(scale_arr);
+        const scaled = try gpuOp2(mlx.mlx_multiply, scores0, scale_arr, m.s);
+        defer _ = mlx.mlx_array_free(scaled);
+        const with_sink = try gpuConcat2(scaled, h.sink_gpu, 1, m.s);
+        defer _ = mlx.mlx_array_free(with_sink);
+        var probs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(probs);
+        try mlx.check(mlx.mlx_softmax_axis(&probs, with_sink, -1, true, m.s));
+        const pr = try gpuSliceCols(probs, nh, 0, tk, m.s);
+        defer _ = mlx.mlx_array_free(pr);
+        try mlx.check(mlx.mlx_array_set(&probs_real, pr));
+    }
     const o_arr = try gpuOp2(mlx.mlx_matmul, probs_real, kmat, m.s);
     defer _ = mlx.mlx_array_free(o_arr);
-    const o_inv = try gpuRopeTail(o_arr, rd, rr.cos, rr.sin, true, m.s);
+    const o_inv = (try decChainKernel(m, o_arr, nh, hd, rd, null, 0, true, rr)) orelse
+        try gpuRopeTail(o_arr, rd, rr.cos, rr.sin, true, m.s);
     defer _ = mlx.mlx_array_free(o_inv);
     // grouped low-rank O on GPU: [og, 1, gin] bf16 @ wo_a_deq [og, gin, ol]
     const og = m.o_groups;
@@ -4620,7 +5820,7 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
     var o_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o_b);
     try mlx.check(mlx.mlx_astype(&o_b, o_g, .bfloat16, m.s));
-    const ored = try gpuOp2(mlx.mlx_matmul, o_b, m.wo_a_deq[li], m.s);
+    const ored = try woAMatmul(m, li, o_b);
     defer _ = mlx.mlx_array_free(ored);
     const rshape2 = [_]c_int{ 1, @intCast(og * ol) };
     const ored_r = try gpuReshape(ored, &rshape2, m.s);
@@ -4628,11 +5828,73 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
     return try gpuQmmB(&ly.wo_b, ored_r, m.s); // [1, dim] f32
 }
 
+/// The 43-layer decode walk shared by the sync (`decodeStep`) and lazy
+/// (`decodeStepLazy`) paths. Consumes `stream_in` (ownership transfers) and
+/// returns the final hc stream (owned). `mh_parts` collects DSpark target
+/// captures when armed (sync path only — the lazy path requires DSpark off).
+fn decodeLayers(m: *Dsv4Model, a: std.mem.Allocator, st: *Dsv4DecodeState, stream_in: mlx.mlx_array, id: u32, id_arr: ?mlx.mlx_array, pos: usize, rr_plain: *const RopeRows, rr_yarn: *const RopeRows, fr_plain: *const Freqs, fr_yarn: *const Freqs, deferred: *std.ArrayList(DeferredCompRow), mh_parts: *std.ArrayList(mlx.mlx_array)) !mlx.mlx_array {
+    var stream_g = stream_in;
+    // Timing-only probes (GARBAGE OUTPUT): `MLX_SERVE_DSV4_LAYER_CAP=N`
+    // truncates the walk, `MLX_SERVE_DSV4_SKIP_MOE=1` drops the ffn
+    // sublayer — slope/intercept attribution of the serial forward.
+    const cap = blk: {
+        const e = std.c.getenv("MLX_SERVE_DSV4_LAYER_CAP") orelse break :blk m.n_layers;
+        break :blk std.fmt.parseInt(usize, std.mem.span(e), 10) catch m.n_layers;
+    };
+    const skip_moe = std.c.getenv("MLX_SERVE_DSV4_SKIP_MOE") != null;
+    for (0..@min(m.n_layers, cap)) |li| {
+        const h = &m.hl[li];
+        const ly = &m.dw.layers[li];
+        const ratio: usize = ly.compress_ratio;
+        const fr = if (ratio != 0) fr_yarn else fr_plain;
+        const rr = if (ratio != 0) rr_yarn else rr_plain;
+        {
+            const pre = try hcPreGpu(m, a, stream_g, h.hc_attn_fn_t, h.hc_attn_scale, h.hc_attn_base, ly.hc_attn_scale, ly.hc_attn_base);
+            defer freeHcPre(&pre);
+            const x = try gpuRms(pre.y, h.attn_norm_g, m.eps, m.s);
+            defer _ = mlx.mlx_array_free(x);
+            const attn_out = try attentionDecodeGpu(m, a, st, li, x, pos, rr, fr, deferred);
+            defer _ = mlx.mlx_array_free(attn_out);
+            const ns = try hcPostGpu(m, stream_g, attn_out, &pre);
+            _ = mlx.mlx_array_free(stream_g);
+            stream_g = ns;
+        }
+        if (!skip_moe) {
+            const pre = try hcPreGpu(m, a, stream_g, h.hc_ffn_fn_t, h.hc_ffn_scale, h.hc_ffn_base, ly.hc_ffn_scale, ly.hc_ffn_base);
+            defer freeHcPre(&pre);
+            const x = try gpuRms(pre.y, h.ffn_norm_g, m.eps, m.s);
+            defer _ = mlx.mlx_array_free(x);
+            const ffn_out = if (id_arr) |ia| try moeGpuLazy(m, a, li, x, ia) else try moeDecodeGpu(m, a, li, x, id);
+            defer _ = mlx.mlx_array_free(ffn_out);
+            const ns = try hcPostGpu(m, stream_g, ffn_out, &pre);
+            _ = mlx.mlx_array_free(stream_g);
+            stream_g = ns;
+        }
+        // DSpark conditioning: hc-averaged stream at the target layers
+        // (reference forward's main_hiddens capture, [1, d] per target).
+        if (st.dspark != null and dsIsTarget(m, li)) {
+            var mean = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(mean);
+            try mlx.check(mlx.mlx_mean_axis(&mean, stream_g, 0, true, m.s));
+            try mh_parts.append(a, mean);
+        }
+    }
+    return stream_g;
+}
+
 /// One incremental decode step: appends token `id`, returns [vocab] logits.
 /// The hc stream stays RESIDENT on GPU across all layers; host hops per token
 /// are the two hc-mix syncs per layer (Sinkhorn), the MoE routing sync, one
 /// combined compressor-input sync on ratio≠0 layers, and the final logits.
 pub fn decodeStep(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, id: u32) ![]f32 {
+    const tracing = dsv4TraceEnabled();
+    var clk: DsparkClock = if (tracing) DsparkClock.init() else undefined;
+    const gap_us: u64 = if (tracing and trace_last_end != null)
+        @as(u64, @intCast(trace_last_end.?.untilNow(std.Io.Threaded.global_single_threaded.io(), .boot).nanoseconds)) / 1000
+    else
+        0;
+    if (tracing) trace_comp_ns = 0;
+    if (st.pending.items.len > 0) try drainPending(m, st); // lazy→sync handoff
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -4679,46 +5941,29 @@ pub fn decodeStep(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, i
         for (mh_parts.items) |p| _ = mlx.mlx_array_free(p);
         mh_parts.deinit(a);
     }
-    for (0..m.n_layers) |li| {
-        const h = &m.hl[li];
-        const ly = &m.dw.layers[li];
-        const ratio: usize = ly.compress_ratio;
-        const fr = if (ratio != 0) fr_yarn else fr_plain;
-        const rr = if (ratio != 0) &rr_yarn else &rr_plain;
-        {
-            const pre = try hcPreGpu(m, a, stream_g, h.hc_attn_fn_t, h.hc_attn_scale, h.hc_attn_base, ly.hc_attn_scale, ly.hc_attn_base);
-            defer freeHcPre(&pre);
-            const x = try gpuRms(pre.y, h.attn_norm_g, m.eps, m.s);
-            defer _ = mlx.mlx_array_free(x);
-            const attn_out = try attentionDecodeGpu(m, a, st, li, x, pos, rr, fr, &deferred);
-            defer _ = mlx.mlx_array_free(attn_out);
-            const ns = try hcPostGpu(m, stream_g, attn_out, &pre);
-            _ = mlx.mlx_array_free(stream_g);
-            stream_g = ns;
-        }
-        {
-            const pre = try hcPreGpu(m, a, stream_g, h.hc_ffn_fn_t, h.hc_ffn_scale, h.hc_ffn_base, ly.hc_ffn_scale, ly.hc_ffn_base);
-            defer freeHcPre(&pre);
-            const x = try gpuRms(pre.y, h.ffn_norm_g, m.eps, m.s);
-            defer _ = mlx.mlx_array_free(x);
-            const ffn_out = try moeDecodeGpu(m, a, li, x, id);
-            defer _ = mlx.mlx_array_free(ffn_out);
-            const ns = try hcPostGpu(m, stream_g, ffn_out, &pre);
-            _ = mlx.mlx_array_free(stream_g);
-            stream_g = ns;
-        }
-        // DSpark conditioning: hc-averaged stream at the target layers
-        // (reference forward's main_hiddens capture, [1, d] per target).
-        if (st.dspark != null and dsIsTarget(m, li)) {
-            var mean = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(mean);
-            try mlx.check(mlx.mlx_mean_axis(&mean, stream_g, 0, true, m.s));
-            try mh_parts.append(a, mean);
-        }
+    stream_g = try decodeLayers(m, a, st, stream_g, id, null, pos, &rr_plain, &rr_yarn, fr_plain, fr_yarn, &deferred, &mh_parts);
+    // Schedule the deferred compressor side-branches WITH the head walk:
+    // they share ~the whole cone with the logits, so the GPU computes them
+    // for free during the head sync and `processDeferredComp`'s eval
+    // becomes a wait-free formality (it was a serial ~2.7 ms mini-eval).
+    if (deferred.items.len > 0) {
+        const dvec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(dvec);
+        for (deferred.items) |r2| _ = mlx.mlx_vector_array_append_value(dvec, r2.arr);
+        try mlx.check(mlx.mlx_async_eval(dvec));
     }
+    const build_ns: u64 = if (tracing) clk.lap() else 0;
     const logits = try headLogitsGpu(m, gpa, a, stream_g);
     errdefer gpa.free(logits);
+    const head_ns: u64 = if (tracing) clk.lap() else 0;
     try processDeferredComp(m, st, a, deferred.items, pos, fr_yarn);
+    if (tracing) {
+        const defer_ns = clk.lap();
+        log.info("[dsv4-trace] pos={d} build={d}us head={d}us defer={d}us comp={d}us gap={d}us\n", .{
+            pos, build_ns / 1000, head_ns / 1000, defer_ns / 1000, trace_comp_ns / 1000, gap_us,
+        });
+        trace_last_end = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .boot);
+    }
     if (st.dspark != null and mh_parts.items.len > 0) {
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -4729,6 +5974,109 @@ pub fn decodeStep(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, i
         try appendDsparkMainKv(m, st, mh, 1, &rr_plain);
     }
     return logits;
+}
+
+/// Lazy pipelined decode step: the same graph as `decodeStep`, but the token
+/// id stays a GPU array (embed row via `embed_g` take, hash routing via a
+/// device tid2eid lookup) and the logits return UNEVALUATED [1, vocab] —
+/// generate.zig's pipelined next() samples on GPU and overlaps the next
+/// build with execution, so the id never forces a host round trip. Host ring
+/// pushes stash on `st.pending` (async-scheduled with the token's own flow)
+/// and drain just before the next window-boundary token's emission build, a
+/// prefill/verify chunk, or teardown. Requires `lazyDecodeReady`.
+pub fn decodeStepLazy(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, id_arr: mlx.mlx_array) !mlx.mlx_array {
+    if (!lazy_decode_logged) {
+        lazy_decode_logged = true;
+        log.info("dsv4: lazy pipelined decode engaged\n", .{});
+    }
+    const tracing = dsv4TraceEnabled();
+    var clk: DsparkClock = if (tracing) DsparkClock.init() else undefined;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pos = st.n;
+    // rings must be current through pos-1 before an emission build reads them
+    if (st.pending.items.len > 0 and posClosesAnyWindow(m, pos)) try drainPending(m, st);
+    const drain_ns: u64 = if (tracing) clk.lap() else 0;
+    st.n += 1;
+    const d = m.dim;
+    const hcm = m.hc;
+    const fr_plain = try freqsFor(m, .plain, pos + 2, m.arena.allocator());
+    const fr_yarn = try freqsFor(m, .yarn, pos + 2, m.arena.allocator());
+    const half = m.rd / 2;
+    const rowshape = [_]c_int{@intCast(half)};
+    const rr_plain = RopeRows{
+        .cos = uploadF32(fr_plain.cos[pos * half ..][0..half], &rowshape),
+        .sin = uploadF32(fr_plain.sin[pos * half ..][0..half], &rowshape),
+    };
+    defer _ = mlx.mlx_array_free(rr_plain.cos);
+    defer _ = mlx.mlx_array_free(rr_plain.sin);
+    const rr_yarn = RopeRows{
+        .cos = uploadF32(fr_yarn.cos[pos * half ..][0..half], &rowshape),
+        .sin = uploadF32(fr_yarn.sin[pos * half ..][0..half], &rowshape),
+    };
+    defer _ = mlx.mlx_array_free(rr_yarn.cos);
+    defer _ = mlx.mlx_array_free(rr_yarn.sin);
+    // stream [hc, d]: embed row via GPU take (bf16 → f32 — the host
+    // embed_f32 is f32 of the same bf16 values, so the rows are identical)
+    var stream_g = blk: {
+        const fshape = [_]c_int{1};
+        var idf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(idf);
+        try mlx.check(mlx.mlx_reshape(&idf, id_arr, &fshape, 1, m.s));
+        var row_b = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row_b);
+        try mlx.check(mlx.mlx_take_axis(&row_b, m.embed_g.?, idf, 0, m.s)); // [1, d] bf16
+        var row_f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row_f);
+        try mlx.check(mlx.mlx_astype(&row_f, row_b, .float32, m.s));
+        const bshape = [_]c_int{ @intCast(hcm), @intCast(d) };
+        var b = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_broadcast_to(&b, row_f, &bshape, 2, m.s));
+        break :blk b;
+    };
+    defer _ = mlx.mlx_array_free(stream_g);
+    var deferred = std.ArrayList(DeferredCompRow).empty;
+    defer {
+        for (deferred.items) |r| _ = mlx.mlx_array_free(r.arr);
+        deferred.deinit(a);
+    }
+    var mh_parts = std.ArrayList(mlx.mlx_array).empty; // DSpark off by contract
+    defer mh_parts.deinit(a);
+    stream_g = try decodeLayers(m, a, st, stream_g, 0, id_arr, pos, &rr_plain, &rr_yarn, fr_plain, fr_yarn, &deferred, &mh_parts);
+    // schedule the deferred rows with the token's own pipeline flow, then
+    // move them to the pending stash (host pushes happen at the next drain)
+    if (deferred.items.len > 0) {
+        const dvec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(dvec);
+        for (deferred.items) |r| _ = mlx.mlx_vector_array_append_value(dvec, r.arr);
+        try mlx.check(mlx.mlx_async_eval(dvec));
+        while (deferred.pop()) |r| {
+            st.pending.append(st.alloc, .{ .li = r.li, .arr = r.arr, .pos = pos }) catch |e| {
+                _ = mlx.mlx_array_free(r.arr);
+                return e;
+            };
+        }
+    }
+    // boundary prefetch: the NEXT token blocks on a full drain before its
+    // emission build — drain the OLDER rows now, leaving only this token's.
+    if (drainPrefetchEnabled() and st.pending.items.len > 0 and posClosesAnyWindow(m, pos + 1))
+        try drainPendingBefore(m, st, pos);
+    const logits = try headLogitsLazyGpu(m, stream_g);
+    if (tracing) {
+        const build_ns = clk.lap();
+        log.info("[dsv4-trace] pos={d} lazy build={d}us drain={d}us pending={d}\n", .{
+            pos, build_ns / 1000, drain_ns / 1000, st.pending.items.len,
+        });
+    }
+    return logits;
+}
+
+/// Everything `decodeStepLazy` requires: GPU stream + GPU emission + GPU MoE
+/// routing (device hash lookup), the GPU embed table, and DSpark off.
+pub fn lazyDecodeReady(m: *const Dsv4Model, st: *const Dsv4DecodeState) bool {
+    return lazyDecodeEnabled() and m.embed_g != null and st.dspark == null and
+        moeRouteGpuEnabled() and gpuEmitActive(m);
 }
 
 /// Drain the non-boundary compressor rows deferred by `attentionDecodeGpu`:
@@ -4743,6 +6091,14 @@ fn processDeferredComp(m: *const Dsv4Model, st: *Dsv4DecodeState, a: std.mem.All
     defer _ = mlx.mlx_vector_array_free(vec);
     for (rows) |r| _ = mlx.mlx_vector_array_append_value(vec, r.arr);
     try mlx.check(mlx.mlx_eval(vec));
+    // Under GPU emission the deferred set includes BOUNDARY rows: their host
+    // push EMITS into the host cache (snapshots/anchors read it), but the
+    // mirror append is suppressed — the in-layer GPU emission already
+    // advanced `used` for those slots. Without GPU emission only
+    // non-boundary rows defer, which can never emit by construction; the
+    // release-mode append keeps the mirrors correct anyway if that
+    // invariant is ever broken.
+    const emit_gpu = gpuEmitActive(m);
     for (rows) |r| {
         const h = &m.hl[r.li];
         const ls = &st.layers[r.li];
@@ -4754,21 +6110,116 @@ fn processDeferredComp(m: *const Dsv4Model, st: *Dsv4DecodeState, a: std.mem.All
         {
             const csx = &ls.comp.?;
             const before = csx.cache.items.len;
-            try compressorPush(m, c, csx, row[0..cd], row[cd .. 2 * cd], pos, ratio, false, fr, a);
-            std.debug.assert(csx.cache.items.len == before);
-            if (csx.cache.items.len > before)
-                try ls.comp_gpu.append(csx.cache.items[before..], m.s);
+            if (emit_gpu) {
+                try compressorPushLight(c, csx, row[0..cd], row[cd .. 2 * cd], pos, ratio);
+            } else {
+                try compressorPush(m, c, csx, row[0..cd], row[cd .. 2 * cd], pos, ratio, false, fr, a);
+                std.debug.assert(csx.cache.items.len == before);
+                if (csx.cache.items.len > before)
+                    try ls.comp_gpu.append(csx.cache.items[before..], m.s);
+            }
         }
         if (ls.idx_comp) |*csx| {
             const ic = &h.idx_comp.?;
             const icd = ic.coff * ic.head_dim;
             const before = csx.cache.items.len;
-            try compressorPush(m, ic, csx, row[2 * cd ..][0..icd], row[2 * cd + icd ..][0..icd], pos, 4, true, fr, a);
-            std.debug.assert(csx.cache.items.len == before);
-            if (csx.cache.items.len > before)
-                try ls.idx_gpu.append(csx.cache.items[before..], m.s);
+            if (emit_gpu) {
+                try compressorPushLight(ic, csx, row[2 * cd ..][0..icd], row[2 * cd + icd ..][0..icd], pos, 4);
+            } else {
+                try compressorPush(m, ic, csx, row[2 * cd ..][0..icd], row[2 * cd + icd ..][0..icd], pos, 4, true, fr, a);
+                std.debug.assert(csx.cache.items.len == before);
+                if (csx.cache.items.len > before)
+                    try ls.idx_gpu.append(csx.cache.items[before..], m.s);
+            }
         }
     }
+}
+
+/// Does position `pos` close ANY compressor window (attn ratios; the ratio-4
+/// indexer shares the ratio-4 boundary)? The lazy path must drain pending
+/// host pushes before this token's emission build reads the rings.
+fn posClosesAnyWindow(m: *const Dsv4Model, pos: usize) bool {
+    for (m.ratios[0..m.n_layers]) |r| {
+        if (r != 0 and (pos + 1) % @as(usize, r) == 0) return true;
+    }
+    return false;
+}
+
+/// One pending row's host pushes (ring updates only — lazy decode implies
+/// GPU emission, the mirrors were appended in-graph). Shared by the full
+/// drain and the boundary prefetch so a fix can't honor one path only.
+fn pendingHostPush(m: *const Dsv4Model, st: *Dsv4DecodeState, p: PendingComp) !void {
+    const h = &m.hl[p.li];
+    const ls = &st.layers[p.li];
+    const ratio: usize = m.dw.layers[p.li].compress_ratio;
+    const row = try toHostF32(st.alloc, p.arr, h.comp_in_w, m.s);
+    defer st.alloc.free(row);
+    const c = &h.comp.?;
+    const cd = c.coff * c.head_dim;
+    try compressorPushLight(c, &ls.comp.?, row[0..cd], row[cd .. 2 * cd], p.pos, ratio);
+    if (ls.idx_comp) |*csx| {
+        const ic = &h.idx_comp.?;
+        const icd = ic.coff * ic.head_dim;
+        try compressorPushLight(ic, csx, row[2 * cd ..][0..icd], row[2 * cd + icd ..][0..icd], p.pos, 4);
+    }
+}
+
+/// Drain the lazy-decode pending host pushes: ONE batched eval (the rows
+/// were already async-scheduled with their token's pipeline flow, so this is
+/// mostly a wait), then the light ring pushes in position order.
+pub fn drainPending(m: *const Dsv4Model, st: *Dsv4DecodeState) !void {
+    if (st.pending.items.len == 0) return;
+    std.debug.assert(gpuEmitActive(m));
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (st.pending.items) |p| _ = mlx.mlx_vector_array_append_value(vec, p.arr);
+    try mlx.check(mlx.mlx_eval(vec));
+    for (st.pending.items) |p| {
+        try pendingHostPush(m, st, p);
+        _ = mlx.mlx_array_free(p.arr);
+    }
+    st.pending.clearRetainingCapacity();
+}
+
+/// Boundary-prefetch kill switch (`MLX_SERVE_DSV4_DRAIN_PREFETCH=0` → the
+/// boundary token drains everything itself, the pre-prefetch behavior).
+var drain_prefetch_state: ?bool = null;
+fn drainPrefetchEnabled() bool {
+    if (drain_prefetch_state) |v| return v;
+    const v = if (std.c.getenv("MLX_SERVE_DSV4_DRAIN_PREFETCH")) |e| e[0] != '0' else true;
+    drain_prefetch_state = v;
+    return v;
+}
+
+/// Partial drain of pending rows with pos < `before` (kept entries stay in
+/// order). Called at the end of the step BEFORE a window-closing token:
+/// those rows' async evals completed a token+ ago, so the wait is a memcpy
+/// that overlaps this token's logits cone instead of sitting on the boundary
+/// token's critical path.
+fn drainPendingBefore(m: *const Dsv4Model, st: *Dsv4DecodeState, before: usize) !void {
+    var n_old: usize = 0;
+    for (st.pending.items) |p| {
+        if (p.pos < before) n_old += 1;
+    }
+    if (n_old == 0) return;
+    std.debug.assert(gpuEmitActive(m));
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (st.pending.items) |p| {
+        if (p.pos < before) _ = mlx.mlx_vector_array_append_value(vec, p.arr);
+    }
+    try mlx.check(mlx.mlx_eval(vec));
+    var w: usize = 0;
+    for (st.pending.items) |p| {
+        if (p.pos < before) {
+            try pendingHostPush(m, st, p);
+            _ = mlx.mlx_array_free(p.arr);
+        } else {
+            st.pending.items[w] = p;
+            w += 1;
+        }
+    }
+    st.pending.items.len = w;
 }
 
 fn dsIsTarget(m: *const Dsv4Model, li: usize) bool {
@@ -4842,9 +6293,82 @@ fn appendDsparkMainKv(m: *Dsv4Model, st: *Dsv4DecodeState, mh: mlx.mlx_array, n:
 
 /// Hyper-head collapse (sigmoid weights only) → final norm → lm head, from a
 /// [hc, d] GPU stream row. One tiny sync (mixes ++ Σx²) + the logits sync.
+/// hc-head sigmoid pre-weights, all-GPU: prew[t, c] = sigmoid(mix[t, c] ·
+/// rsqrt(ss[t]/(hc·d) + eps) · scale + base[c]) + hc_eps. mixes [C, hc],
+/// ssum [C, 1] → [C, hc]. Replaces the per-token mid-head host sync (the
+/// sigmoid mix was the LAST remaining barrier before the logits read).
+fn headPreWeightsGpu(m: *const Dsv4Model, mixes_g: mlx.mlx_array, ssum: mlx.mlx_array) !mlx.mlx_array {
+    const hcm = m.hc;
+    const denom_c = mlx.mlx_array_new_float(@floatFromInt(hcm * m.dim));
+    defer _ = mlx.mlx_array_free(denom_c);
+    const ss_n = try gpuOp2(mlx.mlx_divide, ssum, denom_c, m.s);
+    defer _ = mlx.mlx_array_free(ss_n);
+    const eps_c = mlx.mlx_array_new_float(m.eps);
+    defer _ = mlx.mlx_array_free(eps_c);
+    const ss_e = try gpuOp2(mlx.mlx_add, ss_n, eps_c, m.s);
+    defer _ = mlx.mlx_array_free(ss_e);
+    const rsq = try gpuOp1(mlx.mlx_rsqrt, ss_e, m.s);
+    defer _ = mlx.mlx_array_free(rsq);
+    const mixed = try gpuOp2(mlx.mlx_multiply, mixes_g, rsq, m.s);
+    defer _ = mlx.mlx_array_free(mixed);
+    const scale_c = mlx.mlx_array_new_float(m.hc_head_scale[0]);
+    defer _ = mlx.mlx_array_free(scale_c);
+    const z = try gpuOp2(mlx.mlx_multiply, mixed, scale_c, m.s);
+    defer _ = mlx.mlx_array_free(z);
+    const bshape = [_]c_int{ 1, @intCast(hcm) };
+    const base_g = uploadF32(m.hc_head_base[0..hcm], &bshape);
+    defer _ = mlx.mlx_array_free(base_g);
+    const zb = try gpuOp2(mlx.mlx_add, z, base_g, m.s);
+    defer _ = mlx.mlx_array_free(zb);
+    const sg = try gpuOp1(mlx.mlx_sigmoid, zb, m.s);
+    defer _ = mlx.mlx_array_free(sg);
+    const heps_c = mlx.mlx_array_new_float(m.hc_eps);
+    defer _ = mlx.mlx_array_free(heps_c);
+    return try gpuOp2(mlx.mlx_add, sg, heps_c, m.s);
+}
+
+/// The whole trunk head as ONE lazy graph (GPU streams): hc collapse
+/// (all-GPU sigmoid mix) → final norm → head qmm. Returns [1, vocab], owned,
+/// NOT evaluated — the lazy decode path returns it to the generator's
+/// pipelined sampler.
+fn headLogitsLazyGpu(m: *const Dsv4Model, stream_g: mlx.mlx_array) !mlx.mlx_array {
+    const hcm = m.hc;
+    const d = m.dim;
+    const fshape = [_]c_int{ 1, @intCast(hcm * d) };
+    const flat = try gpuReshape(stream_g, &fshape, m.s);
+    defer _ = mlx.mlx_array_free(flat);
+    const mixes_g = try gpuOp2(mlx.mlx_matmul, flat, m.hc_head_fn_t, m.s);
+    defer _ = mlx.mlx_array_free(mixes_g);
+    const sq = try gpuOp1(mlx.mlx_square, flat, m.s);
+    defer _ = mlx.mlx_array_free(sq);
+    var ssum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ssum);
+    try mlx.check(mlx.mlx_sum_axis(&ssum, sq, 1, true, m.s));
+    const prew = try headPreWeightsGpu(m, mixes_g, ssum); // [1, hc]
+    defer _ = mlx.mlx_array_free(prew);
+    const pshape = [_]c_int{ @intCast(hcm), 1 };
+    const pre_col = try gpuReshape(prew, &pshape, m.s);
+    defer _ = mlx.mlx_array_free(pre_col);
+    const weighted = try gpuOp2(mlx.mlx_multiply, pre_col, stream_g, m.s);
+    defer _ = mlx.mlx_array_free(weighted);
+    var hout = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hout);
+    try mlx.check(mlx.mlx_sum_axis(&hout, weighted, 0, true, m.s));
+    const hn = try gpuRms(hout, m.final_norm_g, m.eps, m.s);
+    defer _ = mlx.mlx_array_free(hn);
+    return try gpuQmmB(&m.dw.head, hn, m.s);
+}
+
 fn headLogitsGpu(m: *const Dsv4Model, gpa: std.mem.Allocator, alloc: std.mem.Allocator, stream_g: mlx.mlx_array) ![]f32 {
     const hcm = m.hc;
     const d = m.dim;
+    if (mlx.streamIsGpu(m.s)) {
+        const logits_g = try headLogitsLazyGpu(m, stream_g);
+        defer _ = mlx.mlx_array_free(logits_g);
+        return try toHostF32(gpa, logits_g, m.vocab, m.s);
+    }
+    // CPU stream = the strict-gated reference path: keep the host sigmoid
+    // byte-stable with forwardPrefill's collapse
     const fshape = [_]c_int{ 1, @intCast(hcm * d) };
     const flat = try gpuReshape(stream_g, &fshape, m.s);
     defer _ = mlx.mlx_array_free(flat);
@@ -5011,7 +6535,21 @@ fn hcPreBatch(m: *Dsv4Model, alloc: std.mem.Allocator, stream_g: mlx.mlx_array, 
     const col3 = [_]c_int{ cc, @intCast(hcm), 1 };
     const comb3 = [_]c_int{ cc, @intCast(hcm), @intCast(hcm) };
     const pack = 2 * hcm + hcm * hcm;
-    if (m.sink_k) |*sk| {
+    if (m.sink_y_k) |*sk| {
+        const cfg = try sinkhornYCfgFor(m, c_tokens);
+        const r = try applySinkhornY(sk, cfg, mixes_g, ss, scale_g, base_g, m.sink_consts, stream_g, m.s);
+        if (m.hc_post_k != null) {
+            return .{ .y = r.y, .post_g = post_g, .combT_g = combT_g, .pk = r.pk };
+        }
+        defer _ = mlx.mlx_array_free(r.pk);
+        const post_flat = try gpuSliceCols(r.pk, c_tokens, hcm, 2 * hcm, m.s);
+        defer _ = mlx.mlx_array_free(post_flat);
+        try mlx.check(mlx.mlx_reshape(&post_g, post_flat, &col3, 3, m.s));
+        const comb_flat = try gpuSliceCols(r.pk, c_tokens, 2 * hcm, pack, m.s);
+        defer _ = mlx.mlx_array_free(comb_flat);
+        try mlx.check(mlx.mlx_reshape(&combT_g, comb_flat, &comb3, 3, m.s));
+        return .{ .y = r.y, .post_g = post_g, .combT_g = combT_g };
+    } else if (m.sink_k) |*sk| {
         const cfg = try sinkhornCfgFor(m, c_tokens);
         const pk = try applySinkhorn(sk, cfg, mixes_g, ss, scale_g, base_g, m.sink_consts, m.s);
         defer _ = mlx.mlx_array_free(pk);
@@ -5063,7 +6601,12 @@ fn hcPreBatch(m: *Dsv4Model, alloc: std.mem.Allocator, stream_g: mlx.mlx_array, 
 }
 
 /// Batched hc_post: new_stream[t] = combᵀ[t] @ residual[t] + post[t]·out[t].
-fn hcPostBatch(m: *const Dsv4Model, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, c_tokens: usize, pre: *const HcPreG) !mlx.mlx_array {
+fn hcPostBatch(m: *Dsv4Model, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, c_tokens: usize, pre: *const HcPreG) !mlx.mlx_array {
+    if (pre.pk) |pk| {
+        const sk = &m.hc_post_k.?;
+        const cfg = try hcPostCfgFor(m, c_tokens);
+        return try applyHcPost(sk, cfg, pk, stream_g, out_g, m.s); // [C, hc, d]
+    }
     const res = try gpuOp2(mlx.mlx_matmul, pre.combT_g, stream_g, m.s);
     defer _ = mlx.mlx_array_free(res);
     const oshape = [_]c_int{ @intCast(c_tokens), 1, @intCast(m.dim) };
@@ -5089,15 +6632,22 @@ fn pushCompChunk(m: *Dsv4Model, st: *Dsv4DecodeState, li: usize, rows: []const f
     const ratio: usize = m.dw.layers[li].compress_ratio;
     const c = &h.comp.?;
     const cd = c.coff * c.head_dim;
+    // Mirror appends are suppressed under GPU emission — the in-layer GPU
+    // emission already appended these slots (host cache still fills for
+    // snapshots/anchors).
+    const emit_gpu = gpuEmitActive(m);
     {
         const csx = &ls.comp.?;
         const before = csx.cache.items.len;
         for (0..C) |t| {
             const row = rows[t * w2 ..][0..w2];
-            try compressorPush(m, c, csx, row[0..cd], row[cd .. 2 * cd], base + t, ratio, false, fr, alloc);
+            if (emit_gpu)
+                try compressorPushLight(c, csx, row[0..cd], row[cd .. 2 * cd], base + t, ratio)
+            else
+                try compressorPush(m, c, csx, row[0..cd], row[cd .. 2 * cd], base + t, ratio, false, fr, alloc);
             if (st.anchors) |*an| an.captureComp(t, li, csx, false);
         }
-        if (csx.cache.items.len > before)
+        if (!emit_gpu and csx.cache.items.len > before)
             try ls.comp_gpu.append(csx.cache.items[before..], m.s);
     }
     if (ls.idx_comp) |*csx| {
@@ -5106,10 +6656,13 @@ fn pushCompChunk(m: *Dsv4Model, st: *Dsv4DecodeState, li: usize, rows: []const f
         const before = csx.cache.items.len;
         for (0..C) |t| {
             const row = rows[t * w2 ..][0..w2];
-            try compressorPush(m, ic, csx, row[2 * cd ..][0..icd], row[2 * cd + icd ..][0..icd], base + t, 4, true, fr, alloc);
+            if (emit_gpu)
+                try compressorPushLight(ic, csx, row[2 * cd ..][0..icd], row[2 * cd + icd ..][0..icd], base + t, 4)
+            else
+                try compressorPush(m, ic, csx, row[2 * cd ..][0..icd], row[2 * cd + icd ..][0..icd], base + t, 4, true, fr, alloc);
             if (st.anchors) |*an| an.captureComp(t, li, csx, true);
         }
-        if (csx.cache.items.len > before)
+        if (!emit_gpu and csx.cache.items.len > before)
             try ls.idx_gpu.append(csx.cache.items[before..], m.s);
     }
 }
@@ -5130,6 +6683,929 @@ fn processDeferredCompChunk(m: *Dsv4Model, st: *Dsv4DecodeState, alloc: std.mem.
         defer alloc.free(host);
         try pushCompChunk(m, st, r.li, host, base, C, fr, alloc);
     }
+}
+
+/// Slice rows [r0, r1) × cols [c0, c1) of a 2-D array.
+fn gpuSliceRC(x: mlx.mlx_array, r0: usize, r1: usize, c0: usize, c1: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    const start = [_]c_int{ @intCast(r0), @intCast(c0) };
+    const stop = [_]c_int{ @intCast(r1), @intCast(c1) };
+    const strides = [_]c_int{ 1, 1 };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, x, &start, 2, &stop, 2, &strides, 2, s));
+    return out;
+}
+
+/// Rows [off, off + n_win*r) of an extended row matrix, stacked per window:
+/// [n_win, r, cd].
+fn winStack(ext: mlx.mlx_array, off: usize, n_win: usize, r: usize, cd: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sl = try gpuSliceRC(ext, off, off + n_win * r, 0, cd, s);
+    defer _ = mlx.mlx_array_free(sl);
+    const shp = [_]c_int{ @intCast(n_win), @intCast(r), @intCast(cd) };
+    return gpuReshape(sl, &shp, s);
+}
+
+/// Fused window emission: one threadgroup per closed window runs the whole
+/// tail (masked-softmax combine → RMSNorm → rope tail → [Hadamard →] QAT sim)
+/// with the ext-row indexing (pre-ring rows vs comp_in chunk rows + ape)
+/// resolved in-kernel. Softmax/RMS reduction trees are ascending-f32 like the
+/// composed chain (drift snapped by the sims; decode-equivalence arbitrates,
+/// sinkhorn-kernel precedent); the QAT sim's scale/grid exponents use
+/// frexp/ldexp bit arithmetic — EXACT, matching the host f64 semantics rather
+/// than the composed chain's f32 log2/ceil approximations.
+const EMIT_WIN_KERNEL_SOURCE =
+    \\int w = thread_position_in_grid.y;
+    \\int lane = thread_position_in_threadgroup.x;
+    \\if (w >= NWIN) return; // uniform per threadgroup (grid.y == NWIN)
+    \\const int CD = (OVERLAP != 0 ? 2 : 1) * D;
+    \\const int ROWS = (OVERLAP != 0 ? 2 : 1) * R;
+    \\const int HALF = RD / 2;
+    \\const int QW = (ROTATE != 0) ? D : (D - RD);
+    \\const int NG = QW / GROUP;
+    \\const float CODE_MAX = (ROTATE != 0) ? 6.0f : 448.0f;
+    \\const float AMAX_FLOOR = (ROTATE != 0) ? metal::ldexp(6.0f, -126) : 1e-4f;
+    \\const int MANT_BITS = (ROTATE != 0) ? 1 : 3;
+    \\const int MIN_EXP = (ROTATE != 0) ? 0 : -6;
+    \\const float MIN_SUB = metal::ldexp(1.0f, MIN_EXP);
+    \\threadgroup float row[D];
+    \\threadgroup float row2[(ROTATE != 0) ? D : 1];
+    \\threadgroup float red[TG];
+    \\threadgroup float gsc[(QW / GROUP) > 0 ? (QW / GROUP) : 1];
+    \\// phase 1: per-feature masked-softmax combine over the window rows.
+    \\// 3 passes (max / exp-sum / weighted acc) re-reading the sources — the
+    \\// composed chain's softmax→multiply→sum rounding order, no register
+    \\// caching so ratio-128 windows (ROWS 128) don't spill.
+    \\for (int j = lane; j < D; j += TG) {
+    \\  float mx = -INFINITY;
+    \\  float sum = 0.0f;
+    \\  float acc = 0.0f;
+    \\  float inv = 0.0f;
+    \\  for (int pass = 0; pass < 3; ++pass) {
+    \\    if (pass == 2) inv = 1.0f / sum;
+    \\    for (int i = 0; i < ROWS; ++i) {
+    \\      int ext; int col;
+    \\      if (OVERLAP != 0) {
+    \\        if (i < R) { ext = w * R + i; col = j; }
+    \\        else { ext = R + w * R + (i - R); col = D + j; }
+    \\      } else { ext = w * R + i; col = j; }
+    \\      float kv; float sc;
+    \\      if (ext < PRE_N) {
+    \\        kv = pre_kv[ext * CD + col];
+    \\        sc = pre_sc[ext * CD + col];
+    \\      } else {
+    \\        int cr = ext - PRE_N;
+    \\        kv = cin[cr * CIN_W + COL_OFF + col];
+    \\        sc = cin[cr * CIN_W + COL_OFF + CD + col] + ape[((BASE_MOD + cr) % R) * CD + col];
+    \\      }
+    \\      if (pass == 0) mx = metal::max(mx, sc);
+    \\      else if (pass == 1) sum += metal::exp(sc - mx);
+    \\      else acc += (metal::exp(sc - mx) * inv) * kv;
+    \\    }
+    \\  }
+    \\  row[j] = acc;
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\// phase 2: RMSNorm (tree-reduced sum of squares, weight applied)
+    \\float ss = 0.0f;
+    \\for (int j = lane; j < D; j += TG) ss += row[j] * row[j];
+    \\red[lane] = ss;
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\for (int off = TG / 2; off > 0; off >>= 1) {
+    \\  if (lane < off) red[lane] += red[lane + off];
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\float rinv = metal::rsqrt(red[0] / (float)D + consts[0]);
+    \\for (int j = lane; j < D; j += TG) row[j] = row[j] * rinv * nw[j];
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\// phase 3: interleaved-pair rope on the tail RD dims at the block start
+    \\for (int p = lane; p < HALF; p += TG) {
+    \\  float a = row[D - RD + 2 * p];
+    \\  float b = row[D - RD + 2 * p + 1];
+    \\  float cv = cosr[w * HALF + p];
+    \\  float sv = sinr[w * HALF + p];
+    \\  row[D - RD + 2 * p] = a * cv - b * sv;
+    \\  row[D - RD + 2 * p + 1] = a * sv + b * cv;
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\// phase 4 (indexer only): Hadamard rotate = row @ hada
+    \\if (ROTATE != 0) {
+    \\  for (int j = lane; j < D; j += TG) {
+    \\    float hacc = 0.0f;
+    \\    for (int kk = 0; kk < D; ++kk) hacc += row[kk] * hada[kk * D + j];
+    \\    row2[j] = hacc;
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\// phase 5: ue8m0 per-group scales — 2^ceil(log2(amax/code_max)), exact
+    \\for (int g = lane; g < NG; g += TG) {
+    \\  float amax = AMAX_FLOOR;
+    \\  for (int e = 0; e < GROUP; ++e) {
+    \\    float v = (ROTATE != 0) ? row2[g * GROUP + e] : row[g * GROUP + e];
+    \\    amax = metal::max(amax, metal::abs(v));
+    \\  }
+    \\  float q = amax / CODE_MAX;
+    \\  int ee = 0;
+    \\  float mm = metal::frexp(q, ee);
+    \\  int ce = (mm == 0.5f) ? (ee - 1) : ee;
+    \\  gsc[g] = metal::ldexp(1.0f, ce);
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\// phase 6: quant-dequant (rope tail stays raw on the fp8 path) + write
+    \\for (int j = lane; j < D; j += TG) {
+    \\  float v = (ROTATE != 0) ? row2[j] : row[j];
+    \\  float res = v;
+    \\  if (ROTATE != 0 || j < D - RD) {
+    \\    float scale = gsc[j / GROUP];
+    \\    float y = metal::clamp(v / scale, -CODE_MAX, CODE_MAX);
+    \\    float a = metal::abs(y);
+    \\    float af = metal::max(a, MIN_SUB);
+    \\    int ee2 = 0;
+    \\    float mm2 = metal::frexp(af, ee2);
+    \\    int e2 = ee2 - 1; // floor(log2(af)): mm2 in [0.5, 1)
+    \\    (void)mm2;
+    \\    if (e2 < MIN_EXP) e2 = MIN_EXP;
+    \\    float quantum = metal::ldexp(1.0f, e2 - MANT_BITS);
+    \\    float qv = metal::min(metal::rint(a / quantum) * quantum, CODE_MAX);
+    \\    float sq = (y < 0.0f) ? -qv : ((y > 0.0f) ? qv : 0.0f);
+    \\    res = sq * scale;
+    \\  }
+    \\  outw[w * D + j] = res;
+    \\}
+;
+
+var emit_kernel_obj: ?mlx.mlx_fast_metal_kernel = null;
+var emit_kernel_build_failed: bool = false;
+fn emitKernelObj() ?mlx.mlx_fast_metal_kernel {
+    if (emit_kernel_build_failed) return null;
+    if (emit_kernel_obj) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "cin", "pre_kv", "pre_sc", "ape", "nw", "cosr", "sinr", "hada", "consts" };
+    const output_names = [_][*:0]const u8{"outw"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_emit_win", in_vec, out_vec, EMIT_WIN_KERNEL_SOURCE, "", true, false);
+    if (kernel.ctx == null) {
+        emit_kernel_build_failed = true;
+        log.warn("dsv4: fused emission kernel failed to build — composed graph fallback\n", .{});
+        return null;
+    }
+    emit_kernel_obj = kernel;
+    return kernel;
+}
+
+/// Everything the emission kernel bakes into its config (output shape, grid,
+/// template ints) — the cache key is the FULL tuple (ShapeKey rule).
+const EmitCfgKey = struct {
+    d: u32,
+    rd: u32,
+    r: u32,
+    overlap: bool,
+    rotate: bool,
+    pre_n: u32,
+    col_off: u32,
+    cin_w: u32,
+    base_mod: u32,
+    n_win: u32,
+    tg: u32,
+};
+const EmitCfgSlot = struct { key: EmitCfgKey, cfg: mlx.mlx_fast_metal_kernel_config };
+/// Decode/verify emission geometries are a handful of stable tuples; prefill
+/// chunks vary per chunk and build-and-free instead (bounded table, no LRU).
+var emit_cfg_cache: [64]?EmitCfgSlot = @splat(null);
+
+fn emitWinCfg(key: EmitCfgKey) ?mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    const out_shape = [_]c_int{ @intCast(key.n_win), @intCast(key.d) };
+    const group: c_int = if (key.rotate) 32 else 64;
+    if (mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 2, .float32) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(key.tg), @intCast(key.n_win), 1) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(key.tg), 1, 1) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", @intCast(key.d)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", @intCast(key.rd)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", @intCast(key.r)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "OVERLAP", @intFromBool(key.overlap)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROTATE", @intFromBool(key.rotate)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GROUP", group) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PRE_N", @intCast(key.pre_n)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "COL_OFF", @intCast(key.col_off)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "CIN_W", @intCast(key.cin_w)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BASE_MOD", @intCast(key.base_mod)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NWIN", @intCast(key.n_win)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", @intCast(key.tg)) != 0)
+    {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        return null;
+    }
+    return cfg;
+}
+
+/// Largest power of two ≤ min(d, 256) — the tree reduction needs a pow-2
+/// threadgroup; every house D (32/96/128/512) maps to a full-occupancy size.
+fn emitTgFor(d: usize) usize {
+    var tg: usize = 1;
+    while (tg * 2 <= @min(d, 256)) tg *= 2;
+    return tg;
+}
+
+/// Fused single-dispatch arm of `emitWindowsGpu`: replaces the ~60-op
+/// composed emission graph (the +4.5 ms boundary-token tax at decode) with
+/// one `dsv4_emit_win` dispatch per compressor. Returns true when it handled
+/// the emission (mirror appended), false to decline to the composed path
+/// (kill switch, ineligible geometry, build failure).
+fn emitWindowsKernel(
+    m: *const Dsv4Model,
+    c: *const HostComp,
+    cs: *const CompDecState,
+    mirror: *GpuRows,
+    comp_in: mlx.mlx_array,
+    col_off: usize,
+    base: usize,
+    r: usize,
+    rotate: bool,
+    fr: *const Freqs,
+    alloc: std.mem.Allocator,
+    W: usize,
+    n_win: usize,
+    pre_n: usize,
+    used_c: usize,
+) !bool {
+    if (!emitKernelEnabled() or !mlx.streamIsGpu(m.s)) return false; // metal_kernel is GPU-only (CPU stream = uncatchable kill)
+    const d = c.head_dim;
+    const cd = c.coff * d;
+    // eligibility is the kernel's own conditions, never a model list
+    if (d > 1024 or m.rd == 0 or m.rd % 2 != 0) return false;
+    if (rotate) {
+        if (d % 32 != 0) return false;
+        const hg = m.hada_g orelse return false;
+        if (mlx.mlx_array_shape(hg)[0] != @as(c_int, @intCast(d))) return false;
+    } else {
+        if (d <= m.rd or (d - m.rd) % 64 != 0) return false;
+    }
+    const kernel = emitKernelObj() orelse return false;
+    const tg = emitTgFor(d);
+    const key = EmitCfgKey{
+        .d = @intCast(d),
+        .rd = @intCast(m.rd),
+        .r = @intCast(r),
+        .overlap = c.coff == 2,
+        .rotate = rotate,
+        .pre_n = @intCast(pre_n),
+        .col_off = @intCast(col_off),
+        .cin_w = @intCast(mlx.mlx_array_shape(comp_in)[1]),
+        .base_mod = @intCast(base % r),
+        .n_win = @intCast(n_win),
+        .tg = @intCast(tg),
+    };
+    _ = used_c;
+    // decode/verify tuples (n_win ≤ 2) are stable — cache; chunk geometries
+    // vary per chunk and are built fresh + freed after apply.
+    var cfg: mlx.mlx_fast_metal_kernel_config = undefined;
+    var cached = false;
+    if (key.n_win <= 2) {
+        for (&emit_cfg_cache) |*slot| {
+            if (slot.*) |sl| {
+                if (std.meta.eql(sl.key, key)) {
+                    cfg = sl.cfg;
+                    cached = true;
+                    break;
+                }
+            } else {
+                const built = emitWinCfg(key) orelse return false;
+                slot.* = .{ .key = key, .cfg = built };
+                cfg = built;
+                cached = true;
+                break;
+            }
+        }
+    }
+    if (!cached) cfg = emitWinCfg(key) orelse return false;
+    defer if (!cached) {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    };
+
+    // pre-ring staging (same layout as the composed path's ext build)
+    const stage_n = @max(pre_n, 1);
+    const stage_kv = try alloc.alloc(f32, stage_n * cd);
+    defer alloc.free(stage_kv);
+    const stage_sc = try alloc.alloc(f32, stage_n * cd);
+    defer alloc.free(stage_sc);
+    if (pre_n == 0) {
+        stage_kv[0] = 0;
+        stage_sc[0] = 0;
+    } else {
+        const overlap = c.coff == 2;
+        const k = base % r;
+        var row: usize = 0;
+        if (overlap) {
+            for (0..r) |i| {
+                @memcpy(stage_kv[row * cd ..][0..cd], cs.kv_pend[i * cs.width ..][0..cd]);
+                @memcpy(stage_sc[row * cd ..][0..cd], cs.sc_pend[i * cs.width ..][0..cd]);
+                row += 1;
+            }
+        }
+        const cur0: usize = if (overlap) r else 0;
+        for (0..k) |i| {
+            @memcpy(stage_kv[row * cd ..][0..cd], cs.kv_pend[(cur0 + i) * cs.width ..][0..cd]);
+            @memcpy(stage_sc[row * cd ..][0..cd], cs.sc_pend[(cur0 + i) * cs.width ..][0..cd]);
+            row += 1;
+        }
+        std.debug.assert(row == pre_n);
+    }
+    const pshape = [_]c_int{ @intCast(stage_n), @intCast(cd) };
+    const pre_kv_g = uploadF32(stage_kv, &pshape);
+    defer _ = mlx.mlx_array_free(pre_kv_g);
+    const pre_sc_g = uploadF32(stage_sc, &pshape);
+    defer _ = mlx.mlx_array_free(pre_sc_g);
+
+    const half = m.rd / 2;
+    const cos_h = try alloc.alloc(f32, n_win * half);
+    defer alloc.free(cos_h);
+    const sin_h = try alloc.alloc(f32, n_win * half);
+    defer alloc.free(sin_h);
+    for (0..n_win) |j| {
+        const bs = (W + j) * r;
+        @memcpy(cos_h[j * half ..][0..half], fr.cos[bs * half ..][0..half]);
+        @memcpy(sin_h[j * half ..][0..half], fr.sin[bs * half ..][0..half]);
+    }
+    const rshape = [_]c_int{ @intCast(n_win), @intCast(half) };
+    const cos_g = uploadF32(cos_h, &rshape);
+    defer _ = mlx.mlx_array_free(cos_g);
+    const sin_g = uploadF32(sin_h, &rshape);
+    defer _ = mlx.mlx_array_free(sin_g);
+    const eps_arr = [_]f32{m.eps};
+    const eshape = [_]c_int{1};
+    const eps_g = uploadF32(&eps_arr, &eshape);
+    defer _ = mlx.mlx_array_free(eps_g);
+    // non-rotate never reads hada — norm_g stands in to keep the input list fixed
+    const hada_in = if (rotate) m.hada_g.? else c.norm_g;
+
+    const inputs_arr = [_]mlx.mlx_array{ comp_in, pre_kv_g, pre_sc_g, c.ape_g, c.norm_g, cos_g, sin_g, hada_in, eps_g };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, m.s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    try mirror.appendGpu(out, n_win, m.s);
+    emit_kernel_hits += 1;
+    if (!emit_kernel_logged) {
+        emit_kernel_logged = true;
+        log.info("dsv4: fused emission kernel engaged\n", .{});
+    }
+    return true;
+}
+
+/// Fused decode attention-chain tail: per-head [RMS →] rope tail →
+/// [fp8-head-sim | Hadamard+fp4] in ONE dispatch, replacing the composed
+/// ~15-25-op chains around the decode qmvs (q / kv / indexer-q / o-inverse).
+/// post: 0 = rope only, 1 = fp8 head sim + raw roped tail, 2 = Hadamard+fp4.
+/// Returns null to decline (kill switch, ineligible geometry, build failure)
+/// — the caller keeps the composed chain.
+/// Row softmax with the sink folded into the max and the denominator, sink
+/// column dropped at the write — one threadgroup per head, tree reductions.
+/// exp/reduction-tree drift vs the composed mlx softmax is the sanctioned
+/// sinkhorn-kernel class (continuous path, decode-equivalence arbitrates).
+const SINK_SOFTMAX_KERNEL_SOURCE =
+    \\int h = thread_position_in_grid.y;
+    \\int lane = thread_position_in_threadgroup.x;
+    \\if (h >= H) return; // uniform per threadgroup (grid.y == H)
+    \\// TK is an INPUT, not a template arg: it changes every token during the
+    \\// context ramp, and a template value would JIT a fresh Metal kernel per
+    \\// tk (measured: first request 19 tok/s vs 29.7 warm).
+    \\int TK = int(tk_size[0]);
+    \\threadgroup float red[TG];
+    \\float sk = sink[h];
+    \\float mx = sk;
+    \\for (int j = lane; j < TK; j += TG) mx = metal::max(mx, scores[h * TK + j] * consts[0]);
+    \\red[lane] = mx;
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\for (int off = TG / 2; off > 0; off >>= 1) {
+    \\  if (lane < off) red[lane] = metal::max(red[lane], red[lane + off]);
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\float m = red[0];
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\float sum = 0.0f;
+    \\for (int j = lane; j < TK; j += TG) sum += metal::exp(scores[h * TK + j] * consts[0] - m);
+    \\red[lane] = sum;
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\for (int off = TG / 2; off > 0; off >>= 1) {
+    \\  if (lane < off) red[lane] += red[lane + off];
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\float inv = 1.0f / (red[0] + metal::exp(sk - m));
+    \\for (int j = lane; j < TK; j += TG) {
+    \\  y[h * TK + j] = metal::exp(scores[h * TK + j] * consts[0] - m) * inv;
+    \\}
+;
+
+var sink_softmax_obj: ?mlx.mlx_fast_metal_kernel = null;
+var sink_softmax_build_failed: bool = false;
+fn sinkSoftmaxObj() ?mlx.mlx_fast_metal_kernel {
+    if (sink_softmax_build_failed) return null;
+    if (sink_softmax_obj) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "scores", "sink", "consts", "tk_size" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_sink_softmax", in_vec, out_vec, SINK_SOFTMAX_KERNEL_SOURCE, "", true, false);
+    if (kernel.ctx == null) {
+        sink_softmax_build_failed = true;
+        log.warn("dsv4: fused sink-softmax kernel failed to build — composed chain fallback\n", .{});
+        return null;
+    }
+    sink_softmax_obj = kernel;
+    return kernel;
+}
+
+const SinkSmKey = struct { h: u32, tk: u32 };
+const SinkSmSlot = struct { key: SinkSmKey, cfg: mlx.mlx_fast_metal_kernel_config };
+/// tk differs per ratio class within one token (~4 live values at steady
+/// state) and grows during the ramp — an 8-slot rotating table keeps the
+/// steady-state configs cached without unbounded growth.
+var sink_sm_cfg_cache: [8]?SinkSmSlot = @splat(null);
+var sink_sm_cfg_next: usize = 0;
+
+/// Fused decode sink-softmax: scale → sink column in the denominator →
+/// row softmax → drop the sink, in ONE dispatch between the two attention
+/// GEMMs (the composed chain is 4 strictly-serial dispatches per layer).
+/// Returns probs [H, TK] f32, or null to decline.
+fn sinkSoftmaxKernel(m: *const Dsv4Model, scores0: mlx.mlx_array, sink: mlx.mlx_array, H: usize, TK: usize, scale: f32) !?mlx.mlx_array {
+    if (!sinkSoftmaxEnabled() or !mlx.streamIsGpu(m.s)) return null; // metal_kernel is GPU-only
+    if (TK == 0 or H == 0 or H > 65535) return null;
+    const kernel = sinkSoftmaxObj() orelse return null;
+    const tg: usize = @min(256, std.math.ceilPowerOfTwoAssert(usize, @max(TK, 2)));
+    const key = SinkSmKey{ .h = @intCast(H), .tk = @intCast(TK) };
+    var cfg: mlx.mlx_fast_metal_kernel_config = undefined;
+    var cached = false;
+    for (&sink_sm_cfg_cache) |*slot| {
+        if (slot.*) |sl| {
+            if (std.meta.eql(sl.key, key)) {
+                cfg = sl.cfg;
+                cached = true;
+                break;
+            }
+        }
+    }
+    if (!cached) {
+        const built = mlx.mlx_fast_metal_kernel_config_new();
+        const y_shape = [_]c_int{ @intCast(H), @intCast(TK) };
+        if (mlx.mlx_fast_metal_kernel_config_add_output_arg(built, &y_shape, 2, .float32) != 0 or
+            mlx.mlx_fast_metal_kernel_config_set_grid(built, @intCast(tg), @intCast(H), 1) != 0 or
+            mlx.mlx_fast_metal_kernel_config_set_thread_group(built, @intCast(tg), 1, 1) != 0 or
+            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(built, "H", @intCast(H)) != 0 or
+            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(built, "TG", @intCast(tg)) != 0)
+        {
+            _ = mlx.mlx_fast_metal_kernel_config_free(built);
+            return null;
+        }
+        // rotate a slot (frees the evicted config — never one in flight:
+        // apply consumes the config synchronously at graph-build time)
+        if (sink_sm_cfg_cache[sink_sm_cfg_next]) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old.cfg);
+        sink_sm_cfg_cache[sink_sm_cfg_next] = .{ .key = key, .cfg = built };
+        sink_sm_cfg_next = (sink_sm_cfg_next + 1) % sink_sm_cfg_cache.len;
+        cfg = built;
+    }
+    const consts = [_]f32{scale};
+    const cshape = [_]c_int{1};
+    const consts_g = uploadF32(&consts, &cshape);
+    defer _ = mlx.mlx_array_free(consts_g);
+    const tk_val = [_]i32{@intCast(TK)};
+    const tk_g = mlx.mlx_array_new_data(&tk_val, &cshape, 1, .int32);
+    defer _ = mlx.mlx_array_free(tk_g);
+    const inputs_arr = [_]mlx.mlx_array{ scores0, sink, consts_g, tk_g };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, m.s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    sink_softmax_hits += 1;
+    if (!sink_softmax_logged) {
+        sink_softmax_logged = true;
+        log.info("dsv4: fused sink-softmax kernel engaged\n", .{});
+    }
+    return out;
+}
+
+const DEC_CHAIN_KERNEL_SOURCE =
+    \\int h = thread_position_in_grid.y;
+    \\int lane = thread_position_in_threadgroup.x;
+    \\if (h >= H) return; // uniform per threadgroup (grid.y == H)
+    \\const int HALF = RD / 2;
+    \\const int QW = (POST == 1) ? (D - RD) : ((POST == 2) ? D : 0);
+    \\const int GROUP = (POST == 2) ? 32 : 64;
+    \\const float CODE_MAX = (POST == 2) ? 6.0f : 448.0f;
+    \\const float AMAX_FLOOR = (POST == 2) ? metal::ldexp(6.0f, -126) : 1e-4f;
+    \\const int MANT_BITS = (POST == 2) ? 1 : 3;
+    \\const int MIN_EXP = (POST == 2) ? 0 : -6;
+    \\const float MIN_SUB = metal::ldexp(1.0f, MIN_EXP);
+    \\threadgroup float row[D];
+    \\threadgroup float row2[(POST == 2) ? D : 1];
+    \\threadgroup float red[TG];
+    \\threadgroup float gsc[(QW > 0) ? (QW / GROUP) : 1];
+    \\// load (+ per-head RMSNorm)
+    \\if (RMS != 0) {
+    \\  float ss = 0.0f;
+    \\  for (int j = lane; j < D; j += TG) { float v = x[h * D + j]; ss += v * v; }
+    \\  red[lane] = ss;
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int off = TG / 2; off > 0; off >>= 1) {
+    \\    if (lane < off) red[lane] += red[lane + off];
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  }
+    \\  float rinv = metal::rsqrt(red[0] / (float)D + consts[0]);
+    \\  for (int j = lane; j < D; j += TG) row[j] = x[h * D + j] * rinv * w[j];
+    \\} else {
+    \\  for (int j = lane; j < D; j += TG) row[j] = x[h * D + j];
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\// interleaved-pair rope on the tail RD dims (INV = conjugate rotation)
+    \\for (int p = lane; p < HALF; p += TG) {
+    \\  float a = row[D - RD + 2 * p];
+    \\  float b = row[D - RD + 2 * p + 1];
+    \\  float cv = cosr[p];
+    \\  float sv = (INV != 0) ? -sinr[p] : sinr[p];
+    \\  row[D - RD + 2 * p] = a * cv - b * sv;
+    \\  row[D - RD + 2 * p + 1] = a * sv + b * cv;
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (POST == 2) {
+    \\  for (int j = lane; j < D; j += TG) {
+    \\    float hacc = 0.0f;
+    \\    for (int kk = 0; kk < D; ++kk) hacc += row[kk] * hada[kk * D + j];
+    \\    row2[j] = hacc;
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\if (QW > 0) {
+    \\  const int NG = QW / GROUP;
+    \\  for (int g = lane; g < NG; g += TG) {
+    \\    float amax = AMAX_FLOOR;
+    \\    for (int e = 0; e < GROUP; ++e) {
+    \\      float v = (POST == 2) ? row2[g * GROUP + e] : row[g * GROUP + e];
+    \\      amax = metal::max(amax, metal::abs(v));
+    \\    }
+    \\    float q = amax / CODE_MAX;
+    \\    int ee = 0;
+    \\    float mm = metal::frexp(q, ee);
+    \\    int ce = (mm == 0.5f) ? (ee - 1) : ee;
+    \\    gsc[g] = metal::ldexp(1.0f, ce);
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\for (int j = lane; j < D; j += TG) {
+    \\  float v = (POST == 2) ? row2[j] : row[j];
+    \\  float res = v;
+    \\  if (POST == 2 || (POST == 1 && j < D - RD)) {
+    \\    float scale = gsc[j / GROUP];
+    \\    float y = metal::clamp(v / scale, -CODE_MAX, CODE_MAX);
+    \\    float a = metal::abs(y);
+    \\    float af = metal::max(a, MIN_SUB);
+    \\    int ee2 = 0;
+    \\    float mm2 = metal::frexp(af, ee2);
+    \\    int e2 = ee2 - 1; // floor(log2(af)): mm2 in [0.5, 1)
+    \\    (void)mm2;
+    \\    if (e2 < MIN_EXP) e2 = MIN_EXP;
+    \\    float quantum = metal::ldexp(1.0f, e2 - MANT_BITS);
+    \\    float qv = metal::min(metal::rint(a / quantum) * quantum, CODE_MAX);
+    \\    float sq = (y < 0.0f) ? -qv : ((y > 0.0f) ? qv : 0.0f);
+    \\    res = sq * scale;
+    \\  }
+    \\  y_out[h * D + j] = res;
+    \\}
+;
+
+var dec_chain_obj: ?mlx.mlx_fast_metal_kernel = null;
+var dec_chain_build_failed: bool = false;
+fn decChainObj() ?mlx.mlx_fast_metal_kernel {
+    if (dec_chain_build_failed) return null;
+    if (dec_chain_obj) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "x", "w", "cosr", "sinr", "hada", "consts" };
+    const output_names = [_][*:0]const u8{"y_out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_dec_chain", in_vec, out_vec, DEC_CHAIN_KERNEL_SOURCE, "", true, false);
+    if (kernel.ctx == null) {
+        dec_chain_build_failed = true;
+        log.warn("dsv4: fused decode-chain kernel failed to build — composed chain fallback\n", .{});
+        return null;
+    }
+    dec_chain_obj = kernel;
+    return kernel;
+}
+
+const DecChainKey = struct { h: u32, d: u32, rd: u32, rms: bool, post: u8, inv: bool, tg: u32 };
+const DecChainSlot = struct { key: DecChainKey, cfg: mlx.mlx_fast_metal_kernel_config };
+/// Decode chains have a handful of per-model geometries — small fixed cache.
+var dec_chain_cfg_cache: [16]?DecChainSlot = @splat(null);
+
+fn decChainCfg(key: DecChainKey) ?mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    const out_shape = [_]c_int{ @intCast(key.h), @intCast(key.d) };
+    if (mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 2, .float32) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(key.tg), @intCast(key.h), 1) != 0 or
+        mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(key.tg), 1, 1) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", @intCast(key.d)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", @intCast(key.h)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", @intCast(key.rd)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RMS", @intFromBool(key.rms)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "POST", key.post) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "INV", @intFromBool(key.inv)) != 0 or
+        mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", @intCast(key.tg)) != 0)
+    {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        return null;
+    }
+    return cfg;
+}
+
+/// Fused decode attention-chain tail: per-head [RMS →] rope tail →
+/// [fp8-head-sim | Hadamard+fp4] in ONE dispatch, replacing the composed
+/// ~15-25-op chains around the decode qmvs (q / kv / indexer-q / o-inverse).
+/// post: 0 = rope only, 1 = fp8 head sim + raw roped tail, 2 = Hadamard+fp4.
+/// Returns null to decline (kill switch, ineligible geometry, build failure)
+/// — the caller keeps the composed chain.
+fn decChainKernel(
+    m: *const Dsv4Model,
+    x: mlx.mlx_array,
+    H: usize,
+    D: usize,
+    rd: usize,
+    rms_w: ?mlx.mlx_array,
+    post: u8,
+    inverse: bool,
+    rr: *const RopeRows,
+) !?mlx.mlx_array {
+    if (!decChainEnabled() or !mlx.streamIsGpu(m.s)) return null; // metal_kernel is GPU-only (CPU stream = uncatchable kill)
+    // eligibility is the kernel's own conditions, never a model list
+    if (D > 1024 or rd == 0 or rd % 2 != 0 or rd > D) return null;
+    if (post == 1 and (D <= rd or (D - rd) % 64 != 0)) return null;
+    var hada_in: mlx.mlx_array = undefined;
+    if (post == 2) {
+        if (D % 32 != 0) return null;
+        const hg = m.hada_g orelse return null;
+        if (mlx.mlx_array_shape(hg)[0] != @as(c_int, @intCast(D))) return null;
+        hada_in = hg;
+    }
+    const kernel = decChainObj() orelse return null;
+    const key = DecChainKey{
+        .h = @intCast(H),
+        .d = @intCast(D),
+        .rd = @intCast(rd),
+        .rms = rms_w != null,
+        .post = post,
+        .inv = inverse,
+        .tg = @intCast(emitTgFor(D)),
+    };
+    var cfg: mlx.mlx_fast_metal_kernel_config = undefined;
+    var cached = false;
+    for (&dec_chain_cfg_cache) |*slot| {
+        if (slot.*) |sl| {
+            if (std.meta.eql(sl.key, key)) {
+                cfg = sl.cfg;
+                cached = true;
+                break;
+            }
+        } else {
+            const built = decChainCfg(key) orelse return null;
+            slot.* = .{ .key = key, .cfg = built };
+            cfg = built;
+            cached = true;
+            break;
+        }
+    }
+    if (!cached) cfg = decChainCfg(key) orelse return null;
+    defer if (!cached) {
+        _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    };
+    const eps_arr = [_]f32{m.eps};
+    const eshape = [_]c_int{1};
+    const eps_g = uploadF32(&eps_arr, &eshape);
+    defer _ = mlx.mlx_array_free(eps_g);
+    // unused slots stand in with always-present arrays (never read in-kernel)
+    const w_in = rms_w orelse rr.cos;
+    if (post != 2) hada_in = rr.cos;
+    const inputs_arr = [_]mlx.mlx_array{ x, w_in, rr.cos, rr.sin, hada_in, eps_g };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, m.s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    dec_chain_hits += 1;
+    if (!dec_chain_logged) {
+        dec_chain_logged = true;
+        log.info("dsv4: fused decode-chain kernel engaged\n", .{});
+    }
+    return out;
+}
+
+/// GPU window emission for one compressor over a chunk (decode is C == 1):
+/// every window the chunk closes gets the masked-softmax combine → RMSNorm →
+/// rope(block start) → QAT sim, and the emitted slots append to the GPU
+/// mirror — pure lazy graph, NO host round trip. Pre-chunk rows come from
+/// the HOST pending rings, which hold bit-identical bytes to the GPU rows
+/// that fed them (same matmul output, same elementwise ape add), so no GPU
+/// ring state exists and snapshots/anchors/rollback stay host-owned. The
+/// host pushes still run — fully deferred to end of token/chunk — with
+/// their mirror append suppressed (`gpuEmitActive`) so `used` advances
+/// exactly once per slot.
+fn emitWindowsGpu(
+    m: *const Dsv4Model,
+    c: *const HostComp,
+    cs: *const CompDecState,
+    mirror: *GpuRows,
+    comp_in: mlx.mlx_array, // [C, comp_in_w] f32
+    col_off: usize, // kv cols [col_off, col_off+cd); sc cols follow
+    base: usize,
+    C: usize,
+    ratio: usize,
+    rotate: bool,
+    fr: *const Freqs,
+    alloc: std.mem.Allocator,
+) !void {
+    const r = ratio;
+    const d = c.head_dim;
+    const cd = c.coff * d;
+    const overlap = c.coff == 2;
+    const W = base / r;
+    const n_win = (base + C) / r - W;
+    if (n_win == 0) return;
+    if (!gpu_emit_logged) {
+        gpu_emit_logged = true;
+        log.info("dsv4: GPU window emission engaged\n", .{});
+    }
+    const k = base % r; // current-window rows already in the host ring
+    const pre_n = k + (if (overlap) r else @as(usize, 0));
+    const used_c = (W + n_win) * r - base; // chunk rows the emission consumes
+    std.debug.assert(used_c <= C);
+
+    if (try emitWindowsKernel(m, c, cs, mirror, comp_in, col_off, base, r, rotate, fr, alloc, W, n_win, pre_n, used_c)) return;
+
+    // ── extended row matrices [pre_n + used_c, cd]; row 0 sits at position
+    // W*r - (overlap ? r : 0), so closed windows are CONTIGUOUS row ranges.
+    const kv_chunk = try gpuSliceRC(comp_in, 0, used_c, col_off, col_off + cd, m.s);
+    defer _ = mlx.mlx_array_free(kv_chunk);
+    const sc_chunk = blk: {
+        const raw = try gpuSliceRC(comp_in, 0, used_c, col_off + cd, col_off + 2 * cd, m.s);
+        defer _ = mlx.mlx_array_free(raw);
+        const idxs = try alloc.alloc(i32, used_c);
+        defer alloc.free(idxs);
+        for (idxs, 0..) |*v, t| v.* = @intCast((base + t) % r);
+        const ishape = [_]c_int{@intCast(used_c)};
+        const idx_g = mlx.mlx_array_new_data(idxs.ptr, &ishape, 1, .int32);
+        defer _ = mlx.mlx_array_free(idx_g);
+        var rows_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows_g);
+        try mlx.check(mlx.mlx_take_axis(&rows_g, c.ape_g, idx_g, 0, m.s));
+        break :blk try gpuOp2(mlx.mlx_add, raw, rows_g, m.s);
+    };
+    defer _ = mlx.mlx_array_free(sc_chunk);
+    var ext_kv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ext_kv);
+    var ext_sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ext_sc);
+    if (pre_n > 0) {
+        const stage_kv = try alloc.alloc(f32, pre_n * cd);
+        defer alloc.free(stage_kv);
+        const stage_sc = try alloc.alloc(f32, pre_n * cd);
+        defer alloc.free(stage_sc);
+        var row: usize = 0;
+        if (overlap) { // previous window: ring slots 0..r, in position order
+            for (0..r) |i| {
+                @memcpy(stage_kv[row * cd ..][0..cd], cs.kv_pend[i * cs.width ..][0..cd]);
+                @memcpy(stage_sc[row * cd ..][0..cd], cs.sc_pend[i * cs.width ..][0..cd]);
+                row += 1;
+            }
+        }
+        const cur0: usize = if (overlap) r else 0;
+        for (0..k) |i| { // current window: slots cur0..cur0+k
+            @memcpy(stage_kv[row * cd ..][0..cd], cs.kv_pend[(cur0 + i) * cs.width ..][0..cd]);
+            @memcpy(stage_sc[row * cd ..][0..cd], cs.sc_pend[(cur0 + i) * cs.width ..][0..cd]);
+            row += 1;
+        }
+        const pshape = [_]c_int{ @intCast(pre_n), @intCast(cd) };
+        const kv_pre = uploadF32(stage_kv, &pshape);
+        defer _ = mlx.mlx_array_free(kv_pre);
+        const sc_pre = uploadF32(stage_sc, &pshape);
+        defer _ = mlx.mlx_array_free(sc_pre);
+        const ekv = try gpuConcat2(kv_pre, kv_chunk, 0, m.s);
+        defer _ = mlx.mlx_array_free(ekv);
+        try mlx.check(mlx.mlx_array_set(&ext_kv, ekv));
+        const esc = try gpuConcat2(sc_pre, sc_chunk, 0, m.s);
+        defer _ = mlx.mlx_array_free(esc);
+        try mlx.check(mlx.mlx_array_set(&ext_sc, esc));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&ext_kv, kv_chunk));
+        try mlx.check(mlx.mlx_array_set(&ext_sc, sc_chunk));
+    }
+
+    // ── per-window effective rows [n_win, rows_eff, d]: with overlap the
+    // previous window's rows contribute their FIRST half and the current
+    // window's their SECOND (the compressorPush col rule).
+    const cur_off: usize = if (overlap) r else 0;
+    var eff_kv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eff_kv);
+    var eff_sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eff_sc);
+    if (overlap) {
+        const prev_kv = try winStack(ext_kv, 0, n_win, r, cd, m.s);
+        defer _ = mlx.mlx_array_free(prev_kv);
+        const cur_kv = try winStack(ext_kv, cur_off, n_win, r, cd, m.s);
+        defer _ = mlx.mlx_array_free(cur_kv);
+        const pk = try gpuSliceLast3(prev_kv, n_win, r, 0, d, m.s);
+        defer _ = mlx.mlx_array_free(pk);
+        const ck = try gpuSliceLast3(cur_kv, n_win, r, d, 2 * d, m.s);
+        defer _ = mlx.mlx_array_free(ck);
+        const jk = try gpuConcat2(pk, ck, 1, m.s);
+        defer _ = mlx.mlx_array_free(jk);
+        try mlx.check(mlx.mlx_array_set(&eff_kv, jk));
+        const prev_sc = try winStack(ext_sc, 0, n_win, r, cd, m.s);
+        defer _ = mlx.mlx_array_free(prev_sc);
+        const cur_sc = try winStack(ext_sc, cur_off, n_win, r, cd, m.s);
+        defer _ = mlx.mlx_array_free(cur_sc);
+        const ps = try gpuSliceLast3(prev_sc, n_win, r, 0, d, m.s);
+        defer _ = mlx.mlx_array_free(ps);
+        const csl = try gpuSliceLast3(cur_sc, n_win, r, d, 2 * d, m.s);
+        defer _ = mlx.mlx_array_free(csl);
+        const js = try gpuConcat2(ps, csl, 1, m.s);
+        defer _ = mlx.mlx_array_free(js);
+        try mlx.check(mlx.mlx_array_set(&eff_sc, js));
+    } else {
+        const ek = try winStack(ext_kv, 0, n_win, r, cd, m.s);
+        defer _ = mlx.mlx_array_free(ek);
+        try mlx.check(mlx.mlx_array_set(&eff_kv, ek));
+        const es = try winStack(ext_sc, 0, n_win, r, cd, m.s);
+        defer _ = mlx.mlx_array_free(es);
+        try mlx.check(mlx.mlx_array_set(&eff_sc, es));
+    }
+
+    // ── masked-softmax combine over the row axis (precise softmax = the
+    // host's max-sub exp/sum in f32; the sims downstream snap the drift)
+    var probs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probs);
+    try mlx.check(mlx.mlx_softmax_axis(&probs, eff_sc, 1, true, m.s));
+    const prod = try gpuOp2(mlx.mlx_multiply, probs, eff_kv, m.s);
+    defer _ = mlx.mlx_array_free(prod);
+    var num = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(num);
+    try mlx.check(mlx.mlx_sum_axis(&num, prod, 1, true, m.s));
+    const cshape = [_]c_int{ @intCast(n_win), @intCast(d) };
+    const combined = try gpuReshape(num, &cshape, m.s);
+    defer _ = mlx.mlx_array_free(combined);
+
+    // ── emit tail: norm → rope at the block starts → QAT sim → append
+    const normd = try gpuRms(combined, c.norm_g, m.eps, m.s);
+    defer _ = mlx.mlx_array_free(normd);
+    const half = m.rd / 2;
+    const cos_h = try alloc.alloc(f32, n_win * half);
+    defer alloc.free(cos_h);
+    const sin_h = try alloc.alloc(f32, n_win * half);
+    defer alloc.free(sin_h);
+    for (0..n_win) |j| {
+        const bs = (W + j) * r;
+        @memcpy(cos_h[j * half ..][0..half], fr.cos[bs * half ..][0..half]);
+        @memcpy(sin_h[j * half ..][0..half], fr.sin[bs * half ..][0..half]);
+    }
+    const rshape = [_]c_int{ @intCast(n_win), @intCast(half) };
+    const cos_g = uploadF32(cos_h, &rshape);
+    defer _ = mlx.mlx_array_free(cos_g);
+    const sin_g = uploadF32(sin_h, &rshape);
+    defer _ = mlx.mlx_array_free(sin_g);
+    const roped = try gpuRopeTailRows(normd, m.rd, cos_g, sin_g, false, m.s);
+    defer _ = mlx.mlx_array_free(roped);
+    var final = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(final);
+    if (rotate) {
+        const had = try gpuOp2(mlx.mlx_matmul, roped, m.hada_g.?, m.s);
+        defer _ = mlx.mlx_array_free(had);
+        const simd = try gpuFp4Sim(had, m.s);
+        defer _ = mlx.mlx_array_free(simd);
+        try mlx.check(mlx.mlx_array_set(&final, simd));
+    } else {
+        const head = try gpuSliceCols(roped, n_win, 0, d - m.rd, m.s);
+        defer _ = mlx.mlx_array_free(head);
+        const hs = try gpuFp8Sim(head, m.s);
+        defer _ = mlx.mlx_array_free(hs);
+        const tail = try gpuSliceCols(roped, n_win, d - m.rd, d, m.s);
+        defer _ = mlx.mlx_array_free(tail);
+        const fin = try gpuConcat2(hs, tail, 1, m.s);
+        defer _ = mlx.mlx_array_free(fin);
+        try mlx.check(mlx.mlx_array_set(&final, fin));
+    }
+    try mirror.appendGpu(final, n_win, m.s);
 }
 
 fn attentionBatch(m: *Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4DecodeState, li: usize, x_g: mlx.mlx_array, c_tokens: usize, base: usize, rr: *const RopeRows, fr: *const Freqs, deferred: *std.ArrayList(DeferredCompRow)) !mlx.mlx_array {
@@ -5187,16 +7663,30 @@ fn attentionBatch(m: *Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4DecodeState,
     // after the layer loop (`processDeferredCompChunk`) exactly as the decode
     // path defers non-boundary positions.
     if (ratio != 0) {
-        const comp_in = try gpuOp2(mlx.mlx_matmul, x_g, h.comp_in_t.?, m.s);
-        const closes = chunkCrossesBoundary(base, C, ratio) or
-            (ls.idx_comp != null and chunkCrossesBoundary(base, C, 4));
-        if (closes or !compDeferEnabled()) {
+        const comp_in = try compInProj(m, h, li, x_g, C);
+        const closes_attn = chunkCrossesBoundary(base, C, ratio);
+        const closes_idx = ls.idx_comp != null and chunkCrossesBoundary(base, C, 4);
+        const closes = closes_attn or closes_idx;
+        if (gpuEmitActive(m)) {
+            // in-chunk emitted slots stay same-chunk-visible through the
+            // mirror (the visibility masks below cover per-token scope);
+            // the host pushes defer to ONE end-of-chunk batched read.
+            const cdd = h.comp.?.coff * h.comp.?.head_dim;
+            if (closes_attn)
+                try emitWindowsGpu(m, &h.comp.?, &ls.comp.?, &ls.comp_gpu, comp_in, 0, base, C, ratio, false, fr, alloc);
+            if (closes_idx)
+                try emitWindowsGpu(m, &h.idx_comp.?, &ls.idx_comp.?, &ls.idx_gpu, comp_in, 2 * cdd, base, C, 4, true, fr, alloc);
+            errdefer _ = mlx.mlx_array_free(comp_in);
+            try deferred.append(alloc, .{ .li = li, .arr = comp_in });
+        } else if (closes or !compDeferEnabled()) {
             defer _ = mlx.mlx_array_free(comp_in);
             var sclk: DsparkClock = if (m.ds_prof != null) DsparkClock.init() else undefined;
+            var cclk: DsparkClock = if (dsv4TraceEnabled()) DsparkClock.init() else undefined;
             const rows = try toHostF32(alloc, comp_in, C * h.comp_in_w, m.s);
             if (m.ds_prof != null) m.ds_prof_comp_sync_ns += sclk.lap();
             defer alloc.free(rows);
             try pushCompChunk(m, st, li, rows, base, C, fr, alloc);
+            if (dsv4TraceEnabled()) trace_comp_ns += cclk.lap();
         } else {
             errdefer _ = mlx.mlx_array_free(comp_in);
             try deferred.append(alloc, .{ .li = li, .arr = comp_in });
@@ -5479,7 +7969,7 @@ fn attentionBatch(m: *Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4DecodeState,
     var ob = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ob);
     try mlx.check(mlx.mlx_astype(&ob, ot, .bfloat16, m.s));
-    const ored = try gpuOp2(mlx.mlx_matmul, ob, m.wo_a_deq[li], m.s); // [og, C, ol]
+    const ored = try woAMatmul(m, li, ob); // [og, C, ol]
     defer _ = mlx.mlx_array_free(ored);
     var ort = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ort);
@@ -5493,6 +7983,22 @@ fn attentionBatch(m: *Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4DecodeState,
 /// Sub-chunk cap: bounds the attention gather transient
 /// (C·(window+idx_topk)·head_dim f32 ≈ 670 MB at 512 on the real geometry).
 const PREFILL_SUB: usize = 512;
+
+/// Prefill sub-chunk size, env-tunable for A/B (`MLX_SERVE_DSV4_PREFILL_SUB`;
+/// default `PREFILL_SUB`). Bigger chunks raise the per-expert M of the
+/// sorted MoE gather (small-M qmm efficiency) at the cost of larger
+/// attention-gather transients. Cached once per process.
+var prefill_sub_state: ?usize = null;
+fn prefillSub() usize {
+    if (prefill_sub_state) |v| return v;
+    var v: usize = PREFILL_SUB;
+    if (std.c.getenv("MLX_SERVE_DSV4_PREFILL_SUB")) |e| {
+        const parsed = std.fmt.parseInt(usize, std.mem.span(e), 10) catch PREFILL_SUB;
+        if (parsed > 0) v = parsed;
+    }
+    prefill_sub_state = v;
+    return v;
+}
 
 /// Prefill transients (the [C, tk, hd] gathers) never repeat a shape across
 /// prompt lengths, so a prefill sub-chunk returns them to the OS (the
@@ -5513,7 +8019,7 @@ pub fn extendState(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
     errdefer if (logits) |l| gpa.free(l);
     var done: usize = 0;
     while (done < ids.len) {
-        const c_tokens = @min(PREFILL_SUB, ids.len - done);
+        const c_tokens = @min(prefillSub(), ids.len - done);
         if (logits) |l| gpa.free(l);
         logits = try extendChunk(m, gpa, st, ids[done .. done + c_tokens], false);
         done += c_tokens;
@@ -5526,13 +8032,17 @@ pub fn extendState(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
 /// logits ([ids.len * vocab] f32, row-major). One chunk only by design — the
 /// DSpark verify block is ≤ block_size+1 tokens.
 pub fn extendStateAllLogits(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids: []const u32) ![]f32 {
-    std.debug.assert(ids.len <= PREFILL_SUB);
+    std.debug.assert(ids.len <= prefillSub());
     return extendChunk(m, gpa, st, ids, true);
 }
 
 fn extendChunk(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids: []const u32, comptime all_logits: bool) ![]f32 {
     var chunk_clk: DsparkClock = if (m.ds_prof != null) DsparkClock.init() else undefined;
     if (m.ds_prof != null) m.ds_prof_comp_sync_ns = 0;
+    const tracing = dsv4TraceEnabled();
+    var tclk: DsparkClock = if (tracing) DsparkClock.init() else undefined;
+    if (tracing) trace_comp_ns = 0;
+    if (st.pending.items.len > 0) try drainPending(m, st); // lazy→chunk handoff
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -5617,7 +8127,9 @@ fn extendChunk(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids:
             try mh_parts.append(a, mean);
         }
     }
+    const layers_ns: u64 = if (tracing) tclk.lap() else 0;
     try processDeferredCompChunk(m, st, a, deferred.items, base, C, fr_yarn);
+    const defer_ns: u64 = if (tracing) tclk.lap() else 0;
     if (st.dspark != null and mh_parts.items.len > 0) {
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -5644,6 +8156,12 @@ fn extendChunk(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, ids:
         break :blk try headLogitsGpu(m, gpa, a, last2);
     };
     if (m.ds_prof != null) m.ds_prof_head_ns = chunk_clk.lap();
+    if (tracing) {
+        const head_ns = tclk.lap();
+        log.info("[dsv4-trace] chunk base={d} C={d} layers={d}ms defer={d}ms head={d}ms comp={d}ms\n", .{
+            base, C, layers_ns / 1_000_000, defer_ns / 1_000_000, head_ns / 1_000_000, trace_comp_ns / 1_000_000,
+        });
+    }
     return out;
 }
 
@@ -5664,20 +8182,32 @@ fn headLogitsBatchGpu(m: *const Dsv4Model, gpa: std.mem.Allocator, alloc: std.me
     var ssum = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ssum);
     try mlx.check(mlx.mlx_sum_axis(&ssum, sq, 1, true, m.s));
-    const joint = try gpuConcat2(mixes_g, ssum, 1, m.s);
-    defer _ = mlx.mlx_array_free(joint);
-    const jh = try toHostF32(alloc, joint, C * (hcm + 1), m.s);
-    defer alloc.free(jh);
-    const prew = try alloc.alloc(f32, C * hcm);
-    defer alloc.free(prew);
-    for (0..C) |t| {
-        const row = jh[t * (hcm + 1) ..][0 .. hcm + 1];
-        const rsq: f32 = @floatCast(1.0 / @sqrt(@as(f64, row[hcm]) / @as(f64, @floatFromInt(hcm * d)) + m.eps));
-        for (0..hcm) |c| prew[t * hcm + c] = sigmoidF32(row[c] * rsq * m.hc_head_scale[0] + m.hc_head_base[c]) + m.hc_eps;
-    }
-    const pshape = [_]c_int{ cc, @intCast(hcm), 1 };
-    const pre_col = uploadF32(prew, &pshape);
+    var pre_col = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pre_col);
+    const pshape = [_]c_int{ cc, @intCast(hcm), 1 };
+    if (mlx.streamIsGpu(m.s)) {
+        const prew_g = try headPreWeightsGpu(m, mixes_g, ssum); // [C, hc]
+        defer _ = mlx.mlx_array_free(prew_g);
+        var pc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pc);
+        try mlx.check(mlx.mlx_reshape(&pc, prew_g, &pshape, 3, m.s));
+        try mlx.check(mlx.mlx_array_set(&pre_col, pc));
+    } else {
+        const joint = try gpuConcat2(mixes_g, ssum, 1, m.s);
+        defer _ = mlx.mlx_array_free(joint);
+        const jh = try toHostF32(alloc, joint, C * (hcm + 1), m.s);
+        defer alloc.free(jh);
+        const prew = try alloc.alloc(f32, C * hcm);
+        defer alloc.free(prew);
+        for (0..C) |t| {
+            const row = jh[t * (hcm + 1) ..][0 .. hcm + 1];
+            const rsq: f32 = @floatCast(1.0 / @sqrt(@as(f64, row[hcm]) / @as(f64, @floatFromInt(hcm * d)) + m.eps));
+            for (0..hcm) |c| prew[t * hcm + c] = sigmoidF32(row[c] * rsq * m.hc_head_scale[0] + m.hc_head_base[c]) + m.hc_eps;
+        }
+        const up = uploadF32(prew, &pshape);
+        defer _ = mlx.mlx_array_free(up);
+        try mlx.check(mlx.mlx_array_set(&pre_col, up));
+    }
     const weighted = try gpuOp2(mlx.mlx_multiply, pre_col, stream_g, m.s);
     defer _ = mlx.mlx_array_free(weighted);
     var hout = mlx.mlx_array_new();
@@ -5805,7 +8335,7 @@ fn dsparkAttentionG(m: *Dsv4Model, st: *Dsv4DecodeState, sti: usize, x_g: mlx.ml
     var ob = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ob);
     try mlx.check(mlx.mlx_astype(&ob, ot, .bfloat16, m.s));
-    const ored = try gpuOp2(mlx.mlx_matmul, ob, m.wo_a_deq[li], m.s); // [og, B, ol]
+    const ored = try woAMatmul(m, li, ob); // [og, B, ol]
     defer _ = mlx.mlx_array_free(ored);
     var ort = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ort);
@@ -6571,7 +9101,7 @@ test "dsv4: routeGpu matches host routeToken (scored + hash)" {
         defer _ = mlx.mlx_array_free(bias_arr);
 
         const ids = [_]u32{ 0, 0, 0 }; // unused for scored selection; len = C
-        var rg = try routeGpu(s, alloc, scores_arr, bias_arr, null, &ids, E, k, route_scale);
+        var rg = try routeGpu(s, alloc, scores_arr, bias_arr, null, null, null, &ids, E, k, route_scale);
         defer rg.deinit();
         const got = try readBack(alloc, &rg, s, C * k);
         defer alloc.free(got.ind);
@@ -6609,7 +9139,7 @@ test "dsv4: routeGpu matches host routeToken (scored + hash)" {
         h.gate_bias = null;
 
         const ids = [_]u32{ 2, 7, 0 };
-        var rg = try routeGpu(s, alloc, scores_arr, null, table[0..], &ids, E, k, route_scale);
+        var rg = try routeGpu(s, alloc, scores_arr, null, table[0..], null, null, &ids, E, k, route_scale);
         defer rg.deinit();
         const got = try readBack(alloc, &rg, s, C * k);
         defer alloc.free(got.ind);
@@ -6831,6 +9361,609 @@ test "dsv4: gpuRopeTail matches the host ropeRow" {
                     try testing.expect(false);
                 }
             }
+        }
+    }
+}
+
+test "dsv4: fused emission kernel matches the composed emission graph (GPU)" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const alloc = testing.allocator;
+    const hada = try buildHadamardF32(alloc, 128, s);
+    defer _ = mlx.mlx_array_free(hada);
+    const Case = struct { d: usize, rd: usize, r: usize, coff: usize, rotate: bool, base: usize, C: usize, col_off: usize, cin_w: usize, seed_neg_inf: bool };
+    const cases = [_]Case{
+        // real attn-compressor decode boundary (first window: -inf prev seed)
+        .{ .d = 512, .rd = 64, .r = 4, .coff = 2, .rotate = false, .base = 3, .C = 1, .col_off = 0, .cin_w = 2560, .seed_neg_inf = true },
+        // real indexer decode boundary: Hadamard + fp4 sim, cols after attn's
+        .{ .d = 128, .rd = 64, .r = 4, .coff = 2, .rotate = true, .base = 3, .C = 1, .col_off = 2048, .cin_w = 2560, .seed_neg_inf = false },
+        // non-overlap chunk with ring remainder (mini ratio-16 shape)
+        .{ .d = 96, .rd = 32, .r = 16, .coff = 1, .rotate = false, .base = 8, .C = 40, .col_off = 0, .cin_w = 192, .seed_neg_inf = false },
+        // overlap chunk crossing mid-window (ape wrap, multi-window)
+        .{ .d = 128, .rd = 64, .r = 4, .coff = 2, .rotate = false, .base = 6, .C = 10, .col_off = 0, .cin_w = 512, .seed_neg_inf = false },
+    };
+    var rng = std.Random.DefaultPrng.init(11);
+    for (cases) |tc| {
+        const cd = tc.coff * tc.d;
+        const half = tc.rd / 2;
+        const npos = tc.base + tc.C + tc.r;
+        var m: Dsv4Model = undefined;
+        m.s = s;
+        m.eps = 1e-6;
+        m.rd = tc.rd;
+        m.hada_g = hada;
+
+        var c: HostComp = undefined;
+        c.head_dim = tc.d;
+        c.coff = tc.coff;
+        const norm_h = try alloc.alloc(f32, tc.d);
+        defer alloc.free(norm_h);
+        for (norm_h) |*v| v.* = 0.5 + rng.random().float(f32);
+        const nshape = [_]c_int{@intCast(tc.d)};
+        c.norm_g = uploadF32(norm_h, &nshape);
+        defer _ = mlx.mlx_array_free(c.norm_g);
+        const ape_h = try alloc.alloc(f32, tc.r * cd);
+        defer alloc.free(ape_h);
+        for (ape_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        const ashape = [_]c_int{ @intCast(tc.r), @intCast(cd) };
+        c.ape_g = uploadF32(ape_h, &ashape);
+        defer _ = mlx.mlx_array_free(c.ape_g);
+
+        var cstate: CompDecState = undefined;
+        const ring_rows = (if (tc.coff == 2) 2 * tc.r else tc.r);
+        const ring = try alloc.alloc(f32, ring_rows * cd);
+        defer alloc.free(ring);
+        const ring_sc = try alloc.alloc(f32, ring_rows * cd);
+        defer alloc.free(ring_sc);
+        for (ring) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        for (ring_sc) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        if (tc.seed_neg_inf) {
+            // first window: previous-window half seeded 0 / -inf (host rule)
+            for (ring[0 .. tc.r * cd]) |*v| v.* = 0;
+            for (ring_sc[0 .. tc.r * cd]) |*v| v.* = -std.math.inf(f32);
+        }
+        cstate.kv_pend = ring;
+        cstate.sc_pend = ring_sc;
+        cstate.width = cd;
+
+        const cin_h = try alloc.alloc(f32, tc.C * tc.cin_w);
+        defer alloc.free(cin_h);
+        for (cin_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        const cshape = [_]c_int{ @intCast(tc.C), @intCast(tc.cin_w) };
+        const cin = uploadF32(cin_h, &cshape);
+        defer _ = mlx.mlx_array_free(cin);
+
+        var fr: Freqs = undefined;
+        fr.half = half;
+        const cos_h = try alloc.alloc(f32, npos * half);
+        defer alloc.free(cos_h);
+        const sin_h = try alloc.alloc(f32, npos * half);
+        defer alloc.free(sin_h);
+        for (cos_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        for (sin_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        fr.cos = cos_h;
+        fr.sin = sin_h;
+
+        const n_win = (tc.base + tc.C) / tc.r - tc.base / tc.r;
+        try testing.expect(n_win > 0);
+
+        emitKernelSetForTest(false);
+        var mir_ref = GpuRows.init(tc.d);
+        defer mir_ref.deinit();
+        try emitWindowsGpu(&m, &c, &cstate, &mir_ref, cin, tc.col_off, tc.base, tc.C, tc.r, tc.rotate, &fr, alloc);
+        emitKernelSetForTest(true);
+        const hits0 = emit_kernel_hits;
+        var mir_k = GpuRows.init(tc.d);
+        defer mir_k.deinit();
+        try emitWindowsGpu(&m, &c, &cstate, &mir_k, cin, tc.col_off, tc.base, tc.C, tc.r, tc.rotate, &fr, alloc);
+        emitKernelSetForTest(null);
+        try testing.expect(emit_kernel_hits > hits0); // ENGAGED, not silently declined
+        try testing.expectEqual(n_win, mir_ref.used);
+        try testing.expectEqual(n_win, mir_k.used);
+
+        const ref_rows = try mir_ref.sliceRows(0, n_win, s);
+        defer _ = mlx.mlx_array_free(ref_rows);
+        const k_rows = try mir_k.sliceRows(0, n_win, s);
+        defer _ = mlx.mlx_array_free(k_rows);
+        const want = try toHostF32(alloc, ref_rows, n_win * tc.d, s);
+        defer alloc.free(want);
+        const got = try toHostF32(alloc, k_rows, n_win * tc.d, s);
+        defer alloc.free(got);
+        for (want, got, 0..) |w, g, i| {
+            // approx-eq is NaN-safe: a NaN diff fails (finiteness rule)
+            if (!(@abs(w - g) <= 2e-3)) {
+                std.debug.print("emit-kernel mismatch d={d} rotate={} i={d}: composed={e} kernel={e}\n", .{ tc.d, tc.rotate, i, w, g });
+                try testing.expect(false);
+            }
+        }
+    }
+}
+
+test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GPU)" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const alloc = testing.allocator;
+    const hada = try buildHadamardF32(alloc, 128, s);
+    defer _ = mlx.mlx_array_free(hada);
+    // post: 0 = rope only, 1 = fp8 head sim + raw roped tail, 2 = hadamard+fp4
+    const Case = struct { h: usize, d: usize, rd: usize, rms: bool, ones_w: bool, post: u8, inv: bool };
+    const cases = [_]Case{
+        .{ .h = 64, .d = 512, .rd = 64, .rms = true, .ones_w = true, .post = 0, .inv = false }, // q chain
+        .{ .h = 1, .d = 512, .rd = 64, .rms = true, .ones_w = false, .post = 1, .inv = false }, // kv chain
+        .{ .h = 64, .d = 128, .rd = 64, .rms = false, .ones_w = false, .post = 2, .inv = false }, // idx q chain
+        .{ .h = 64, .d = 512, .rd = 64, .rms = false, .ones_w = false, .post = 0, .inv = true }, // o rope⁻¹
+        .{ .h = 4, .d = 96, .rd = 32, .rms = true, .ones_w = false, .post = 1, .inv = false }, // mini kv shape
+    };
+    var rng = std.Random.DefaultPrng.init(23);
+    for (cases) |tc| {
+        var m: Dsv4Model = undefined;
+        m.s = s;
+        m.eps = 1e-6;
+        const half = tc.rd / 2;
+        const xs = try alloc.alloc(f32, tc.h * tc.d);
+        defer alloc.free(xs);
+        for (xs) |*v| v.* = (rng.random().float(f32) - 0.5) * 4.0;
+        const xshape = [_]c_int{ 1, @intCast(tc.h * tc.d) };
+        const x = uploadF32(xs, &xshape);
+        defer _ = mlx.mlx_array_free(x);
+        const ws = try alloc.alloc(f32, tc.d);
+        defer alloc.free(ws);
+        for (ws) |*v| v.* = if (tc.ones_w) 1.0 else 0.5 + rng.random().float(f32);
+        const wshape = [_]c_int{@intCast(tc.d)};
+        const w = uploadF32(ws, &wshape);
+        defer _ = mlx.mlx_array_free(w);
+        const cos_h = try alloc.alloc(f32, half);
+        defer alloc.free(cos_h);
+        const sin_h = try alloc.alloc(f32, half);
+        defer alloc.free(sin_h);
+        for (cos_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        for (sin_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        const rshape = [_]c_int{@intCast(half)};
+        const rr = RopeRows{ .cos = uploadF32(cos_h, &rshape), .sin = uploadF32(sin_h, &rshape) };
+        defer _ = mlx.mlx_array_free(rr.cos);
+        defer _ = mlx.mlx_array_free(rr.sin);
+
+        // composed reference: the exact attentionDecodeGpu op chain
+        const hshape = [_]c_int{ @intCast(tc.h), @intCast(tc.d) };
+        const xr = try gpuReshape(x, &hshape, s);
+        defer _ = mlx.mlx_array_free(xr);
+        var stage = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stage);
+        if (tc.rms) {
+            const n = try gpuRms(xr, w, m.eps, s);
+            defer _ = mlx.mlx_array_free(n);
+            try mlx.check(mlx.mlx_array_set(&stage, n));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&stage, xr));
+        }
+        const roped = try gpuRopeTail(stage, tc.rd, rr.cos, rr.sin, tc.inv, s);
+        defer _ = mlx.mlx_array_free(roped);
+        var want_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want_arr);
+        switch (tc.post) {
+            0 => try mlx.check(mlx.mlx_array_set(&want_arr, roped)),
+            1 => {
+                const head = try gpuSliceCols(roped, tc.h, 0, tc.d - tc.rd, s);
+                defer _ = mlx.mlx_array_free(head);
+                const hs = try gpuFp8Sim(head, s);
+                defer _ = mlx.mlx_array_free(hs);
+                const tail = try gpuSliceCols(roped, tc.h, tc.d - tc.rd, tc.d, s);
+                defer _ = mlx.mlx_array_free(tail);
+                const fin = try gpuConcat2(hs, tail, 1, s);
+                defer _ = mlx.mlx_array_free(fin);
+                try mlx.check(mlx.mlx_array_set(&want_arr, fin));
+            },
+            else => {
+                const had = try gpuOp2(mlx.mlx_matmul, roped, hada, s);
+                defer _ = mlx.mlx_array_free(had);
+                const simd = try gpuFp4Sim(had, s);
+                defer _ = mlx.mlx_array_free(simd);
+                try mlx.check(mlx.mlx_array_set(&want_arr, simd));
+            },
+        }
+
+        decChainSetForTest(true);
+        const hits0 = dec_chain_hits;
+        m.hada_g = if (tc.post == 2) hada else null;
+        const got_arr = (try decChainKernel(&m, x, tc.h, tc.d, tc.rd, if (tc.rms) w else null, tc.post, tc.inv, &rr)) orelse {
+            decChainSetForTest(null);
+            std.debug.print("dec-chain DECLINED h={d} d={d} post={d}\n", .{ tc.h, tc.d, tc.post });
+            try testing.expect(false);
+            unreachable;
+        };
+        defer _ = mlx.mlx_array_free(got_arr);
+        decChainSetForTest(null);
+        try testing.expect(dec_chain_hits > hits0);
+
+        const want = try toHostF32(alloc, want_arr, tc.h * tc.d, s);
+        defer alloc.free(want);
+        const got = try toHostF32(alloc, got_arr, tc.h * tc.d, s);
+        defer alloc.free(got);
+        for (want, got, 0..) |wv, gv, i| {
+            if (!(@abs(wv - gv) <= 2e-3)) {
+                std.debug.print("dec-chain mismatch h={d} d={d} post={d} i={d}: composed={e} kernel={e}\n", .{ tc.h, tc.d, tc.post, i, wv, gv });
+                try testing.expect(false);
+            }
+        }
+    }
+}
+
+test "dsv4: fused MoE gate+up kernel is no worse than the composed gathers (GPU)" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const alloc = testing.allocator;
+    const E: usize = 8;
+    const N: usize = 32;
+    const K: usize = 128;
+    const k: usize = 6;
+    const Case = struct { bits: u32, gs: u32, limit: f32 };
+    const cases = [_]Case{
+        .{ .bits = 2, .gs = 64, .limit = 10.0 }, // real trunk experts
+        .{ .bits = 8, .gs = 32, .limit = 1.0 }, // mini shape, clip engaged
+        .{ .bits = 4, .gs = 32, .limit = 10.0 },
+    };
+    var rng = std.Random.DefaultPrng.init(31);
+    for (cases) |tc| {
+        var m: Dsv4Model = undefined;
+        m.s = s;
+        m.swiglu_limit = tc.limit;
+
+        var banks: [2]Q = undefined;
+        var deq_host: [2][]f32 = .{ &.{}, &.{} };
+        defer for (deq_host) |dh| alloc.free(dh);
+        for (0..2) |bi| {
+            const wf = try alloc.alloc(f32, E * N * K);
+            defer alloc.free(wf);
+            for (wf) |*v| v.* = (rng.random().float(f32) - 0.5) * 0.6;
+            const wshape = [_]c_int{ @intCast(E), @intCast(N), @intCast(K) };
+            const w32 = uploadF32(wf, &wshape);
+            defer _ = mlx.mlx_array_free(w32);
+            var wb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb);
+            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+            var qv = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(qv);
+            const empty = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(empty);
+            try mlx.check(mlx.mlx_quantize(&qv, wb, mlx.mlx_optional_int.some(@intCast(tc.gs)), mlx.mlx_optional_int.some(@intCast(tc.bits)), "affine", empty, s));
+            var wq = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&wq, qv, 0));
+            var sc = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
+            var bs = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&bs, qv, 2));
+            banks[bi] = .{ .w = wq, .s = sc, .b = bs, .qp = .{ .bits = tc.bits, .group_size = tc.gs } };
+            // dequant ground-truth operand (widened to f32 for the host read)
+            var deq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(deq);
+            try mlx.check(mlx.mlx_dequantize(&deq, wq, sc, bs, mlx.mlx_optional_int.some(@intCast(tc.gs)), mlx.mlx_optional_int.some(@intCast(tc.bits)), "affine", empty, mlx.mlx_optional_dtype{}, s));
+            var deq32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(deq32);
+            try mlx.check(mlx.mlx_astype(&deq32, deq, .float32, s));
+            deq_host[bi] = try toHostF32(alloc, deq32, E * N * K, s);
+        }
+        defer for (&banks) |*b| {
+            _ = mlx.mlx_array_free(b.w);
+            _ = mlx.mlx_array_free(b.s);
+            _ = mlx.mlx_array_free(b.b);
+        };
+
+        const xf = try alloc.alloc(f32, K);
+        defer alloc.free(xf);
+        for (xf) |*v| v.* = (rng.random().float(f32) - 0.5) * 3.0;
+        const xshape = [_]c_int{ 1, 1, 1, @intCast(K) };
+        const x32 = uploadF32(xf, &xshape);
+        defer _ = mlx.mlx_array_free(x32);
+        var xe = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xe);
+        try mlx.check(mlx.mlx_astype(&xe, x32, .bfloat16, s));
+        // x as the kernel sees it (bf16-rounded), for the f64 ground truth
+        const xh = try toHostF32(alloc, xe, K, s);
+        defer alloc.free(xh);
+
+        const inds = [_]i32{ 0, 3, 3, 7, 1, 0 }; // duplicates included
+        const ishape = [_]c_int{ 1, @intCast(k) };
+        const ind = mlx.mlx_array_new_data(&inds, &ishape, 2, .int32);
+        defer _ = mlx.mlx_array_free(ind);
+
+        // composed reference chain (the decode branch verbatim)
+        const gate_arr = try gatherQmmE(&banks[0], xe, ind, s);
+        defer _ = mlx.mlx_array_free(gate_arr);
+        const up_arr = try gatherQmmE(&banks[1], xe, ind, s);
+        defer _ = mlx.mlx_array_free(up_arr);
+        const act_c = try clippedSwigluG(gate_arr, up_arr, tc.limit, s);
+        defer _ = mlx.mlx_array_free(act_c);
+        // the fused arm must reproduce the composed act SHAPE exactly — the
+        // down gather consumes it as its x operand
+        try mlx.check(mlx.mlx_array_eval(act_c));
+        {
+            const nd = mlx.mlx_array_ndim(act_c);
+            const sh = mlx.mlx_array_shape(act_c);
+            const want_sh = [_]c_int{ 1, @intCast(k), 1, @intCast(N) };
+            try testing.expectEqual(@as(usize, 4), nd);
+            for (0..4) |i| try testing.expectEqual(want_sh[i], sh[i]);
+        }
+
+        moeGateUpSetForTest(true);
+        const hits0 = moe_gateup_hits;
+        const act_f = (try moeGateUpFused(&m, xe, &banks[0], &banks[1], ind, k)) orelse {
+            moeGateUpSetForTest(null);
+            std.debug.print("moe gate+up DECLINED bits={d} gs={d}\n", .{ tc.bits, tc.gs });
+            try testing.expect(false);
+            unreachable;
+        };
+        defer _ = mlx.mlx_array_free(act_f);
+        moeGateUpSetForTest(null);
+        try testing.expect(moe_gateup_hits > hits0);
+
+        const got_c = try toHostF32(alloc, act_c, k * N, s);
+        defer alloc.free(got_c);
+        const got_f = try toHostF32(alloc, act_f, k * N, s);
+        defer alloc.free(got_f);
+
+        // f64 ground truth from the dequantized banks + bf16-rounded x
+        var err_c: f64 = 0;
+        var err_f: f64 = 0;
+        for (0..k) |e| {
+            const eid: usize = @intCast(inds[e]);
+            for (0..N) |n| {
+                var g: f64 = 0;
+                var u: f64 = 0;
+                for (0..K) |j| {
+                    g += @as(f64, xh[j]) * deq_host[0][(eid * N + n) * K + j];
+                    u += @as(f64, xh[j]) * deq_host[1][(eid * N + n) * K + j];
+                }
+                const gc = @min(g, @as(f64, tc.limit));
+                const uc = std.math.clamp(u, -@as(f64, tc.limit), @as(f64, tc.limit));
+                const truth = (gc / (1.0 + @exp(-gc))) * uc;
+                const i = e * N + n;
+                try testing.expect(std.math.isFinite(got_c[i]));
+                try testing.expect(std.math.isFinite(got_f[i]));
+                err_c = @max(err_c, @abs(@as(f64, got_c[i]) - truth));
+                err_f = @max(err_f, @abs(@as(f64, got_f[i]) - truth));
+            }
+        }
+        std.debug.print("dsv4 moe gate+up bits={d}: err composed={e:.3} fused={e:.3}\n", .{ tc.bits, err_c, err_f });
+        // no-worse-than-reference (house rule: never kernel-vs-kernel exact)
+        try testing.expect(err_f <= err_c * 1.25 + 1e-3);
+    }
+}
+
+test "dsv4: boundary prefetch drains older pending rows a token early (DSV4_MINI)" {
+    // At the end of the step BEFORE a window-closing token, older pending
+    // compressor rows (async-scheduled ≥1 token ago) must drain so the
+    // boundary token's blocking drain shrinks to the latest token's rows.
+    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    if (mlx.noGpuBackend()) return;
+    if (!drainPrefetchEnabled()) return; // fallback-arm runs assert nothing here
+    const path = std.mem.span(path_z);
+    const allocator = testing.allocator;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
+    defer allocator.free(cfg_path);
+    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    file.close(io);
+    defer allocator.free(cfg_json);
+    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
+    defer allocator.free(shard_path);
+    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    defer weights.deinit();
+
+    const dw = try loadDsv4Weights(allocator, &cfg, &weights);
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    _ = unsetenv("MLX_SERVE_DSV4_DSPARK");
+    var mdl = try initModel(allocator, &cfg, dw, s);
+    defer mdl.deinit();
+
+    var rng = std.Random.DefaultPrng.init(43);
+    var ids: [20]u32 = undefined;
+    for (&ids) |*v| v.* = rng.random().uintLessThan(u32, @intCast(mdl.vocab));
+
+    var st = try initDecodeState(&mdl, allocator);
+    defer deinitDecodeState(&st);
+    try testing.expect(lazyDecodeReady(&mdl, &st));
+    {
+        const p = try prefillIntoState(&mdl, allocator, &st, ids[0..17]);
+        allocator.free(p);
+    }
+    // mini ratios [0,4,16,4]: pos 19 closes a ratio-4 window. Steps at pos
+    // 17 and 18 accumulate pending rows; the pos-18 step must prefetch-drain
+    // pos-17's rows because pos 19 is a boundary.
+    for (17..19) |n| {
+        const idv: i32 = @intCast(ids[n]);
+        const ishape = [_]c_int{ 1, 1 };
+        const id_arr = mlx.mlx_array_new_data(&idv, &ishape, 2, .int32);
+        defer _ = mlx.mlx_array_free(id_arr);
+        const lazy_g = try decodeStepLazy(&mdl, allocator, &st, id_arr);
+        defer _ = mlx.mlx_array_free(lazy_g);
+        const logits = try toHostF32(allocator, lazy_g, @intCast(mdl.vocab), s);
+        defer allocator.free(logits);
+        for (logits) |v| try testing.expect(std.math.isFinite(v));
+    }
+    try testing.expect(st.pending.items.len > 0);
+    for (st.pending.items) |p| {
+        if (p.pos != 18) {
+            std.debug.print("prefetch missed: pending row li={d} pos={d} (want only pos 18)\n", .{ p.li, p.pos });
+            try testing.expect(false);
+        }
+    }
+    try drainPending(&mdl, &st);
+    try testing.expectEqual(@as(usize, 0), st.pending.items.len);
+}
+
+test "dsv4: fused sink-softmax kernel matches the composed scale/concat/softmax/slice (GPU)" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const alloc = testing.allocator;
+    const Case = struct { nh: usize, tk: usize };
+    const cases = [_]Case{
+        .{ .nh = 64, .tk = 640 }, // real steady state (window 128 + top-512)
+        .{ .nh = 64, .tk = 128 }, // ratio-128 layer / pure sliding
+        .{ .nh = 4, .tk = 7 }, // mini early-ramp shape
+    };
+    var rng = std.Random.DefaultPrng.init(53);
+    for (cases) |tc| {
+        var m: Dsv4Model = undefined;
+        m.s = s;
+        const hd: usize = 512;
+        const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd))));
+        const sc_h = try alloc.alloc(f32, tc.nh * tc.tk);
+        defer alloc.free(sc_h);
+        for (sc_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 40.0;
+        const sshape = [_]c_int{ @intCast(tc.nh), @intCast(tc.tk) };
+        const scores0 = uploadF32(sc_h, &sshape);
+        defer _ = mlx.mlx_array_free(scores0);
+        const sink_h = try alloc.alloc(f32, tc.nh);
+        defer alloc.free(sink_h);
+        for (sink_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 6.0;
+        const kshape = [_]c_int{ @intCast(tc.nh), 1 };
+        const sink_g = uploadF32(sink_h, &kshape);
+        defer _ = mlx.mlx_array_free(sink_g);
+
+        // composed reference: the attentionDecodeGpu chain verbatim
+        const scale_arr = mlx.mlx_array_new_float(scale);
+        defer _ = mlx.mlx_array_free(scale_arr);
+        const scaled = try gpuOp2(mlx.mlx_multiply, scores0, scale_arr, s);
+        defer _ = mlx.mlx_array_free(scaled);
+        const with_sink = try gpuConcat2(scaled, sink_g, 1, s);
+        defer _ = mlx.mlx_array_free(with_sink);
+        var probs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(probs);
+        try mlx.check(mlx.mlx_softmax_axis(&probs, with_sink, -1, true, s));
+        const want_arr = try gpuSliceCols(probs, tc.nh, 0, tc.tk, s);
+        defer _ = mlx.mlx_array_free(want_arr);
+
+        sinkSoftmaxSetForTest(true);
+        const hits0 = sink_softmax_hits;
+        const got_arr = (try sinkSoftmaxKernel(&m, scores0, sink_g, tc.nh, tc.tk, scale)) orelse {
+            sinkSoftmaxSetForTest(null);
+            std.debug.print("sink-softmax DECLINED nh={d} tk={d}\n", .{ tc.nh, tc.tk });
+            try testing.expect(false);
+            unreachable;
+        };
+        defer _ = mlx.mlx_array_free(got_arr);
+        sinkSoftmaxSetForTest(null);
+        try testing.expect(sink_softmax_hits > hits0);
+
+        const want = try toHostF32(alloc, want_arr, tc.nh * tc.tk, s);
+        defer alloc.free(want);
+        const got = try toHostF32(alloc, got_arr, tc.nh * tc.tk, s);
+        defer alloc.free(got);
+        for (want, got, 0..) |w, g, i| {
+            if (!(@abs(w - g) <= 1e-5)) {
+                std.debug.print("sink-softmax mismatch nh={d} tk={d} i={d}: composed={e} kernel={e}\n", .{ tc.nh, tc.tk, i, w, g });
+                try testing.expect(false);
+            }
+        }
+    }
+}
+
+test "dsv4: comp_in decode requant rides --decode-attn-quant (DSV4_MINI)" {
+    // The compressor-input projection (dense bf16, ~610 MB/token on the real
+    // trunk) gets an int8-g32 side copy served at decode/verify widths when
+    // the user-facing --decode-attn-quant flag is on; big prefill chunks keep
+    // the dense weight (quality anchor). LOSSY by design — this gate pins
+    // engagement + closeness, the real-checkpoint characterization decides
+    // the shipped default.
+    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    if (mlx.noGpuBackend()) return;
+    const path = std.mem.span(path_z);
+    const allocator = testing.allocator;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
+    defer allocator.free(cfg_path);
+    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    file.close(io);
+    defer allocator.free(cfg_json);
+    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
+    defer allocator.free(shard_path);
+    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    defer weights.deinit();
+
+    var rng = std.Random.DefaultPrng.init(61);
+    var ids: [26]u32 = undefined;
+    const vocab_guess: u32 = 64;
+    for (&ids) |*v| v.* = rng.random().uintLessThan(u32, vocab_guess);
+
+    var dense_logits: [9][]f32 = undefined;
+    var n_steps: usize = 0;
+    defer for (dense_logits[0..n_steps]) |l| allocator.free(l);
+
+    defer {
+        transformer.decode_attn_quant_override = null;
+    }
+    for ([_]bool{ false, true }) |quant_arm| {
+        transformer.decode_attn_quant_override = quant_arm;
+        const dw = try loadDsv4Weights(allocator, &cfg, &weights);
+        const s = mlx.gpuStream();
+        defer _ = mlx.mlx_stream_free(s);
+        _ = unsetenv("MLX_SERVE_DSV4_DSPARK");
+        var mdl = try initModel(allocator, &cfg, dw, s);
+        defer mdl.deinit();
+        var st = try initDecodeState(&mdl, allocator);
+        defer deinitDecodeState(&st);
+        {
+            const p = try prefillIntoState(&mdl, allocator, &st, ids[0..17]);
+            allocator.free(p);
+        }
+        const hits0 = comp_in_q_hits;
+        var agree: usize = 0;
+        var step: usize = 0;
+        for (17..ids.len) |n| {
+            const dec = try decodeStep(&mdl, allocator, &st, ids[n]);
+            if (!quant_arm) {
+                dense_logits[step] = dec;
+                n_steps += 1;
+            } else {
+                defer allocator.free(dec);
+                const ref = dense_logits[step];
+                var dot: f64 = 0;
+                var na: f64 = 0;
+                var nb: f64 = 0;
+                var am_a: usize = 0;
+                var am_b: usize = 0;
+                for (ref, dec, 0..) |a2, b2, i| {
+                    try testing.expect(std.math.isFinite(b2));
+                    dot += @as(f64, a2) * b2;
+                    na += @as(f64, a2) * a2;
+                    nb += @as(f64, b2) * b2;
+                    if (a2 > ref[am_a]) am_a = i;
+                    if (b2 > dec[am_b]) am_b = i;
+                }
+                const cos = dot / (@sqrt(na) * @sqrt(nb) + 1e-30);
+                if (am_a == am_b) agree += 1;
+                // int8-g32 on the mini's random weights and tiny groups is
+                // relatively coarser than the real geometry — 0.95 catches
+                // wiring bugs (a wrong operand reads ~0); the real-checkpoint
+                // characterization is the quality gate.
+                if (cos < 0.95) {
+                    std.debug.print("comp_in requant drifted at n={d}: cos={d:.6}\n", .{ n + 1, cos });
+                    try testing.expect(false);
+                }
+            }
+            step += 1;
+        }
+        if (quant_arm) {
+            try testing.expect(comp_in_q_hits > hits0); // ENGAGED under the flag
+            try testing.expect(agree * 10 >= step * 8);
+            std.debug.print("dsv4 comp_in requant: argmax {d}/{d}, engaged\n", .{ agree, step });
+        } else {
+            try testing.expectEqual(hits0, comp_in_q_hits); // dense arm never engages
         }
     }
 }

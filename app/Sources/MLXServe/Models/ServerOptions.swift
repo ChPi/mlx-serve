@@ -107,14 +107,17 @@ struct ServerOptions: Codable, Equatable {
     /// depth live from the measured acceptance rate). A fixed value is a
     /// benchmarking lever; emitted only when non-zero.
     var mtpDepth: Int = 0
-    /// Decode attention requant: the server serves decode steps from INT8
-    /// group-32 side copies of DENSE (bf16/f16) attention projection weights —
-    /// ~23% faster decode on models that ship dense attention (Laguna; most
-    /// quantized checkpoints are unaffected). Lossy by design (a real
-    /// requantization, decode/verify only; prefill keeps the dense weights).
-    /// Default ON, mirroring transformer.zig DECODE_ATTN_QUANT_DEFAULT —
-    /// `toCLIArgs` emits `--no-decode-attn-quant` ONLY when turned off.
-    var decodeAttnQuant: Bool = true
+    /// Decode attention requant, TRI-STATE: nil = the server's own default
+    /// (laguna-class dense attention requants ON, DeepSeek-V4's comp_in
+    /// requant stays dense — its characterization found answer movement, so
+    /// the server gates it on the EXPLICIT flag form), true = emit
+    /// `--decode-attn-quant` (opts dsv4 in, +7-8% decode there), false =
+    /// emit `--no-decode-attn-quant` (bit-exact dense everywhere). A plain
+    /// Bool cannot tell "not decided" from "switched on" (the drafterOptOut
+    /// class), and legacy blobs stored the old always-written Bool — the
+    /// decode migration below treats a stored TRUE as undecided, never as an
+    /// explicit opt-in.
+    var decodeAttnQuantChoice: Bool? = nil
     /// `--mtp`. A MoE checkpoint that ships an MTP head keeps it OFF for every
     /// request that omits `enable_mtp` (the server's `defaultEnableMtp`: the
     /// verify forward pays the expert-routing penalty, the same caution the
@@ -586,9 +589,12 @@ struct ServerOptions: Codable, Equatable {
         if enableDSpark {
             args += ["--dspark"]
         }
-        // Decode attention requant: server default is ON, so only OFF emits.
-        if !decodeAttnQuant {
-            args += ["--no-decode-attn-quant"]
+        // Decode attention requant: tri-state — undecided emits NOTHING (the
+        // server default keeps laguna on and dsv4's comp_in dense); an
+        // explicit choice emits its flag, and the positive form is what opts
+        // dsv4's characterization-gated comp_in requant in.
+        if let choice = decodeAttnQuantChoice {
+            args += [choice ? "--decode-attn-quant" : "--no-decode-attn-quant"]
         }
         // Performance: only emit non-default flags so the CLI tail stays
         // readable in log lines and `ps`. Server defaults are 1 / off / 2GB.
@@ -708,6 +714,14 @@ extension ServerOptions {
     /// extension so the memberwise / no-arg initializers stay synthesized.
     /// `encode(to:)` and `CodingKeys` remain compiler-synthesized, so round-trip
     /// + Equatable are unchanged (see `testRoundTripCodable`).
+    /// The retired always-written Bool `decodeAttnQuant` — read-only, for the
+    /// tri-state migration above (it cannot live in the synthesized
+    /// CodingKeys: a case with no matching property breaks synthesized
+    /// encode).
+    private enum LegacyDecodeAttnQuantKey: String, CodingKey {
+        case decodeAttnQuant
+    }
+
     init(from decoder: Decoder) throws {
         self.init()   // every property seeded with its default
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -733,7 +747,20 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanDiscoverEnabled) { lanDiscoverEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lanName) { lanName = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuant) { decodeAttnQuant = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuantChoice) {
+            decodeAttnQuantChoice = v
+        } else {
+            // Legacy blobs always carried `decodeAttnQuant` (the old Bool was
+            // written by synthesized encode for every user who saved settings
+            // once), so a stored TRUE is indistinguishable from "never
+            // touched" and stays nil — it must not become an explicit opt-in
+            // to dsv4's lossy comp_in requant. FALSE was a real choice.
+            if try decoder.container(keyedBy: LegacyDecodeAttnQuantKey.self)
+                .decodeIfPresent(Bool.self, forKey: .decodeAttnQuant) == false
+            {
+                decodeAttnQuantChoice = false
+            }
+        }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
@@ -940,7 +967,7 @@ extension ServerOptions {
             needsRestart: true),
         "decodeAttnQuant": .init(
             title: "Fast decode for bf16-attention models (recommended)",
-            explainer: "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding.",
+            explainer: "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Flipping this ON (rather than leaving it untouched) also enables DeepSeek-V4's compressor-input requant — ~7% faster decode there, with rare wording-level artifacts. Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding.",
             needsRestart: true),
         "kvQuant": .init(
             title: "KV cache quantization",

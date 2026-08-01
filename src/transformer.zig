@@ -14083,7 +14083,20 @@ var decode_attn_quant_cached: ?bool = null;
 /// `ServerOptions` default.
 pub const DECODE_ATTN_QUANT_DEFAULT = true;
 
-fn decodeAttnQuantEnabled() bool {
+/// Whether the user EXPLICITLY asked for --decode-attn-quant (CLI flag, app
+/// toggle, or env "1") as opposed to riding the silent default. Archs whose
+/// characterization showed ANSWER MOVEMENT under the requant gate on this
+/// form (dsv4 comp_in: one duplicated paragraph on 1/7 greedy prompts,
+/// 2026-08-01); laguna's clean characterization keeps the plain default.
+pub fn decodeAttnQuantExplicit() bool {
+    if (decode_attn_quant_override) |v| return v; // test seam counts as explicit
+    if (std.c.getenv("MLX_SERVE_DECODE_ATTN_QUANT")) |raw| {
+        return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    }
+    return decode_attn_quant_flag orelse false;
+}
+
+pub fn decodeAttnQuantEnabled() bool {
     if (decode_attn_quant_override) |v| return v;
     if (decode_attn_quant_cached) |v| return v;
     const enabled = blk: {
@@ -16791,6 +16804,22 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
     var ids32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids32);
     try mlx.check(mlx.mlx_astype(&ids32, token_ids, .int32, self.s));
+    // Lazy pipelined decode: the sampled token id and the returned logits
+    // both stay GPU arrays, so generate.zig's pipelined next() overlaps the
+    // next build with GPU execution (the sync path below force-evals the id
+    // and host-copies the logits — a full pipeline drain per token).
+    if (ctx.cache.step != 0 and n == 1 and mdl.dec_state != null and
+        dsv4_mod.lazyDecodeReady(mdl, &mdl.dec_state.?))
+    {
+        const lazy = try dsv4_mod.decodeStepLazy(mdl, self.allocator, &mdl.dec_state.?, ids32);
+        defer _ = mlx.mlx_array_free(lazy);
+        ctx.cache.step += 1;
+        const shape3 = [_]c_int{ 1, 1, @intCast(mlx.mlx_array_size(lazy)) };
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_reshape(&out, lazy, &shape3, 3, self.s));
+        return out;
+    }
     try mlx.check(mlx.mlx_array_eval(ids32));
     const data = mlx.mlx_array_data_int32(ids32) orelse return error.NoData;
     var logits_host: []f32 = undefined;
