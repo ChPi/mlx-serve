@@ -47,6 +47,13 @@ pub const ModelConfig = struct {
     vocab_size: u32 = 262208,
     hidden_size: u32 = 3840,
     intermediate_size: u32 = 15360,
+    /// Whether `intermediate_size` came from the JSON or is the struct default
+    /// above. MoE checkpoints routinely omit the key (DSV4 ships none at all),
+    /// and a consumer that cannot tell the two apart bills the 15360 default as
+    /// though the model declared it — 3.96 GB of phantom MLP transient in the
+    /// prefill guard. Only readers that need the DISTINCTION should look here;
+    /// everyone else keeps using `intermediate_size` and its fallback value.
+    intermediate_size_declared: bool = false,
     num_hidden_layers: u32 = 48,
     num_attention_heads: u32 = 16,
     num_key_value_heads: u32 = 8,
@@ -360,6 +367,37 @@ pub const ModelConfig = struct {
     time_step_max: f32 = std.math.inf(f32),
     mamba_chunk_size: u32 = 256,
     mamba_mlp_act: HiddenAct = .relu_sq, // Nemotron-H MLP uses ReLU^2
+
+    /// How many keys ONE query actually reads during prefill at this prompt
+    /// length. `seq` (dense causal) unless the architecture BOUNDS its
+    /// attention — the prefill admission guard's score term multiplies by this,
+    /// and billing a dense key axis for a sparse arch is a spurious 400.
+    ///
+    /// deepseek_v4 reads a raw sliding window plus at most ONE compressed arm
+    /// per layer (`deepseek_v4.zig`: `tk = wk + n_sel`, `wk = @min(m.window,
+    /// seq_total)`), so the widest layer is what the guard must bill:
+    ///   - `compress_ratios[i] == 0` → window only
+    ///   - `== 4` → top-`index_topk` of the `seq/4` compressed slots (the
+    ///     literal 4 mirrors the engine's own `if (ratio == 4)` branch)
+    ///   - otherwise → ALL `seq/ratio` slots, visibility-masked
+    /// plus one sink column. The all-visible arm is seq-scaled, so it overtakes
+    /// the top-k arm at long context and the bound must track it rather than
+    /// freezing at `index_topk`. A checkpoint declaring no ratios stays dense —
+    /// an arch we cannot bound must never be billed as though we had.
+    pub fn prefillAttnKeys(self: *const ModelConfig, seq: u64) u64 {
+        if (!std.mem.eql(u8, self.model_type, "deepseek_v4")) return seq;
+        const n = @min(self.dsv4_n_compress_ratios, self.dsv4_compress_ratios.len);
+        if (n == 0) return seq;
+        const window: u64 = @min(@as(u64, self.sliding_window), seq);
+        var widest: u64 = 0;
+        for (self.dsv4_compress_ratios[0..n]) |r| {
+            if (r == 0) continue;
+            const slots: u64 = seq / r;
+            const cols: u64 = if (r == 4) @min(@as(u64, self.dsv4_index_topk), slots) else slots;
+            widest = @max(widest, cols);
+        }
+        return @min(seq, window + widest + 1);
+    }
 
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
@@ -778,7 +816,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     // Parse common fields
     if (cfg_obj.get("vocab_size")) |v| config.vocab_size = @intCast(v.integer);
     if (cfg_obj.get("hidden_size")) |v| config.hidden_size = @intCast(v.integer);
-    if (cfg_obj.get("intermediate_size")) |v| config.intermediate_size = @intCast(v.integer);
+    if (cfg_obj.get("intermediate_size")) |v| {
+        config.intermediate_size = @intCast(v.integer);
+        config.intermediate_size_declared = true;
+    }
     if (cfg_obj.get("num_hidden_layers")) |v| config.num_hidden_layers = @intCast(v.integer);
     if (cfg_obj.get("num_attention_heads")) |v| config.num_attention_heads = @intCast(v.integer);
     if (cfg_obj.get("num_key_value_heads")) |v| config.num_key_value_heads = @intCast(v.integer);
@@ -1431,7 +1472,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // by the generic block above) and the dense bottom-layer width
         // `dense_intermediate_size` — opposite of our field meanings. Swap.
         config.moe_intermediate_size = config.intermediate_size;
-        if (cfg_obj.get("dense_intermediate_size")) |v| { if (v == .integer) config.intermediate_size = @intCast(v.integer); }
+        if (cfg_obj.get("dense_intermediate_size")) |v| {
+            if (v == .integer) {
+                config.intermediate_size = @intCast(v.integer);
+                config.intermediate_size_declared = true;
+            }
+        }
         if (cfg_obj.get("dense_mlp_idx")) |v| { if (v == .integer) config.first_k_dense_replace = @intCast(v.integer); }
         if (cfg_obj.get("n_routed_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
         if (cfg_obj.get("n_shared_experts")) |v| { if (v == .integer) config.inkling_n_shared_experts = @intCast(v.integer); }
@@ -2934,6 +2980,46 @@ test "ModelConfig parses deepseek_v4 (DeepSeek-V4-Flash-0731 mirror)" {
     const eos = config.eosTokenSlice();
     try testing.expectEqual(@as(usize, 1), eos.len);
     try testing.expectEqual(@as(u32, 1), eos[0]);
+}
+
+test "prefillAttnKeys: dense archs bill the whole prompt, deepseek_v4 bills its sparse bound" {
+    // The admission guard's score term asks ONE question: how many keys does a
+    // single query actually read during prefill? Dense causal attention reads
+    // the whole prompt; DSV4 reads a 128-wide raw window plus ONE compressed
+    // arm, and that difference is the whole 10.3 GB spurious-400 (2026-07-31).
+    var dense = ModelConfig{};
+    dense.model_type = "qwen3_5";
+    try testing.expectEqual(@as(u64, 100_000), dense.prefillAttnKeys(100_000));
+
+    var cfg = ModelConfig{};
+    cfg.model_type = "deepseek_v4";
+    cfg.sliding_window = 128;
+    cfg.dsv4_index_topk = 512;
+    cfg.dsv4_n_compress_ratios = 4;
+    cfg.dsv4_compress_ratios[0] = 0; // window only
+    cfg.dsv4_compress_ratios[1] = 4; // top-k indexer arm
+    cfg.dsv4_compress_ratios[2] = 128; // all-visible arm, seq/128 slots
+    cfg.dsv4_compress_ratios[3] = 0;
+
+    // 5806 tokens: ratio-4 layers select top-512 of 1451 slots; ratio-128
+    // layers see 45. Widest layer = 128 + 512 + 1 sink.
+    try testing.expectEqual(@as(u64, 641), cfg.prefillAttnKeys(5806));
+
+    // At 1M the ALL-VISIBLE arm overtakes the top-k one (1M/128 = 8192 slots),
+    // so the bound must track it rather than freezing at index_topk — this is
+    // the term that keeps the guard honest at long context.
+    try testing.expectEqual(@as(u64, 128 + 8192 + 1), cfg.prefillAttnKeys(1_048_576));
+
+    // Never wider than the prompt: a 32-token prompt has 32 keys, not 641.
+    try testing.expectEqual(@as(u64, 32), cfg.prefillAttnKeys(32));
+
+    // A config that declares no ratios at all falls back to dense — an arch we
+    // cannot bound must never be billed as if we had bounded it.
+    var bare = ModelConfig{};
+    bare.model_type = "deepseek_v4";
+    bare.sliding_window = 128;
+    bare.dsv4_n_compress_ratios = 0;
+    try testing.expectEqual(@as(u64, 100_000), bare.prefillAttnKeys(100_000));
 }
 
 test "ModelConfig deepseek_v4: the superseded PREVIEW checkpoint is rejected" {

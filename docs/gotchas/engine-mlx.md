@@ -1625,3 +1625,32 @@ on the code task BOTH our arms answer `sum(range(1, 11))**2` (wrong — square o
 where the ds4 GGUF answers `sum(i*i for i in range(1, 11))`. That is identical in serial, so
 it is our quant mix (2-bit gate/up, 3-bit down, no imatrix) against antirez's imatrix-
 calibrated IQ2XXS/Q2_K, not the engine and not DSpark.
+
+## The prefill admission guard billed a dense attention shape for a sparse arch (dsv4, 2026-07-31)
+
+A 5806-token prompt to DeepSeek-V4-Flash — a 1M-context model — came back:
+
+```
+400: Prompt (5806 tokens) requires ~10277MB GPU memory but only ~8629MB available.
+```
+
+10 GB of working set for 5.8K tokens is absurd on its face, and the number reproduces exactly from `server.prefillMemoryNeeded` at that checkpoint's config. Two independent terms were wrong, and they happened to be the two biggest:
+
+| term | billed | truth |
+|---|---|---|
+| scores | 3992 MB | ~440 MB |
+| 3×mlp | 3960 MB | ~1050 MB |
+| kv | 259 MB | fine |
+| dequant | 11 MB | fine |
+
+**1. The score term assumed dense causal attention.** `head_dim: 512` is outside every fused kernel (`prefillHeadDimFused` covers ≤128 and 256), so the composed-SDPA score scratch is billed — as `heads × chunk × seq`. But DSV4 is sparse: `deepseek_v4.zig` builds `tk = wk + n_sel` with `wk = @min(m.window, seq_total)`, i.e. a 128-wide raw sliding window plus ONE compressed arm — top-`index_topk` (512) of the `seq/4` slots on ratio-4 layers, or all `seq/ratio` slots visibility-masked otherwise. So a query reads **at most 641 keys at this length, not 5806**, and the over-bill grows linearly with the prompt while the truth stays nearly flat. Note the all-visible arm IS seq-scaled (`seq/128`), so it overtakes the top-k arm at long context — the bound tracks the widest layer rather than freezing at `index_topk`.
+
+**2. The FFN width was a struct default the checkpoint never stated.** DSV4's config ships no `intermediate_size` at all, so `ModelConfig`'s 15360 — a Gemma shape — leaked into `@max(intermediate_size, moe + shared)`. The code even carried a comment acknowledging this ("a fat ffn costs MBs of estimate, not GBs"), which holds only for small chunks; at a 5632-wide forward it cost 3.96 GB. `intermediate_size_declared` now distinguishes "the JSON said 15360" from "nobody said anything".
+
+The first draft of that fix billed the bare `moe_intermediate_size` (2048) and was **wrong in the dangerous direction**: a MoE chunk gathers `num_experts_per_tok` expert rows per token, so the transient scales with `top_k × moe_intermediate + shared` — 12288 here, not 2048. Under-billing this guard does not produce a 400, it produces an uncatchable Metal OOM that kills the process, so the asymmetry decides every judgement call in it.
+
+Corrected: **4848 MB**, admitted with room. A sweep over every checkpoint on disk moved exactly two bills and left the rest byte-identical: DSV4 (10277 → 4848 at 5.8K, 9385 → 4225 at 64K) and Qwen3.6-35B-A3B (3915 → 1395 at 5.8K), the latter purely from the width fix — its real per-token MLP is 8 experts × 512 + 512 shared = 4608, against the 15360 it was being charged.
+
+One honest caveat: the corrected number is not the true peak either. DSV4's indexer builds a `[chunk, heads, S]` similarity over compressed slots (`S ≈ seq/ratio`) that the estimator does not model at all. The formula was simultaneously over-billing two terms and missing a third; it just happened to land net-conservative.
+
+Guards: `prefillAttnKeys` (model.zig — dense archs, the ratio-4/all-visible crossover at 1M, short-prompt clamp, and the no-ratios dense fallback), `prefillFfnWidth` (declared-beats-default, shared adds, dense unaffected), the end-to-end KEY BOUND estimate pinning both the 10277 MB failure and the 4848 MB fix, and a source scan asserting `checkAttentionMemory` passes `config.prefillAttnKeys(seq)` rather than `seq` — the engagement class, since handing the new parameter `seq` reproduces the old bill exactly while every direct unit test still passes.
