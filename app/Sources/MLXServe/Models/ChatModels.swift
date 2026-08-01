@@ -29,6 +29,19 @@ struct ChatSession: Identifiable, Codable {
     /// Agent toggle. See PerSessionUIStateTests.
     var enableThinking: Bool
     var useMCP: Bool
+    /// The agent (persona) this tab is talking to; nil = none, i.e. the app's own
+    /// defaults and today's behavior. Per-session like the toggles above — the
+    /// detail view is REUSED across tabs, so an app-wide "active agent" would
+    /// leak between conversations. Switching applies to subsequent turns only.
+    var agentId: UUID?
+    /// Tools this chat has switched OFF in the Tools menu, by wire name.
+    ///
+    /// Stored as raw strings rather than `AgentToolKind` so a tool retired in a
+    /// later build leaves an unrecognized name on disk instead of failing the
+    /// whole session's decode — `disabledToolKinds` drops what it can't resolve.
+    /// Subtractive only: it can take away what the agent already allowed, never
+    /// grant what it forbids (see `AgentResolution.resolve`).
+    var disabledTools: [String]
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -43,10 +56,19 @@ struct ChatSession: Identifiable, Codable {
         self.isExternalBridge = false
         self.enableThinking = false
         self.useMCP = false
+        self.agentId = nil
+        self.disabledTools = []
+    }
+
+    /// Resolve stored names to tools, silently dropping any this build no longer
+    /// has. An unknown name must never be allowed to match something else.
+    static func disabledToolKinds(_ names: [String]) -> Set<AgentToolKind> {
+        Set(names.compactMap(AgentToolKind.init(rawValue:)))
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP
+        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
+        case disabledTools
     }
 
     init(from decoder: Decoder) throws {
@@ -63,12 +85,18 @@ struct ChatSession: Identifiable, Codable {
         // existed come back with the keys absent → default both off.
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? false
         useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
+        // Absent (every session saved before agents existed) → no agent → the
+        // app defaults, unchanged on upgrade.
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
         // Backfill: sessions saved before workingDirectory had a default come back as nil. Anchor them
         // at ~/.mlx-serve/workspace so the agent's tools and MCP servers both have a sane default.
         let decoded = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
         workingDirectory = decoded ?? ChatSession.defaultWorkingDirectory
         // Sessions saved before attach-a-folder persisted simply have none.
         attachedFolderPath = try c.decodeIfPresent(String.self, forKey: .attachedFolderPath)
+        // Absent (every session saved before the Tools menu) → nothing disabled,
+        // i.e. exactly the behaviour that build had.
+        disabledTools = try c.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
     }
 
     /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20
@@ -137,6 +165,30 @@ struct ChatImage: Identifiable, Codable, Equatable {
     }
 }
 
+/// A generated media file attached to a message BY REFERENCE.
+///
+/// Images ride `ChatMessage.images` as JPEG bytes, which is fine for a picture
+/// but not for the rest: a 30 s track is tens of MB and a 4 s clip more, and
+/// `chat-history.json` would carry every one of them forever. So audio and video
+/// are a path into the same `~/.mlx-serve/generations` tree the tray windows
+/// write to — the file the service already produced, not a second copy.
+///
+/// The file can go away (the user empties that folder), so every renderer treats
+/// a missing path as a normal state rather than assuming it resolves.
+struct ChatMediaRef: Codable, Equatable, Identifiable {
+    enum Kind: String, Codable { case image, audio, video }
+
+    var kind: Kind
+    var path: String
+    /// What was asked for — the caption under the player, and what makes a bare
+    /// filename in a months-old transcript mean something.
+    var prompt: String
+
+    var id: String { path }
+    var filename: String { (path as NSString).lastPathComponent }
+    var exists: Bool { FileManager.default.fileExists(atPath: path) }
+}
+
 /// An audio clip attached to a message. `pcm` holds raw little-endian float32
 /// mono samples at 16 kHz — the format the Gemma 4 12B unified audio embedder
 /// frames into 640-sample tokens. Decoded client-side by `AudioPreprocessor`.
@@ -174,6 +226,10 @@ struct ChatMessage: Identifiable, Codable {
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
     var images: [ChatImage]?  // Images attached to this message
     var audio: [ChatAudio]?   // Audio clips attached to this message
+    // Generated media attached BY PATH (see ChatMediaRef) — the tracks and clips
+    // the in-chat media tools produce. Absent on every message saved before they
+    // existed, and tolerated as absent forever.
+    var media: [ChatMediaRef]? = nil
     // When true, the message is kept visible in the UI (e.g. preserved reasoning
     // from a cut-off or pad-only retry) but excluded from API history so it
     // can't confuse subsequent iterations of the agent loop.
@@ -182,6 +238,11 @@ struct ChatMessage: Identifiable, Codable {
     // Drives the inline kill X on the tool-call card. Persisted, but resolves to
     // no live process after a restart (the registry isn't persisted).
     var processHandles: [String]? = nil
+    // Set when this message is a FAILURE notice rather than model output — the
+    // transcript renders it as a card (with "Increase Context Size" when the
+    // prompt overflowed) instead of the old `[Error: …]` text, which read as
+    // something the model itself had said.
+    var errorNotice: ChatErrorNotice? = nil
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -204,6 +265,7 @@ struct ChatMessage: Identifiable, Codable {
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
         case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
+        case errorNotice, media
     }
 
     init(from decoder: Decoder) throws {
@@ -225,8 +287,10 @@ struct ChatMessage: Identifiable, Codable {
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
         audio = try c.decodeIfPresent([ChatAudio].self, forKey: .audio)
+        media = try c.decodeIfPresent([ChatMediaRef].self, forKey: .media)
         failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
         processHandles = try c.decodeIfPresent([String].self, forKey: .processHandles)
+        errorNotice = try c.decodeIfPresent(ChatErrorNotice.self, forKey: .errorNotice)
     }
 }
 
@@ -247,6 +311,12 @@ struct ModelInfo {
     /// `model_type` from config.json — "gemma4", "qwen3_5_moe", "llama", etc.
     /// Empty string when talking to a pre-drafter-UX server build.
     var architecture: String = ""
+    /// Which backend serves this entry, as the server reports it
+    /// (`meta.engine`: "mlx" | "llama" | "ds4" | "gguf" — "gguf" is an
+    /// unloaded GGUF stub whose engine is only decided at load). Empty on
+    /// servers that pre-date the field → `engine` falls back to inferring
+    /// from `architecture`.
+    var engineName: String = ""
     /// True when the model has any MoE (sparse expert) layers. Drives the
     /// soft-warning pill in Settings → Drafter, since drafter regresses on
     /// MoE targets at single-stream batch=1.
@@ -328,11 +398,21 @@ struct ModelInfo {
         return "\(name[name.startIndex..<at]) · \(name[name.index(after: at)...])"
     }
 
-    /// Which backend serves this model — derived from `architecture`
-    /// (`model_type` in config.json / the GGUF stub). Drives the engine-
-    /// aware Settings UI so toggles that don't apply (e.g. MLX `--kv-quant`
-    /// on a GGUF target) are hidden instead of silently no-op'ing.
+    /// Which backend serves this model — drives the engine-aware Settings UI
+    /// so toggles that don't apply (e.g. MLX `--kv-quant` on a GGUF target)
+    /// are hidden instead of silently no-op'ing. The server's own
+    /// `meta.engine` report wins; the `architecture` inference is the legacy
+    /// fallback for servers that pre-date the field, where it stays correct
+    /// (those builds serve deepseek_v4 ONLY via the embedded ds4 engine —
+    /// the NATIVE deepseek_v4 arch ships with the same release that added
+    /// `meta.engine`, and the two report the SAME architecture string).
     var engine: ServerEngine {
+        switch engineName {
+        case "mlx": return .mlx
+        case "ds4": return .dsv4
+        case "llama", "gguf": return .llama
+        default: break // pre-field server or unknown future value → infer
+        }
         switch architecture {
         case "gguf": return .llama
         case "deepseek_v4": return .dsv4
@@ -428,10 +508,26 @@ struct MemoryInfo {
     /// axis from `activeBytes` (the MLX GPU-allocator footprint).
     var availableBytes: Int64
     var maxSafeContext: Int
+    /// MLX's reclaimable buffer pool — memory the server process HOLDS but is
+    /// not using. A third axis again from `activeBytes` (in use) and
+    /// `availableBytes` (free system RAM). Issue #110 was invisible precisely
+    /// because the panel showed `activeBytes` alone: 19.6 GB on screen against
+    /// 81.4 GB in Activity Monitor, with the other 61 GB parked here. 0 when the
+    /// server build predates the field — the suffix is hidden then.
+    var cacheBytes: Int64 = 0
 
     var activeFormatted: String { Self.format(activeBytes) }
     var peakFormatted: String { Self.format(peakBytes) }
     var availableFormatted: String { Self.format(availableBytes) }
+    var cacheFormatted: String { Self.format(cacheBytes) }
+
+    /// What the tray's "GPU Memory" row reads. The cache term only appears once
+    /// it is big enough to explain a footprint the user would notice — a pool
+    /// doing its job (a few hundred MB of buffer reuse) is not news.
+    var gpuMemoryLabel: String {
+        guard cacheBytes >= 1 << 30 else { return activeFormatted }
+        return "\(activeFormatted) (+\(cacheFormatted) cache)"
+    }
 
     /// Fraction (0...1) of `totalBytes` physical RAM occupied by the model's GPU
     /// (MLX) footprint. The bar's denominator is total RAM — NOT `peak×2`, which
@@ -460,7 +556,8 @@ struct MemoryInfo {
             activeBytes: mem["active_bytes"] as? Int64 ?? 0,
             peakBytes: mem["peak_bytes"] as? Int64 ?? 0,
             availableBytes: mem["available_bytes"] as? Int64 ?? 0,
-            maxSafeContext: mem["max_safe_context"] as? Int ?? 0
+            maxSafeContext: mem["max_safe_context"] as? Int ?? 0,
+            cacheBytes: mem["cache_bytes"] as? Int64 ?? 0
         )
     }
 
@@ -515,7 +612,7 @@ enum ServerStatus: Equatable {
     }
 }
 
-enum LocalModelSource: String, Codable, Hashable {
+enum LocalModelSource: String, Codable, Hashable, CaseIterable {
     case mlxServe
     case lmStudio
     /// Discovered in the Hugging Face hub cache (`~/.cache/huggingface/hub`,
@@ -523,6 +620,17 @@ enum LocalModelSource: String, Codable, Hashable {
     /// cache's blob/ref/symlink structure is managed by `huggingface-cli`.
     case huggingFace
     case custom
+
+    /// Heading for this source's group in a model picker. `allCases` order is
+    /// the order pickers render, so it also decides which group comes first.
+    var sectionTitle: String {
+        switch self {
+        case .mlxServe: "MLX-Serve Models"
+        case .lmStudio: "Other Discovered Models"
+        case .huggingFace: "Hugging Face Cache"
+        case .custom: "Custom Folder"
+        }
+    }
 }
 
 /// Distinguishes a base model from a paired drafter checkpoint. Drafters are
@@ -811,17 +919,19 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // an mtp/weights.safetensors sidecar; the server auto-loads it for multi-token
     // speculative decode (~1.1–1.4× decode on agent/code workloads).
     GemmaModelOption(id: "qwen36-27b-4bit-mtp", displayName: "Qwen 3.6 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", sizeEstimate: "~16.6 GB, needs 24 GB+ RAM"),
-    // DeepSeek-V4-Flash via ds4 GGUF — 96 GB+ Macs only. Served by the embedded
-    // ds4 engine (antirez/ds4) rather than the MLX/safetensors path.
+    // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
+    // Our own mixed 2/3/8-bit safetensors mirror, so it takes the plain repo
+    // download path; it replaced the `antirez/deepseek-v4-gguf` IQ2XXS entry
+    // that the embedded ds4 engine served (same model, one engine fewer in the
+    // way, but 118 GB instead of 87 — the 96 GB tier no longer has a DeepSeek
+    // entry here). The id keeps its "dsv4" token: that is what the tray filter
+    // reads.
     GemmaModelOption(
-        id: "dsv4-flash-gguf",
-        displayName: "DeepSeek-V4-Flash (ds4)",
-        repoId: "antirez/deepseek-v4-gguf",
-        sizeEstimate: "~87 GB, needs 96 GB+ RAM",
-        // imatrix-calibrated IQ2XXS — better quality at the same size; the
-        // download path also auto-pulls the MTP draft head for ds4 spec-decode.
-        ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
-        minHostRamBytes: 96 * (UInt64(1) << 30)
+        id: "dsv4-flash-mlx",
+        displayName: "DeepSeek-V4-Flash (MLX native)",
+        repoId: "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit",
+        sizeEstimate: "~118 GB, needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
     // The imatrix-calibrated 2-bit build (mlx-community oQ2e): the FULL

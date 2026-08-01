@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// Shared layout constants for the chat column — ONE source of truth for the
 /// numbers that must agree across independent views. The transcript, context
@@ -31,16 +32,33 @@ enum ChatMetrics {
     /// `composerControlSize` frames (send symbol point size == attach circle).
     static let composerIconSize: CGFloat = 30
 
-    /// Toolbar mode pills (Think / Agent / MCP) — one geometry so the three
-    /// capsules render identically. Height and icon slot are EXPLICIT because
-    /// SF symbols at the same point size have different intrinsic sizes
-    /// (brain vs wrench vs puzzle); padding-derived heights made the pills
-    /// subtly unequal. The pills ride ONE ToolbarItem with
-    /// `togglePillSpacing` between them, so in-cluster gaps are ours and
-    /// uniform — no item ever adds outer padding of its own (a stray
-    /// leading/trailing pad on one item is what made the gaps uneven before).
-    static let togglePillPaddingH: CGFloat = 8
-    static let togglePillHeight: CGFloat = 24
-    static let togglePillIconSize: CGFloat = 15
-    static let togglePillSpacing: CGFloat = 8
+    /// Exact height of BOTH controls in the sidebar's bottom row (New Chat +
+    /// the agent menu).
+    ///
+    /// They are `.plain` buttons drawing their own background — the same shape
+    /// as the composer's discs — precisely so this number is the height. Don't
+    /// put them back on `.buttonStyle(.bordered)`: a bordered control keeps its
+    /// INTRINSIC size and merely centers inside whatever frame it's given, so
+    /// its height can only be steered indirectly through the label, and a text
+    /// label and a bare glyph never land on the same number. Measured through
+    /// the accessibility API while both sat inside 28pt frames: New Chat 24pt,
+    /// the menu 17pt.
+    static let sidebarButtonHeight: CGFloat = 28
+    static let sidebarButtonCornerRadius: CGFloat = 6
+
+    // The Think / Agent / MCP capsules that used to live in the window toolbar
+    // had their own `togglePill*` geometry here. They are icon-only composer
+    // controls now and draw from `composerIconSize` / `composerControlSize` like
+    // every other control in that row, so the separate metrics are gone rather
+    // than left behind as a second, unused way to size a control.
+}
+
+extension View {
+    /// The sidebar's bottom-row button chrome: one exact height, one fill, one
+    /// radius — applied to both controls so neither can drift from the other.
+    func sidebarActionButton() -> some View {
+        frame(height: ChatMetrics.sidebarButtonHeight)
+            .background(Color.secondary.opacity(0.15),
+                        in: RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius))
+    }
 }

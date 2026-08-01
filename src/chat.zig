@@ -52,6 +52,12 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     images: ?[]const ImageData = null, // Preprocessed image data for vision
     audio: ?[]const AudioData = null, // Raw PCM for the unified audio embedder
+    /// Reasoning the client round-trips on assistant HISTORY messages
+    /// (`reasoning_content`/`reasoning` on chat completions, `thinking`
+    /// blocks on /v1/messages). Templates that persist reasoning across
+    /// turns (laguna) read it; templates that strip history reasoning
+    /// (Qwen, Gemma) never reference the field and render unchanged.
+    reasoning_content: ?[]const u8 = null,
 };
 
 /// Chat template configuration loaded from tokenizer_config.json.
@@ -128,6 +134,8 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 }
 
 /// Format chat messages into token IDs using the model's Jinja chat template.
+/// `effort` is the client's raw `reasoning_effort` string (see
+/// `serializeExtraContext`) — null when the request didn't send one.
 pub fn formatChat(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
@@ -136,8 +144,9 @@ pub fn formatChat(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    effort: ?[]const u8,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort);
     defer allocator.free(rendered);
 
 
@@ -297,8 +306,9 @@ pub fn encodeChatViaLlama(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    effort: ?[]const u8,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort);
     defer allocator.free(rendered);
 
     const i32_ids = try engine.tokenizeText(allocator, rendered, false);
@@ -339,6 +349,7 @@ fn renderChatTemplate(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    effort: ?[]const u8,
 ) ![]const u8 {
     if (chat_config.chat_template.len == 0) {
         return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
@@ -380,8 +391,8 @@ fn renderChatTemplate(
     const messages_json = try serializeMessagesJson(allocator, effective_messages);
     defer allocator.free(messages_json);
 
-    // Build extra context (bos_token, eos_token, enable_thinking)
-    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking);
+    // Build extra context (bos_token, eos_token, enable_thinking, effort)
+    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
     defer allocator.free(extra_json);
 
     // Null-terminate strings for C
@@ -587,7 +598,18 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
             try buf.appendSlice(allocator, ",\"tool_calls\":[");
             for (tcs, 0..) |tc, ti| {
                 if (ti > 0) try buf.append(allocator, ',');
-                try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
+                try buf.appendSlice(allocator, "{\"type\":\"function\",");
+                if (tc.id.len > 0) {
+                    // Inkling's template names a tool RESULT by matching
+                    // `message.tool_call_id` against the history call's `id`
+                    // (`tc.id is defined and tc.id == message.tool_call_id`) —
+                    // without the id the result renders nameless. Inert for
+                    // templates that never read it.
+                    try buf.appendSlice(allocator, "\"id\":");
+                    try appendJsonString(allocator, &buf, tc.id);
+                    try buf.append(allocator, ',');
+                }
+                try buf.appendSlice(allocator, "\"function\":{\"name\":");
                 try appendJsonString(allocator, &buf, tc.name);
                 try buf.appendSlice(allocator, ",\"arguments\":");
                 // Embed arguments as a JSON OBJECT when it parses cleanly — Qwen
@@ -618,6 +640,14 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
             // to render duplicate content, wasting tokens.
         }
 
+        if (msg.reasoning_content) |rc| {
+            // Key omitted entirely when absent: templates gate on
+            // `message.reasoning_content is string`, and an explicit null
+            // would still pass `is defined`-style checks.
+            try buf.appendSlice(allocator, ",\"reasoning_content\":");
+            try appendJsonString(allocator, &buf, rc);
+        }
+
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
@@ -625,7 +655,22 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
     return buf.toOwnedSlice(allocator);
 }
 
-fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool) ![]const u8 {
+/// OpenAI's effort vocabulary → DeepSeek's low|high|max. `medium` maps to
+/// low deliberately: DeepSeek's `high` text is "Absolute maximum with no
+/// shortcuts permitted" and its own default is low, so nothing verbose is
+/// injected unless the client explicitly asked for it. Unknown strings also
+/// fall back to low for the same reason.
+pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "low";
+    if (std.mem.eql(u8, e, "high")) return "high";
+    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max")) return "max";
+    return "low";
+}
+
+/// `effort` is the client's raw `reasoning_effort` string (null when the
+/// request didn't send one) — today only the dsv4 family maps it into the
+/// template; other families keep their fixed vocabulary.
+fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -653,10 +698,41 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // no_think), not enable_thinking — and default HIGH when the var is
     // absent. Always supply the mapped value so thinking-off requests
     // actually close the think block; templates that don't read it ignore it.
-    try buf.appendSlice(allocator, if (enable_thinking)
+    //
+    // Inkling's template ALSO reads `reasoning_effort` but with a different
+    // vocabulary (none/minimal/low/medium/high/max) and raise_exception's on
+    // anything else — hy3's "no_think" would fail the render and silently
+    // swap in fallbackFormatChat (wrong-family tags). Its thinking-off word
+    // is "none"; sniffed by the effort header string unique to that family.
+    // DeepSeek-V4-0731's encoder made `reasoning_effort` a THREE-level
+    // vocabulary (low|high|max) whose high/max levels PREPEND a verbose
+    // "Reasoning Effort: …" preamble to the whole conversation, with low (=
+    // nothing) as the reference default. hy3's blanket "high" would inject
+    // that preamble into every thinking request on this family, so dsv4 maps
+    // the CLIENT's effort string through `dsv4EffortFor` — high/max opt in,
+    // everything else (incl. absent) stays the reference default.
+    const dsv4_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
+    const inkling_style = std.mem.indexOf(u8, chat_config.chat_template, "Thinking effort level") != null;
+    if (dsv4_style) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, dsv4EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
+    else if (inkling_style)
+        ",\"reasoning_effort\":\"none\""
     else
         ",\"reasoning_effort\":\"no_think\"");
+
+    // DeepSeek-V4's template switches on `thinking_mode` ("chat"|"thinking",
+    // the reference encoder's own vocabulary). Only emitted when the template
+    // reads it — other families never see the key.
+    if (std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null) {
+        try buf.appendSlice(allocator, if (enable_thinking)
+            ",\"thinking_mode\":\"thinking\""
+        else
+            ",\"thinking_mode\":\"chat\"");
+    }
 
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
@@ -986,6 +1062,8 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
 
 /// Strip `<think>...</think>` or `<|channel>thought\n...<channel|>` block from model output.
 pub fn stripThinkBlock(text: []const u8) []const u8 {
+    // Inkling message channels: same arm as splitThinkBlock (content only).
+    if (splitInklingChannels(text)) |split| return split.content;
     const base = stripThinkBlockLeading(text);
     const trimmed = if (lastUnclosedThinkOpen(base)) |o|
         std.mem.trimEnd(u8, base[0..o.pos], "\n ")
@@ -1050,6 +1128,66 @@ pub const ThinkSplit = struct {
 };
 
 /// True when a rendered generation prompt ends inside a think block the
+const INKLING_THINKING_TAG = "<|content_thinking|>";
+const INKLING_TEXT_TAG = "<|content_text|>";
+const INKLING_END_TAG = "<|end_message|>";
+const INKLING_MODEL_TAG = "<|message_model|>";
+const INKLING_INVOKE_TAG = "<|content_invoke_tool_json|>";
+
+/// Control-channel marker TOKENS that must never appear in a visible stream
+/// delta. Every entry is a single special token in its family's vocab, so
+/// exact-match filtering at the delta level is complete — a marker can't be
+/// split across deltas. Shared by every streaming surface's flush path.
+pub fn isChannelMarkerToken(tt: []const u8) bool {
+    return std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
+        std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>") or
+        std.mem.eql(u8, tt, INKLING_TEXT_TAG) or std.mem.eql(u8, tt, INKLING_END_TAG) or
+        std.mem.eql(u8, tt, INKLING_MODEL_TAG) or std.mem.eql(u8, tt, INKLING_THINKING_TAG);
+}
+
+/// Strip a leading `<|message_model|>` (and, on raw completions, a leading
+/// `<|end_message|>` closing the prompt's implicit message) so the channel
+/// marker is at position 0.
+fn inklingStripMessageHead(text: []const u8) []const u8 {
+    var t = std.mem.trimStart(u8, text, "\n ");
+    if (std.mem.startsWith(u8, t, INKLING_END_TAG)) t = t[INKLING_END_TAG.len..];
+    if (std.mem.startsWith(u8, t, INKLING_MODEL_TAG)) t = t[INKLING_MODEL_TAG.len..];
+    return t;
+}
+
+/// Content runs to its `<|end_message|>` (anything after is a re-opened
+/// message the stop token cut, or trailing markers — dropped).
+fn inklingTrimContentTail(content_in: []const u8) []const u8 {
+    var content = content_in;
+    if (std.mem.indexOf(u8, content, INKLING_END_TAG)) |em| content = content[0..em];
+    return std.mem.trim(u8, content, "\n ");
+}
+
+/// The Inkling arm of splitThinkBlock: null when the text carries no Inkling
+/// channel markers (every other family falls through).
+fn splitInklingChannels(text: []const u8) ?ThinkSplit {
+    const t = inklingStripMessageHead(text);
+    if (std.mem.startsWith(u8, t, INKLING_THINKING_TAG)) {
+        const body = t[INKLING_THINKING_TAG.len..];
+        if (std.mem.indexOf(u8, body, INKLING_END_TAG)) |em| {
+            const reasoning = std.mem.trim(u8, body[0..em], "\n ");
+            var content = inklingStripMessageHead(body[em + INKLING_END_TAG.len ..]);
+            if (std.mem.startsWith(u8, content, INKLING_TEXT_TAG)) content = content[INKLING_TEXT_TAG.len..];
+            return .{
+                .reasoning_content = if (reasoning.len > 0) reasoning else null,
+                .content = inklingTrimContentTail(content),
+            };
+        }
+        // Length-truncated mid-thought: reasoning, never content.
+        const reasoning = std.mem.trim(u8, body, "\n ");
+        return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
+    }
+    if (std.mem.startsWith(u8, t, INKLING_TEXT_TAG)) {
+        return .{ .reasoning_content = null, .content = inklingTrimContentTail(t[INKLING_TEXT_TAG.len..]) };
+    }
+    return null;
+}
+
 /// template opened (Qwen 3.5/3.6 style: `…assistant\n<think>\n`). Callers
 /// decode the last few prompt tokens and pass the tail here. A thinking-off
 /// render ends with a CLOSED `</think>` block and must not match.
@@ -1064,6 +1202,12 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
 /// think opener (see `promptTailOpensThink`), so output with no literal opener
 /// and no close tag is still reasoning — generation started inside the block.
 pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    // Inkling (inkling_mm_model) message channels: the model emits role-less
+    // MESSAGES — `<|content_thinking|>R<|end_message|>` then
+    // `<|message_model|><|content_text|>C<|end_message|>` — not a tag pair.
+    // Keyed on channel openers no other family emits; runs regardless of the
+    // `thinking` flag because the content marker needs stripping either way.
+    if (splitInklingChannels(text)) |split| return split;
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         const think_tag = "<|channel>thought\n";
@@ -1323,6 +1467,23 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // Gemma 4 fully-formed canonical open.
     if (std.mem.indexOf(u8, buf, "<|tool_call") != null) return true;
 
+    // Inkling: the invoke marker is a SINGLE special token (arrives whole) —
+    // once present, everything from here on is call payload. Without this the
+    // NAME + full JSON streamed as visible content deltas (live 2026-07-30,
+    // first real pi session; the leak landed in pi's transcript and
+    // contaminated every later turn's history).
+    if (std.mem.indexOf(u8, buf, INKLING_INVOKE_TAG) != null) return true;
+
+    // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
+    if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
+    // Inkling NAME hold: with a message-boundary marker present (a family
+    // signal no other template emits), a segment that is still a bare
+    // identifier run may be the NAME directly before an invoke marker. Prose
+    // disambiguates within a token or two (space/punctuation); a call
+    // disambiguates at the invoke marker. An EMPTY segment never holds, so
+    // thinking splits stay prompt and marker-only flushes keep flowing.
+    if (inklingSegmentCouldBeToolName(buf)) return true;
+
     // `<tool…` family: walk every `<tool` occurrence, accept the first one
     // whose terminator is valid (mirrors parseToolCalls' acceptance rule).
     var scan: usize = 0;
@@ -1341,11 +1502,39 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         "<",     "<t",     "<to",     "<too",     "<tool",
         "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
         "<|tool_", "<|tool_c", "<|tool_ca", "<|tool_cal",
+        // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
+        // splits too in case the tokenizer spells the marker in pieces)
+        "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
+        "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
     }
     return false;
+}
+
+/// Inkling streaming NAME hold: true when the text after the last message
+/// boundary (<|end_message|> / <|message_model|> / <|content_text|>) is a
+/// NON-EMPTY bare identifier run — the shape of a tool NAME right before its
+/// invoke marker. A thinking message never matches (no boundary marker →
+/// whole buffer, which carries `<|`); other families never emit these
+/// markers at all.
+fn inklingSegmentCouldBeToolName(buf: []const u8) bool {
+    var seg_start: usize = 0;
+    var saw_marker = false;
+    inline for (.{ INKLING_END_TAG, INKLING_MODEL_TAG, INKLING_TEXT_TAG }) |tag| {
+        if (std.mem.lastIndexOf(u8, buf, tag)) |p| {
+            saw_marker = true;
+            seg_start = @max(seg_start, p + tag.len);
+        }
+    }
+    if (!saw_marker) return false;
+    const seg = buf[seg_start..];
+    if (seg.len == 0 or seg.len > 64) return false;
+    for (seg) |c| {
+        if (!inklingIsNameChar(c)) return false;
+    }
+    return true;
 }
 
 /// Streaming-only: what should a tools-enabled SSE path do with the buffered
@@ -1368,6 +1557,17 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 pub const StreamThinkGate = enum { flush_text, hold_thinking, split_think };
 
 pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
+    // Inkling channels decide early: every marker is a SINGLE special token,
+    // so a leading <|content_text|> is a whole marker (the flush path's
+    // marker-token skip keeps it out of visible deltas), and a thinking
+    // message holds until its <|end_message|> arrives.
+    {
+        const ihead = inklingStripMessageHead(buf);
+        if (std.mem.startsWith(u8, ihead, INKLING_TEXT_TAG)) return .flush_text;
+        if (std.mem.startsWith(u8, ihead, INKLING_THINKING_TAG)) {
+            return if (std.mem.indexOf(u8, ihead, INKLING_END_TAG) != null) .split_think else .hold_thinking;
+        }
+    }
     const has_thinking = (enable_thinking and !think_closed) or
         std.mem.indexOf(u8, buf, "<|channel>thought") != null or
         indexOfThinkOpenTag(buf, 0) != null or
@@ -1425,11 +1625,20 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // inner `<tool…>` blocks get a chance — this is what makes the outer
     // `<tool_calls>` wrapper case work.
     //
-    // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST: its wrapper
-    // (`<tool_calls:opensource>`) would also trip the generic `<tool` scan
-    // below, which would misread the non-JSON arg_key/arg_value body. When it
-    // matched, the generic scans are skipped but the shared safety net at the
-    // bottom still runs.
+    // Inkling (inkling_mm_model) is tried FIRST: its calls are MESSAGES —
+    // `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>` —
+    // whose distinctive marker no other family emits; the generic `<tool`
+    // scans never see the shape and other families never carry the marker.
+    try parseInklingToolCalls(allocator, text, &calls);
+    // DeepSeek-V4 native DSML (`<｜DSML｜invoke …>`): distinctive fullwidth-bar
+    // marker no other family emits, and the generic `<tool` scan never sees
+    // it (the byte before "tool_calls" is `｜`, not `<`).
+    try parseDsmlToolCalls(allocator, effective_text, &calls);
+    // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST among the tag
+    // families: its wrapper (`<tool_calls:opensource>`) would also trip the
+    // generic `<tool` scan below, which would misread the non-JSON
+    // arg_key/arg_value body. When it matched, the generic scans are skipped
+    // but the shared safety net at the bottom still runs.
     try parseHy3ToolCalls(allocator, effective_text, &calls);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
@@ -1746,8 +1955,12 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
     }
 
-    // If no <tool_call> tags, try to find raw JSON tool call(s)
-    if (calls.items.len == 0) {
+    // If no <tool_call> tags, try to find raw JSON tool call(s). Never on
+    // text carrying the Inkling invoke marker: that format OWNED the parse,
+    // and a call it deliberately skipped (no recoverable name) must not be
+    // resurrected from its payload bytes by the bare-JSON heuristic — the
+    // comment below says "no tag syntax anywhere", and there IS tag syntax.
+    if (calls.items.len == 0 and std.mem.indexOf(u8, text, INKLING_INVOKE_TAG) == null) {
         var trimmed = std.mem.trim(u8, effective_text, " \t\n\r");
         if (std.mem.startsWith(u8, trimmed, "</tool_call>")) {
             trimmed = std.mem.trim(u8, trimmed["</tool_call>".len..], " \t\n\r");
@@ -2764,6 +2977,253 @@ fn earliestIndexOfAny(text: []const u8, from: usize, needles: []const []const u8
         }
     }
     return best;
+}
+
+/// A tool-name character per the identifier alphabet every template family's
+/// names draw from. The Inkling NAME is glued directly to the invoke marker,
+/// so anything outside this set (a channel marker's `>`, a payload's `}`,
+/// prose punctuation) terminates the name run.
+fn inklingIsNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
+}
+
+/// The trailing identifier run ending at `end` (exclusive). Live 2026-07-30:
+/// the boundary-based prefix scan swallowed the `<|content_text|>` marker
+/// (name `<|content_text|>bash`), and a dropped `<|end_message|>` between
+/// calls produced `}}write` — both resolve to the bare NAME here.
+fn inklingTrailingNameRun(text: []const u8, end: usize) []const u8 {
+    var start = end;
+    while (start > 0 and inklingIsNameChar(text[start - 1])) start -= 1;
+    return text[start..end];
+}
+
+/// Inkling tool calls: `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>`
+/// per call (one message each; parallel calls are consecutive messages). The
+/// payload's "name" is authoritative (the prefix NAME is the same string in
+/// well-formed output, and is the fallback when the payload is truncated).
+/// Truncation salvage per the hard rule: recover NAME + `{}` — never partial
+/// argument values.
+// DeepSeek-V4 native DSML markers. `｜` is the FULLWIDTH vertical bar
+// (U+FF5C, 3 bytes) — the dsml_token "｜DSML｜" appears in no other family.
+const DSML_INVOKE_TAG = "<｜DSML｜invoke";
+const DSML_INVOKE_CLOSE = "</｜DSML｜invoke>";
+const DSML_PARAM_TAG = "<｜DSML｜parameter";
+const DSML_PARAM_CLOSE = "</｜DSML｜parameter>";
+
+/// Tolerant quoted-attribute extraction from a tag-attribute segment:
+/// `name="X"` / `name='X'` / mangled unquoted `name=X` (to whitespace/`>`).
+fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
+    const pat = key ++ "=";
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, seg, start, pat)) |at| {
+        if (at > 0 and (std.ascii.isAlphanumeric(seg[at - 1]) or seg[at - 1] == '_')) {
+            start = at + pat.len;
+            continue;
+        }
+        var v = at + pat.len;
+        if (v >= seg.len) return null;
+        const q = seg[v];
+        if (q == '"' or q == '\'') {
+            v += 1;
+            const end = std.mem.indexOfScalarPos(u8, seg, v, q) orelse seg.len;
+            return seg[v..end];
+        }
+        const end = std.mem.indexOfAnyPos(u8, seg, v, " \t\n>") orelse seg.len;
+        return seg[v..end];
+    }
+    return null;
+}
+
+/// DeepSeek-V4 DSML tool calls:
+///   `<｜DSML｜tool_calls>` wrapping
+///   `<｜DSML｜invoke name="X">` +
+///   `<｜DSML｜parameter name="k" string="true|false">v</｜DSML｜parameter>`.
+/// string="true" values are raw text (JSON-escaped here); string="false"
+/// values are already JSON (validated; invalid degrades to an honest string).
+/// House conventions: the parser keys on the INVOKE marker (a dropped
+/// wrapper or invoke-close still parses — delimiter-drop class), values run
+/// to the CONFIRMED closing tag (rich values with `<`/newlines survive),
+/// truncation salvages NAME + completed pairs (fragments dropped), keys are
+/// escaped + deduped (last wins) so emitted arguments are ALWAYS valid JSON.
+fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    const Param = struct { key: []const u8, value: []const u8, is_string: bool };
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, DSML_INVOKE_TAG)) |inv| {
+        var p = inv + DSML_INVOKE_TAG.len;
+        const tag_end = std.mem.indexOfScalarPos(u8, text, p, '>') orelse break;
+        const name = dsmlAttr(text[p..tag_end], "name") orelse {
+            pos = tag_end + 1;
+            continue;
+        };
+        p = tag_end + 1;
+
+        var params = std.ArrayList(Param).empty;
+        defer params.deinit(allocator);
+        while (true) {
+            const next_param = std.mem.indexOfPos(u8, text, p, DSML_PARAM_TAG);
+            const next_close = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_CLOSE);
+            const next_invoke = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_TAG);
+            const np = next_param orelse std.math.maxInt(usize);
+            const nc = next_close orelse std.math.maxInt(usize);
+            const ni = next_invoke orelse std.math.maxInt(usize);
+            if (np == std.math.maxInt(usize) and nc == std.math.maxInt(usize) and ni == std.math.maxInt(usize)) {
+                // truncated invoke: ship NAME + completed pairs
+                p = text.len;
+                break;
+            }
+            if (nc <= np and nc <= ni) {
+                p = nc + DSML_INVOKE_CLOSE.len;
+                break;
+            }
+            if (ni < np) {
+                // dropped invoke-close — the next call starts here; the outer
+                // loop picks it up from `p`.
+                p = ni;
+                break;
+            }
+            // parameter
+            var q = np + DSML_PARAM_TAG.len;
+            const ptag_end = std.mem.indexOfScalarPos(u8, text, q, '>') orelse {
+                p = text.len;
+                break;
+            };
+            const attrs = text[q..ptag_end];
+            const pkey = dsmlAttr(attrs, "name");
+            const pstring = dsmlAttr(attrs, "string");
+            const vstart = ptag_end + 1;
+            const vclose = std.mem.indexOfPos(u8, text, vstart, DSML_PARAM_CLOSE) orelse {
+                // unterminated value = server-cut fragment; drop it, end scan
+                p = text.len;
+                break;
+            };
+            q = vclose + DSML_PARAM_CLOSE.len;
+            if (pkey) |k| {
+                const value = text[vstart..vclose];
+                // string attr absent (mangled opener): treat JSON-parseable
+                // values as JSON, everything else as a string.
+                const is_string = if (pstring) |sf|
+                    !std.mem.eql(u8, sf, "false")
+                else
+                    !dsmlValueIsJson(allocator, value);
+                // dedup: last wins
+                var replaced = false;
+                for (params.items) |*prm| {
+                    if (std.mem.eql(u8, prm.key, k)) {
+                        prm.value = value;
+                        prm.is_string = is_string;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) try params.append(allocator, .{ .key = k, .value = value, .is_string = is_string });
+            }
+            p = q;
+        }
+
+        // Build the arguments object: escaped keys, escaped string values,
+        // raw (validated) JSON values.
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        try out.append(allocator, '{');
+        for (params.items, 0..) |prm, i| {
+            if (i > 0) try out.append(allocator, ',');
+            try appendJsonString(allocator, &out, prm.key);
+            try out.append(allocator, ':');
+            if (!prm.is_string and dsmlValueIsJson(allocator, prm.value)) {
+                try out.appendSlice(allocator, std.mem.trim(u8, prm.value, " \t\n\r"));
+            } else {
+                try appendJsonString(allocator, &out, prm.value);
+            }
+        }
+        try out.append(allocator, '}');
+        const name_owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_owned);
+        try calls.append(allocator, .{ .name = name_owned, .arguments = try out.toOwnedSlice(allocator) });
+        pos = p;
+    }
+}
+
+fn dsmlValueIsJson(allocator: std.mem.Allocator, value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\n\r");
+    if (trimmed.len == 0) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return false;
+    parsed.deinit();
+    return true;
+}
+
+fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, INKLING_INVOKE_TAG)) |inv| {
+        const prefix_name = inklingTrailingNameRun(text, inv);
+
+        // Body = the balanced JSON object right after the marker (string-aware
+        // brace scan). The next <|end_message|> is NOT a reliable terminator:
+        // the model drops it between back-to-back calls (live 2026-07-30,
+        // `{…}}write<|content_invoke_tool_json|>{…}`), and an end-tag-bounded
+        // body then swallows the following call whole. No balance by end of
+        // text = truncation → the NAME + `{}` salvage below.
+        const body_start = inv + INKLING_INVOKE_TAG.len;
+        var body: []const u8 = "";
+        const after = std.mem.trimStart(u8, text[body_start..], "\n ");
+        if (std.mem.startsWith(u8, after, "{")) {
+            if (balancedJsonObject(after)) |obj| {
+                body = obj;
+                pos = (body_start + (text.len - body_start - after.len)) + obj.len;
+            } else {
+                pos = text.len; // truncated object — nothing further to scan
+            }
+        } else {
+            // No object after the marker at all: keep the old end-tag-bounded
+            // read so a non-JSON payload still gets a parse attempt.
+            const body_end = std.mem.indexOfPos(u8, text, body_start, INKLING_END_TAG) orelse text.len;
+            body = std.mem.trim(u8, text[body_start..body_end], "\n ");
+            pos = body_end;
+        }
+
+        var name: []const u8 = prefix_name;
+        var args_json: ?[]const u8 = null; // allocated when set
+        if (std.json.parseFromSlice(std.json.Value, allocator, body, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("name")) |nv| {
+                    if (nv == .string and nv.string.len > 0) {
+                        name = nv.string;
+                        // Marker-echo repair: pi's "Tool <|content_text|>bash
+                        // not found" reply taught the model to copy the garbage
+                        // name INTO its payloads (live 2026-07-30). No real
+                        // tool name contains `<|` — keep the trailing
+                        // identifier run; empty → fall back to the prefix name.
+                        if (std.mem.indexOf(u8, name, "<|") != null) {
+                            name = inklingTrailingNameRun(name, name.len);
+                            if (name.len == 0) name = prefix_name;
+                        }
+                    }
+                }
+                if (parsed.value.object.get("args")) |av| {
+                    if (av == .object) {
+                        // Re-serialize through Stringify: escaping + key dedup
+                        // by construction (the tag-converter invariant).
+                        args_json = std.json.Stringify.valueAlloc(allocator, av, .{}) catch null;
+                    }
+                }
+                // `name` borrows from `parsed` — dupe before deinit.
+                name = try allocator.dupe(u8, name);
+            } else {
+                name = try allocator.dupe(u8, name);
+            }
+        } else |_| {
+            // Truncated / mangled payload: NAME + {} (never ship fragments).
+            name = try allocator.dupe(u8, name);
+        }
+        errdefer allocator.free(name);
+        if (name.len == 0) {
+            allocator.free(name);
+            if (args_json) |a| allocator.free(a);
+            continue;
+        }
+        const arguments = args_json orelse try allocator.dupe(u8, "{}");
+        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+    }
 }
 
 fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
@@ -4195,6 +4655,184 @@ test "promptTailOpensThink detects template-injected opener" {
     // Gemma 4 prompt tail (no injected opener)
     try testing.expect(!promptTailOpensThink("<|turn>model\n"));
     try testing.expect(!promptTailOpensThink(""));
+}
+
+test "splitThinkBlock: Inkling message channels (thinking + text + truncation)" {
+    // Real REAP25 captures (2026-07-30): the model emits role-less MESSAGES —
+    // a thinking message, then a fresh <|message_model|> text message — not a
+    // tag pair. Channel markers must never leak into content or reasoning.
+    {
+        const out = "<|content_thinking|>Shorter wavelengths scatter more.<|end_message|><|message_model|><|content_text|>Rayleigh scattering.<|end_message|>";
+        const split = splitThinkBlock(out, true, false);
+        try testing.expectEqualStrings("Shorter wavelengths scatter more.", split.reasoning_content.?);
+        try testing.expectEqualStrings("Rayleigh scattering.", split.content);
+    }
+    // Thinking-off shape (live capture: chat 2+2)
+    {
+        const out = "<|content_text|>4<|end_message|>";
+        const split = splitThinkBlock(out, false, false);
+        try testing.expect(split.reasoning_content == null);
+        try testing.expectEqualStrings("4", split.content);
+    }
+    // Length-truncated mid-thought: reasoning, never content
+    {
+        const out = "<|content_thinking|>The user is asking for";
+        const split = splitThinkBlock(out, true, false);
+        try testing.expectEqualStrings("The user is asking for", split.reasoning_content.?);
+        try testing.expectEqualStrings("", split.content);
+    }
+    // Raw-completion shape: leading <|end_message|><|message_model|> before
+    // the first channel marker (no template context).
+    {
+        const out = "<|end_message|><|message_model|><|content_thinking|>Standard implementation.<|end_message|><|message_model|><|content_text|>def fib(n): ...<|end_message|>";
+        const split = splitThinkBlock(out, true, false);
+        try testing.expectEqualStrings("Standard implementation.", split.reasoning_content.?);
+        try testing.expectEqualStrings("def fib(n): ...", split.content);
+    }
+}
+
+test "parseToolCalls: Inkling invoke_tool_json family" {
+    const allocator = testing.allocator;
+    // Canonical shape from the chat template: NAME<|content_invoke_tool_json|>
+    // {"name":...,"args":{...}}<|end_message|>, optionally after a thinking message.
+    {
+        const text = "<|content_thinking|>Need the time.<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{\"timezone\":\"UTC\"}}<|end_message|>";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("get_time", calls[0].name);
+        try testing.expect(!calls[0].inferred);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("UTC", parsed.value.object.get("timezone").?.string);
+    }
+    // Two calls in one turn (parallel) — each its own message.
+    {
+        const text = "<|message_model|>alpha<|content_invoke_tool_json|>{\"name\":\"alpha\",\"args\":{\"a\":1}}<|end_message|><|message_model|>beta<|content_invoke_tool_json|>{\"name\":\"beta\",\"args\":{}}<|end_message|>";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 2), calls.len);
+        try testing.expectEqualStrings("alpha", calls[0].name);
+        try testing.expectEqualStrings("beta", calls[1].name);
+    }
+    // Truncated mid-args: salvage NAME + {} — never partial values.
+    {
+        const text = "<|message_model|>write_file<|content_invoke_tool_json|>{\"name\":\"write_file\",\"args\":{\"path\":\"/tmp/x\",\"content\":\"half-writ";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("write_file", calls[0].name);
+        try testing.expectEqualStrings("{}", calls[0].arguments);
+    }
+}
+
+test "parseToolCalls: Inkling name is the trailing identifier run" {
+    const allocator = testing.allocator;
+    // Live 2026-07-30 pi session: the tool message opens with the
+    // <|content_text|> marker glued to the NAME. When the payload is
+    // truncated, the salvage name must be the bare identifier — never
+    // `<|content_text|>bash` (pi's "Tool <|content_text|>bash not found"
+    // reply taught the model to echo that garbage name back).
+    {
+        const text = "<|message_model|><|content_text|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("bash", calls[0].name);
+        try testing.expectEqualStrings("{}", calls[0].arguments);
+    }
+    // Marker echoed INTO the payload's "name" (the self-reinforcing loop's
+    // second stage): sanitize to the trailing identifier run.
+    {
+        const text = "<|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"<|content_text|>bash\",\"args\":{}}<|end_message|>";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("bash", calls[0].name);
+    }
+    // Payload name that is ONLY a marker, no prefix name either → the call
+    // has no recoverable name and is skipped.
+    {
+        const text = "<|message_model|><|content_invoke_tool_json|>{\"name\":\"<|content_text|>\",\"args\":{}}<|end_message|>";
+        const calls = try parseToolCalls(allocator, text);
+        try testing.expect(calls == null);
+    }
+}
+
+test "parseToolCalls: Inkling back-to-back invokes without <|end_message|>" {
+    const allocator = testing.allocator;
+    // Live 2026-07-30: the model drops the <|end_message|> between two calls
+    // (`{…}}write<|content_invoke_tool_json|>{…}`). Body extraction must stop
+    // at the balanced object — an end-tag-bounded body swallows call 2 whole.
+    const text = "<|message_model|><|content_text|>write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"a.js\",\"content\":\"x\"}}write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"b.js\",\"content\":\"y\"}}<|end_message|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    try testing.expectEqualStrings("write", calls[1].name);
+    const p0 = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer p0.deinit();
+    try testing.expectEqualStrings("a.js", p0.value.object.get("path").?.string);
+    const p1 = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer p1.deinit();
+    try testing.expectEqualStrings("b.js", p1.value.object.get("path").?.string);
+}
+
+test "streamShouldBufferForTools: Inkling invoke marker and NAME hold" {
+    // The invoke marker is a single special token — once present, everything
+    // from here is call payload and must never flush as content.
+    try testing.expect(streamShouldBufferForTools("<|message_model|>bash<|content_invoke_tool_json|>"));
+    try testing.expect(streamShouldBufferForTools("<|content_invoke_tool_json|>{\"name\":\"bash\""));
+    // NAME hold: an Inkling boundary marker plus a bare identifier segment
+    // could be the NAME right before the invoke marker — hold until
+    // disambiguated (prose adds a space/punct within a token or two).
+    try testing.expect(streamShouldBufferForTools("<|message_model|><|content_text|>bash"));
+    try testing.expect(streamShouldBufferForTools("<|message_model|>get_time"));
+    // Prose disambiguates → flows.
+    try testing.expect(!streamShouldBufferForTools("<|content_text|>The answer"));
+    // Completed message (empty segment after the end marker) → flows.
+    try testing.expect(!streamShouldBufferForTools("<|content_text|>4<|end_message|>"));
+    // A thinking message never trips the NAME hold (the think gate owns it).
+    try testing.expect(!streamShouldBufferForTools("<|content_thinking|>Need the time"));
+    // No Inkling markers → other families completely unaffected.
+    try testing.expect(!streamShouldBufferForTools("bash"));
+    try testing.expect(!streamShouldBufferForTools("plain prose mentioning get_time here"));
 }
 
 test "parseToolCalls JSON format" {
@@ -5946,7 +6584,7 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
         // Verbatim shape from the live failure: hide-cursor ANSI code + prompt UI.
         .{ .role = "tool", .content = "\x1b[?25l\u{2502}\n\u{25c6}  Which template would you like?", .tool_call_id = "tc_0" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null);
     defer allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "<|tool_response>") != null);
@@ -5989,7 +6627,7 @@ test "renderChatTemplate: Hy3 constructs — str.format tokens, arguments.items(
         .{ .role = "user", .content = "write it" },
         .{ .role = "assistant", .content = "", .tool_calls = &tc },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null);
     defer allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "<user:opensource>write it") != null);
@@ -6041,7 +6679,7 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
 
     // Thinking ON: generation prompt must end inside a think block.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "hy_begin_of_sentence:opensource") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "hy_User:opensource") != null);
@@ -6057,10 +6695,86 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
     }
     // Thinking OFF (reasoning_effort no_think): think opened AND closed.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
         defer allocator.free(rendered);
         try testing.expect(!promptTailOpensThink(rendered));
         try testing.expect(std.mem.indexOf(u8, rendered, "<think:opensource></think:opensource>") != null);
+    }
+}
+
+test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallback (hermetic)" {
+    // src/fixtures/inkling_chat_template.jinja is the verbatim template from
+    // pipenetwork/Inkling-Small-MLX-* (Thinking Machines Inkling Small). It
+    // exercises jinja features no other family does — namespace(), dict/tuple
+    // literals, tojson(sort_keys=true, separators=(",", ":")), `is mapping` —
+    // and it RAISES on any reasoning_effort string it doesn't know (including
+    // hy3's "no_think") and on tool-call arguments passed as a JSON STRING. A
+    // raise = silent fallbackFormatChat = wrong-family tags, so the render is
+    // pinned hermetically for both thinking arms.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/inkling_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+
+    // Thinking ON: effort header 0.9 (our "high"), tool declare, tool call as
+    // {"name":...,"args":{...}} with args as an OBJECT (sorted, compact), tool
+    // result named via tool_call_id lookup, generation prompt at the tail.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|>tool_declare<|content_xml|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\"name\":\"get_time\"") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_user|><|content_text|>What time is it?<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{\"timezone\":\"UTC\"}}<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|content_model_end_sampling|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_tool|>get_time<|content_text|>12:34 UTC<|end_message|>") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
+        // No fallback-format markers (a raise inside the template silently falls back).
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    }
+    // Thinking OFF: the effort header must be the template's "0" form — hy3's
+    // "no_think" is UNKNOWN to this template and raises.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Thinking effort level: 0<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    }
+    // History reasoning round-trip (laguna class): this template PERSISTS
+    // assistant reasoning as its own <|content_thinking|> message. If the
+    // field ever stops reaching the render, prior turns silently lose their
+    // thinking blocks while turn 1 still works.
+    {
+        const hist = [_]Message{
+            .{ .role = "user", .content = "Why is the sky blue?" },
+            .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
+            .{ .role = "user", .content = "And sunsets?" },
+        };
+        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_text|>Rayleigh scattering.<|end_message|>") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
     }
 }
 
@@ -6075,7 +6789,7 @@ test "serializeExtraContext with thinking enabled" {
     };
     _ = &config;
 
-    const result = try serializeExtraContext(allocator, &config, true);
+    const result = try serializeExtraContext(allocator, &config, true, null);
     defer allocator.free(result);
     // Should contain enable_thinking:true
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":true") != null);
@@ -6092,9 +6806,80 @@ test "serializeExtraContext with thinking disabled" {
     };
     _ = &config;
 
-    const result = try serializeExtraContext(allocator, &config, false);
+    const result = try serializeExtraContext(allocator, &config, false, null);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
+}
+
+test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {
+    // medium deliberately maps LOW: DeepSeek's "high" text is a verbose
+    // "absolute maximum, no shortcuts" preamble and the reference default is
+    // low — nothing verbose is injected unless the client explicitly asked.
+    try testing.expectEqualStrings("low", dsv4EffortFor(null));
+    try testing.expectEqualStrings("low", dsv4EffortFor("none"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("minimal"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("low"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("medium"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("banana")); // unknown → default
+    try testing.expectEqualStrings("high", dsv4EffortFor("high"));
+    try testing.expectEqualStrings("max", dsv4EffortFor("xhigh"));
+    try testing.expectEqualStrings("max", dsv4EffortFor("max"));
+}
+
+test "serializeExtraContext: dsv4 gets the reference's default reasoning effort" {
+    // DeepSeek-V4-0731 turned `reasoning_effort` into low|high|max where
+    // high/max PREPEND a verbose preamble to the conversation and low adds
+    // nothing (the reference default). The hy3 convention of sending "high"
+    // for every thinking-enabled request would silently attach that preamble
+    // to every dsv4 thinking turn; the family is sniffed by `thinking_mode`,
+    // which only this template reads.
+    const allocator = testing.allocator;
+    var dsv4 = ChatConfig{
+        .chat_template = "{%- set mode = thinking_mode|default('chat') -%}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    for ([_]bool{ true, false }) |thinking| {
+        const r = try serializeExtraContext(allocator, &dsv4, thinking, null);
+        defer allocator.free(r);
+        try testing.expect(std.mem.indexOf(u8, r, "\"reasoning_effort\":\"low\"") != null);
+        // thinking_mode still carries the on/off switch for this family.
+        try testing.expect(std.mem.indexOf(u8, r, if (thinking)
+            "\"thinking_mode\":\"thinking\""
+        else
+            "\"thinking_mode\":\"chat\"") != null);
+    }
+    // A client-supplied effort string reaches the template MAPPED through
+    // `dsv4EffortFor` — high/max opt into the verbose preamble, medium stays
+    // at the reference default (never silently verbose).
+    const mapped_cases = [_]struct { in: ?[]const u8, out: []const u8 }{
+        .{ .in = "high", .out = "\"reasoning_effort\":\"high\"" },
+        .{ .in = "max", .out = "\"reasoning_effort\":\"max\"" },
+        .{ .in = "xhigh", .out = "\"reasoning_effort\":\"max\"" },
+        .{ .in = "medium", .out = "\"reasoning_effort\":\"low\"" },
+    };
+    for (mapped_cases) |case| {
+        const r = try serializeExtraContext(allocator, &dsv4, true, case.in);
+        defer allocator.free(r);
+        try testing.expect(std.mem.indexOf(u8, r, case.out) != null);
+    }
+
+    // Other families are untouched: hy3-style keeps high/no_think.
+    var other = ChatConfig{
+        .chat_template = "{{ reasoning_effort }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const on = try serializeExtraContext(allocator, &other, true, null);
+    defer allocator.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "\"reasoning_effort\":\"high\"") != null);
+    const off = try serializeExtraContext(allocator, &other, false, null);
+    defer allocator.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "\"reasoning_effort\":\"no_think\"") != null);
 }
 
 test "serializeMessagesJson basic" {
@@ -6128,6 +6913,57 @@ test "serializeMessagesJson with tool_calls" {
     // Should contain tool_calls array
     try testing.expect(std.mem.indexOf(u8, result, "\"tool_calls\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
+}
+
+test "serializeMessagesJson carries assistant reasoning_content" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What is 2+2?" },
+        .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const asst = parsed.value.array.items[1].object;
+    try testing.expectEqualStrings("two plus two is four", asst.get("reasoning_content").?.string);
+    // A message without the field must not carry the key at all — templates
+    // gate on `is string`, and an explicit null would still pass `is defined`.
+    try testing.expect(parsed.value.array.items[0].object.get("reasoning_content") == null);
+}
+
+test "assistant history reasoning_content reaches a template that reads it (laguna round-trip)" {
+    // laguna's chat_template.jinja persists reasoning across turns: history
+    // assistant messages render <think>{message.reasoning|reasoning_content}</think>.
+    // When the parse layer drops the field, every history turn renders the
+    // empty <think></think> nothink signature and the model stops thinking
+    // from turn 2 of a session (live 2026-07-29, pi agent on Laguna XS: one
+    // reasoning delta on the 2-msg turn, zero across the next 13k chunks).
+    // Template fragment mirrors laguna's assistant-history branch.
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = "{%- for message in messages -%}" ++
+            "{%- if message.role == 'assistant' -%}" ++
+            "{%- set rc = '' -%}" ++
+            "{%- if message.reasoning is string -%}{%- set rc = message.reasoning -%}" ++
+            "{%- elif message.reasoning_content is string -%}{%- set rc = message.reasoning_content -%}" ++
+            "{%- endif -%}" ++
+            "<think>{{ rc }}</think>{{ message.content }}" ++
+            "{%- endif -%}{%- endfor -%}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    _ = &config;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What is 2+2?" },
+        .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<think>two plus two is four</think>4") != null);
 }
 
 test "serializeMessagesJson embeds valid-JSON arguments as object (not string)" {
@@ -6564,7 +7400,7 @@ test "renderChatTemplate: DSV4-style template gets tool fallback applied" {
     const messages = [_]Message{
         .{ .role = "user", .content = "list my files" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
     defer allocator.free(rendered);
     // Tool prompt should have been injected as a system message.
     try testing.expect(std.mem.indexOf(u8, rendered, "Available functions") != null);
@@ -8312,4 +9148,230 @@ test "parseToolCalls hy3: suffixed think close before the wrapper still parses" 
     }
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("list_files", calls[0].name);
+}
+
+// ── DeepSeek-V4 native DSML tool calls ─────────────────────────────────
+
+fn freeParsedCalls(calls: []ParsedToolCall) void {
+    for (calls) |tc| {
+        testing.allocator.free(tc.name);
+        testing.allocator.free(tc.arguments);
+    }
+    testing.allocator.free(calls);
+}
+
+test "parseToolCalls dsml: canonical two-call block, string and JSON params" {
+    const raw = "I'll check the weather.\n\n<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"get_weather\">\n" ++
+        "<｜DSML｜parameter name=\"city\" string=\"true\">San Francisco</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n" ++
+        "<｜DSML｜invoke name=\"get_time\">\n" ++
+        "<｜DSML｜parameter name=\"tz\" string=\"true\">PST</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n" ++
+        "</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    try testing.expectEqualStrings("{\"city\":\"San Francisco\",\"days\":3}", calls[0].arguments);
+    try testing.expectEqualStrings("get_time", calls[1].name);
+    try testing.expectEqualStrings("{\"tz\":\"PST\"}", calls[1].arguments);
+    try testing.expect(!calls[0].inferred);
+}
+
+test "parseToolCalls dsml: dropped invoke close before the next call still parses both" {
+    // Delimiter-drop tolerance (hy3 class): the model omits </｜DSML｜invoke>
+    // between back-to-back calls.
+    const raw = "<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"first\">\n" ++
+        "<｜DSML｜parameter name=\"a\" string=\"true\">x</｜DSML｜parameter>\n" ++
+        "<｜DSML｜invoke name=\"second\">\n" ++
+        "<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("first", calls[0].name);
+    try testing.expectEqualStrings("{\"a\":\"x\"}", calls[0].arguments);
+    try testing.expectEqualStrings("second", calls[1].name);
+    try testing.expectEqualStrings("{\"b\":true}", calls[1].arguments);
+}
+
+test "parseToolCalls dsml: truncation salvages NAME + completed pairs, never fragments" {
+    // Server-side cut mid-value: the unterminated pair is dropped (a half-
+    // written file is worse than a re-issued write), completed pairs survive.
+    const raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n" ++
+        "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/a.txt</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"content\" string=\"true\">first half of a long fi";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expectEqualStrings("{\"path\":\"/tmp/a.txt\"}", calls[0].arguments);
+}
+
+test "parseToolCalls dsml: rich string value runs to the confirmed close" {
+    // Newlines, quotes, braces, `<` inside a string value — value ends ONLY
+    // at the closing parameter tag (the Gemma dropped-quote class).
+    const raw = "<｜DSML｜invoke name=\"bash\">\n" ++
+        "<｜DSML｜parameter name=\"cmd\" string=\"true\">grep -r \"a < b\" src/\necho {done}</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("grep -r \"a < b\" src/\necho {done}", parsed.value.object.get("cmd").?.string);
+}
+
+test "parseToolCalls dsml: duplicate keys dedup (last wins) and invalid JSON value degrades to string" {
+    const raw = "<｜DSML｜invoke name=\"t\">\n" ++
+        "<｜DSML｜parameter name=\"k\" string=\"true\">old</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"k\" string=\"true\">new</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"n\" string=\"false\">not[json</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("new", parsed.value.object.get("k").?.string);
+    try testing.expectEqualStrings("not[json", parsed.value.object.get("n").?.string);
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+}
+
+test "parseToolCalls dsml: zero-arg call and thinking prefix" {
+    const raw = "thinking about it</think>Sure.\n\n<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"list_files\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("list_files", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hold" {
+    try testing.expect(streamShouldBufferForTools("Sure.\n\n<｜DSML｜tool_calls>"));
+    try testing.expect(streamShouldBufferForTools("<｜DSML｜invoke name=\"x\">"));
+    // partial fullwidth-bar prefix at the tail — next token may complete it
+    try testing.expect(streamShouldBufferForTools("answer text <｜DSML"));
+    try testing.expect(streamShouldBufferForTools("answer text <｜"));
+    // plain prose with a fullwidth bar elsewhere must NOT hold
+    try testing.expect(!streamShouldBufferForTools("the ｜ character is fun"));
+}
+
+test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_result (hermetic)" {
+    // src/fixtures/dsv4_chat_template.jinja is OUR faithful transcription of
+    // DeepSeek-V4's encoding_dsv4.py (the checkpoint ships none): TOOLS block
+    // into the system position, assistant history tool calls as DSML
+    // invoke/parameter markup (string params raw, JSON params via tojson —
+    // whose default ", "/": " separators match python json.dumps), tool role
+    // as <tool_result> user turns (consecutive results merge), thinking_mode
+    // chat|thinking with the reference's drop-thinking rule (reasoning kept
+    // only for assistant turns AFTER the last user/tool message).
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/dsv4_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_weather", .arguments = "{\"city\": \"Paris\", \"days\": 3}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "Sunny, 22C", .tool_call_id = "tc_0" },
+    };
+
+    // Thinking OFF (chat mode): assistant turns open with the bare </think>.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You are helpful.\n\n## Tools") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\"<｜DSML｜tool_calls>\" block") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"get_weather\"") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜User｜>Weather in Paris?") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "</｜DSML｜tool_calls><｜end▁of▁sentence｜>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜User｜><tool_result>Sunny, 22C</tool_result>") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜></think>"));
+        // No fallback-format markers (a raise inside the template silently falls back).
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    }
+    // Thinking ON with TOOLS: the reference DISABLES drop_thinking whenever
+    // tools are declared (agent sessions keep reasoning on every assistant
+    // turn — the laguna round-trip class), so the tool-calling assistant
+    // renders <think>…</think> even though a tool result follows it.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜><think>"));
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜><think></think>\n\n<｜DSML｜tool_calls>") != null);
+        // 0731's reasoning-effort preamble must NOT appear at the serializer's
+        // dsv4 default (the reference default is "low" = nothing). hy3's
+        // blanket "high" would have prepended it to every thinking request.
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning Effort:") == null);
+    }
+    // Client-supplied effort reaches the render MAPPED (dsv4EffortFor): the
+    // raw CLIENT vocabulary goes in ("xhigh"), the template sees "max" and
+    // prepends the max preamble. This is the end-to-end pin the unit tests
+    // can't give — the string must survive renderChatTemplate →
+    // serializeExtraContext → Jinja.
+    {
+        const user_only = [_]Message{.{ .role = "user", .content = "prove it" }};
+        const r_max = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "xhigh");
+        defer allocator.free(r_max);
+        try testing.expect(std.mem.indexOf(u8, r_max, "Reasoning Effort: Beyond maximum") != null);
+        const r_high = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "high");
+        defer allocator.free(r_high);
+        try testing.expect(std.mem.indexOf(u8, r_high, "Reasoning Effort: Absolute maximum") != null);
+        // Outside thinking mode the preamble never applies, whatever the effort.
+        const r_chat = try renderChatTemplate(allocator, &user_only, &config, null, null, false, "high");
+        defer allocator.free(r_chat);
+        try testing.expect(std.mem.indexOf(u8, r_chat, "Reasoning Effort:") == null);
+    }
+    // Old-turn reasoning DROPS (the reference's drop_thinking): an assistant
+    // turn with a LATER user message renders without its reasoning.
+    {
+        const hist = [_]Message{
+            .{ .role = "user", .content = "Why is the sky blue?" },
+            .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
+            .{ .role = "user", .content = "And sunsets?" },
+        };
+        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜></think>Rayleigh scattering.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Shorter wavelengths") == null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜><think>"));
+    }
+    // No system message + tools: the reference delivers tools through a
+    // system/developer turn and renders `system_content + "\n\n" + tools`, so
+    // an EMPTY system turn still emits the two newlines (measured against
+    // 0731's encoder — it silently DROPS tools attached to a user message, so
+    // an empty system turn is its only way to say "tools, no system prompt").
+    // Clients routinely send user+tools with no system message, and dropping
+    // that separator shifts every token after the bos away from what the
+    // model was trained on. Pinned byte-exact by tests/dsv4_template_ab.py.
+    {
+        const no_sys = [_]Message{
+            .{ .role = "user", .content = "hi" },
+        };
+        const rendered = try renderChatTemplate(allocator, &no_sys, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.startsWith(u8, rendered, "<｜begin▁of▁sentence｜>\n\n## Tools"));
+        try testing.expect(std.mem.indexOf(u8, rendered, "tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi") != null);
+    }
 }

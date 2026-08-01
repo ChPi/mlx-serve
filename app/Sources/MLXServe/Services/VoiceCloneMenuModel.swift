@@ -17,6 +17,41 @@ enum VoiceCloneMenuModel {
         !clipPath.isEmpty && cloneEnabled && ttsModelDownloaded
     }
 
+    /// Kokoro speaks only when it is the selected engine AND its checkpoint is
+    /// on disk. Same honesty rule as the clone: without the model every sentence
+    /// silently falls back to the system voice, so the menu must not tick it.
+    static func kokoroIsActive(engine: VoiceEngine, kokoroDownloaded: Bool) -> Bool {
+        engine == .kokoro && kokoroDownloaded
+    }
+
+    /// What the collapsed tray label shows, given the whole engine choice. One
+    /// function so the label can never disagree with what will actually speak.
+    static func collapsedLabel(engine: VoiceEngine,
+                               clipPath: String,
+                               cloneEnabled: Bool,
+                               ttsModelDownloaded: Bool,
+                               kokoroDownloaded: Bool,
+                               kokoroVoice: String,
+                               cloneLabel: String,
+                               systemVoiceName: String?) -> String {
+        if kokoroIsActive(engine: engine, kokoroDownloaded: kokoroDownloaded) {
+            return clipDisplayName(KokoroVoiceCatalog.blendDisplayName(for: kokoroVoice))
+        }
+        if engine == .clone,
+           cloneIsActive(clipPath: clipPath, cloneEnabled: cloneEnabled,
+                         ttsModelDownloaded: ttsModelDownloaded) {
+            let name = clipDisplayName(cloneLabel)
+            return name.isEmpty ? "My voice" : name
+        }
+        return systemVoiceName ?? "Voice"
+    }
+
+    /// Why the Kokoro rows are disabled; nil when it can speak.
+    static func kokoroUnavailableReason(kokoroDownloaded: Bool) -> String? {
+        kokoroDownloaded ? nil
+            : "Requires the Kokoro voice model — download it in Settings ▸ Voice."
+    }
+
     /// Longest clip name the tray will render. The label is a FILENAME the user
     /// picked, so it can be arbitrarily long — and the menu-bar panel is a fixed
     /// narrow column that a 200-character name blows out sideways, dragging the
@@ -60,11 +95,63 @@ enum VoiceCloneMenuModel {
 
     // MARK: - Disk seams (not unit-tested)
 
-    /// Is the Audio pane's TTS model on disk? Cheap directory check; cache the
-    /// result per panel appearance — don't call per render.
+    /// Is a voice backend COMPLETE on disk? The bundle's ready markers, not a
+    /// bare `config.json` check: the app downloads these itself now, and
+    /// `config.json` is one of the first files a 345 MB pull lands — so a
+    /// dir-exists test says "available" while the weights and (for Kokoro) the
+    /// `g2p/` dictionaries are still in flight, and picking a voice then gets
+    /// silence. Same answer the Settings download bar gives, so the two
+    /// surfaces can't disagree. Cache per panel appearance — these stat the
+    /// disk, don't call them per render.
+    @MainActor
+    private static func bundleOnDisk(_ preset: AudioModelPreset) -> Bool {
+        preset.bundle.components.allSatisfy {
+            DownloadManager.componentReady($0, modelsRoot: ServerManager.modelsRoot)
+        }
+    }
+
+    /// Which cloning model the voice path will ACTUALLY load: the Audio pane's
+    /// configured preset when it's on disk, else any other cloning-capable one
+    /// that is. nil when none are downloaded.
+    ///
+    /// Resolving against the disk rather than trusting the setting is the fix for
+    /// a silent failure: the default is the 0.6B repo, so a machine holding only
+    /// the 1.7B variants had `synthesize` return nil and every cloned sentence
+    /// come out in the system voice while the picker still showed the clip as
+    /// active. Kokoro is never a candidate — it cannot clone (`ref_audio` is a
+    /// named 400 there), which is exactly why `AudioModelPreset.all` is the
+    /// cloning-capable catalog. Pure, with the disk check injected.
+    static func resolvedCloneModel(configured: AudioModelPreset,
+                                   isDownloaded: (AudioModelPreset) -> Bool) -> AudioModelPreset? {
+        if configured.supportsCloning, isDownloaded(configured) { return configured }
+        return AudioModelPreset.all.first { $0.supportsCloning && isDownloaded($0) }
+    }
+
+    /// Can a cloned voice actually speak right now? The picker's enabled state and
+    /// the synthesizer read THIS, so the UI can't tick a voice that won't work.
+    static func cloneAvailable(configured: AudioModelPreset,
+                               isDownloaded: (AudioModelPreset) -> Bool) -> Bool {
+        resolvedCloneModel(configured: configured, isDownloaded: isDownloaded) != nil
+    }
+
+    /// The live-disk resolution (production seam).
+    @MainActor
+    static func resolvedCloneModel() -> AudioModelPreset? {
+        resolvedCloneModel(configured: AudioGenSettings.load().resolvedModel,
+                           isDownloaded: bundleOnDisk)
+    }
+
+    /// Is a cloning backend ready? (Was "is the configured one on disk", which
+    /// ignored every other downloaded variant.)
     @MainActor
     static func ttsModelDownloaded() -> Bool {
-        ServerManager.resolveModelDir(repo: AudioGenSettings.load().resolvedModel.repo) != nil
+        resolvedCloneModel() != nil
+    }
+
+    /// Is the Kokoro checkpoint ready?
+    @MainActor
+    static func kokoroModelDownloaded() -> Bool {
+        bundleOnDisk(AudioModelPreset.kokoro82M)
     }
 
     /// The Settings ▸ Voice "Choose file…" flow, reused by the picker menu:

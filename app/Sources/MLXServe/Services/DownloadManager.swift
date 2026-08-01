@@ -43,11 +43,15 @@ class DownloadManager: ObservableObject {
         }
     }
 
-    let modelsDir: String = {
-        let path = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
-        try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
-        return path
-    }()
+    let modelsDir: String
+
+    /// `modelsRoot` exists so the download loop can be driven against a temp
+    /// dir in tests; the app always takes the default. Kept in sync with the
+    /// Zig resolver — `~/.mlx-serve/models` is the single source of truth.
+    init(modelsRoot: String = NSString(string: "~/.mlx-serve/models").expandingTildeInPath) {
+        try? FileManager.default.createDirectory(atPath: modelsRoot, withIntermediateDirectories: true)
+        modelsDir = modelsRoot
+    }
 
     // MARK: - Path resolution
     //
@@ -190,16 +194,38 @@ class DownloadManager: ObservableObject {
     }
 
     private nonisolated static func holdsModel(_ dir: String, fm: FileManager) -> Bool {
-        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) { return true }
-        // Diffusers-layout media models (Mage-Flow) ship weight SUBDIRS and a
-        // `model_index.json` root — NO top-level config.json. Without this a
-        // fully-downloaded Mage-Flow never resolves: the picker shows "Download"
-        // forever and a click reverts (files present → size-matched skip →
-        // instant finish → re-check still false).
-        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("model_index.json")) { return true }
+        if holdsWeightLayout(dir) { return true }
         // Recursive: a large GGUF quant's only `.gguf` files are nested shards
         // (`<quant>/<quant>-00001-of-00002.gguf`), so a shallow scan misses them.
         return !ggufQuantPaths(inDir: dir).isEmpty
+    }
+
+    /// True when `dir` holds a safetensors model of any layout we serve. The
+    /// ONE answer to "is this repo on disk?" for everything that isn't a GGUF —
+    /// `ServerManager.resolveModelDir` asks it too, because a second copy of the
+    /// marker list is exactly how the two sites drifted apart on klein 9B.
+    ///
+    /// Three shapes, each a fact about real repos rather than a preference:
+    /// standard MLX (`config.json`), diffusers (`model_index.json` + weight
+    /// subdirs, Mage-Flow), and CONFIGLESS weight subdirs — no root json at all,
+    /// which is what `mlx-community/flux2-klein-9b-4bit` ships. Gating on the
+    /// root markers made its complete 8.9 GB download read as absent forever
+    /// (the Kokoro-vs-`tts()` bug: the pane offers Download, the click reverts).
+    /// The server has the same problem and solves it the same way — it
+    /// classifies that repo from the DiT's weight NAMES (`peekMfluxFlux2`), not
+    /// from a root file.
+    nonisolated static func holdsWeightLayout(_ dir: String) -> Bool {
+        let fm = FileManager.default
+        for marker in ["config.json", "model_index.json"] {
+            if fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) { return true }
+        }
+        // A `transformer/` holding real weights. Deliberately not "has the
+        // subdir": a download that got as far as creating the folder must still
+        // read as incomplete, and an in-flight transfer's `.partial` is not a
+        // weight. The DiT dir is the narrowest marker that no chat model has.
+        let dit = (dir as NSString).appendingPathComponent("transformer")
+        let shards = (try? fm.contentsOfDirectory(atPath: dit)) ?? []
+        return shards.contains { $0.hasSuffix(".safetensors") }
     }
 
     /// File size in bytes, resolving symlinks first. Hugging Face snapshots
@@ -506,7 +532,8 @@ class DownloadManager: ObservableObject {
         existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
     }
 
-    func download(repoId: String, selection: FileSelection = .chatDefault) async {
+    func download(repoId: String, selection: FileSelection = .chatDefault,
+                  alertOnFailure: Bool = true) async {
         let destDir = newLayoutDir(for: repoId)
 
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
@@ -520,7 +547,7 @@ class DownloadManager: ObservableObject {
             // it, silently dropping the sidecar (and the model's spec-decode
             // speedup). `selectNeededFiles` keeps top-level files + mtp/ only.
             let listURL = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true")!
-            let (listData, _) = try await URLSession.shared.data(from: listURL)
+            let (listData, _) = try await DownloadSession.shared.data(for: Self.hfApiRequest(listURL))
             guard let files = try JSONSerialization.jsonObject(with: listData) as? [[String: Any]] else {
                 throw URLError(.cannotParseResponse)
             }
@@ -574,46 +601,26 @@ class DownloadManager: ObservableObject {
                 for attempt in 0..<maxRetries {
                     try Task.checkCancellation()
 
-                    // Check for existing partial download
-                    let existingBytes: Int64
-                    if let attrs = try? FileManager.default.attributesOfItem(atPath: partialPath),
-                       let size = attrs[.size] as? Int64, size > 0 {
-                        existingBytes = size
+                    // Bytes already banked for this file — the chunk sidecar's
+                    // total after an interrupted multi-connection run, else the
+                    // plain `.partial` size.
+                    let existingBytes = ChunkedFileDownloader.resumableBytes(partialPath: partialPath, fileSize: fileSize)
+                    if existingBytes > 0 {
                         downloads[repoId]?.statusText = "Resuming \(filePath) from \(formatBytes(existingBytes))..."
                         downloads[repoId]?.fileProgress = fileSize > 0 ? Double(existingBytes) / Double(fileSize) : 0
-                    } else {
-                        existingBytes = 0
-                    }
-
-                    // Create or open partial file
-                    let fm = FileManager.default
-                    if !fm.fileExists(atPath: partialPath) {
-                        fm.createFile(atPath: partialPath, contents: nil)
-                    }
-                    guard let fileHandle = FileHandle(forWritingAtPath: partialPath) else {
-                        throw URLError(.cannotCreateFile)
-                    }
-                    try fileHandle.seekToEnd()
-
-                    var request = URLRequest(url: fileURL)
-                    if existingBytes > 0 {
-                        request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
                     }
 
                     do {
-                        try await downloadToFile(
-                            request: request,
-                            fileHandle: fileHandle,
+                        try await transferFile(
+                            url: fileURL,
+                            partialPath: partialPath,
                             repoId: repoId,
                             fileSize: fileSize,
-                            existingBytes: existingBytes,
                             baseDownloaded: downloadedSize,
                             totalSize: totalSize
                         )
 
-                        // Success — move partial to final destination
-                        try? fm.removeItem(atPath: destPath)
-                        try fm.moveItem(atPath: partialPath, toPath: destPath)
+                        try commitPartial(partialPath, to: destPath)
                         break
                     } catch {
                         // User-cancelled? Stop immediately. URLSession surfaces
@@ -647,7 +654,7 @@ class DownloadManager: ObservableObject {
             if Task.isCancelled { return }
             let message = error.localizedDescription
             downloads[repoId] = DownloadState(status: .failed, error: message)
-            if !(error is CancellationError) {
+            if alertOnFailure, !(error is CancellationError) {
                 presentFailureAlert(repoId: repoId, message: message)
             }
         }
@@ -661,7 +668,7 @@ class DownloadManager: ObservableObject {
     /// Sidecars (mmproj/tokenizer) are dropped. Empty on error.
     func listGgufFiles(repoId: String) async -> [String] {
         guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return [] }
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
+        guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let files = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
         return files
@@ -678,10 +685,51 @@ class DownloadManager: ObservableObject {
         let task = Task { @MainActor [weak self] in
             await self?.download(repoId: repoId)
             self?.finalizeIfCancelled(repoId: repoId)
+            await self?.downloadCompanionDrafterIfNeeded(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    // MARK: - Companion drafter
+    //
+    // The Gemma 4 assistant drafter is a DEPENDENCY of the model it pairs with,
+    // not something to shop for: it only ever works alongside one Gemma 4 size,
+    // and picking it yourself means knowing that. It used to have its own Model
+    // Browser destination, which mostly generated the question "which of these
+    // is mine?". Now it rides along with its target, the same way a ds4 GGUF
+    // quant pulls its MTP head (`resolveGgufDownloadFiles`).
+
+    /// The drafter repo that pairs with `repoId`, or nil when there isn't one.
+    ///
+    /// Dense Gemma 4 only. The MoE target (26B-A4B) is excluded on purpose —
+    /// the drafter REGRESSES decode there (verify pays expert routing, so the
+    /// server defaults it off on MoE targets), and fetching a checkpoint we
+    /// then refuse to use is worse than not having it. GGUF Gemma is excluded
+    /// too: it runs on llama.cpp, which has no drafter path at all.
+    nonisolated static func companionDrafterRepo(forRepoId repoId: String) -> String? {
+        let base = (repoId as NSString).lastPathComponent.lowercased()
+        guard base.contains("gemma-4") || base.contains("gemma4") else { return nil }
+        // A drafter must not pull itself — that download is an infinite regress.
+        guard !base.contains("assistant"), !base.contains("gguf") else { return nil }
+        // One parser for "which Gemma size is this?" — `gemmaVariantFor` is the
+        // same one the pairing and auto-sync paths use, so a new size can't be
+        // taught to one of them and not the other.
+        guard let variant = gemmaVariantFor(modelPath: base, isMoE: false), variant != .moe26B else { return nil }
+        return variant.drafterRepoId
+    }
+
+    /// Fetch `repoId`'s drafter after it lands, unless it's already here.
+    /// Failures stay silent (the Downloads pane still shows the failed row):
+    /// an alert naming a repo the user never asked for reads as a bug in the
+    /// download they DID ask for.
+    private func downloadCompanionDrafterIfNeeded(for repoId: String) async {
+        guard !Task.isCancelled,
+              downloads[repoId]?.status == .completed,
+              let drafter = Self.companionDrafterRepo(forRepoId: repoId),
+              !isReady(drafter) else { return }
+        await download(repoId: drafter, alertOnFailure: false)
     }
 
     // MARK: - Media bundles
@@ -807,7 +855,7 @@ class DownloadManager: ObservableObject {
     /// out of the selectable-quant lists) and return the MTP draft-head path.
     private func repoMtpSidecar(repoId: String) async -> String? {
         guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return nil }
-        guard let (data, response) = try? await URLSession.shared.data(from: url),
+        guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
         return Self.mtpSidecarPath(in: entries.compactMap { $0["path"] as? String })
@@ -962,6 +1010,10 @@ class DownloadManager: ObservableObject {
         guard fm.fileExists(atPath: path) else { return false }
         try? fm.removeItem(atPath: path)
         try? fm.removeItem(atPath: path + ".partial")
+        // The chunk sidecar travels with the `.partial` — leaving it behind
+        // would have the next download resume against a plan for bytes that
+        // are no longer there.
+        ChunkedResumeState.remove(forPartial: path + ".partial")
 
         let dir = (path as NSString).deletingLastPathComponent
         if ggufQuantPaths(inDir: dir).isEmpty,
@@ -1003,9 +1055,9 @@ class DownloadManager: ObservableObject {
             for rel in shards {
                 try Task.checkCancellation()
                 let fileURL = ggufShardURL(repoId: repoId, path: rel)
-                var headReq = URLRequest(url: fileURL)
+                var headReq = Self.hfApiRequest(fileURL)
                 headReq.httpMethod = "HEAD"
-                let (_, headResp) = try await URLSession.shared.data(for: headReq)
+                let (_, headResp) = try await DownloadSession.shared.data(for: headReq)
                 let sz: Int64 = {
                     guard let http = headResp as? HTTPURLResponse else { return 0 }
                     if let cl = http.value(forHTTPHeaderField: "Content-Length"), let n = Int64(cl) { return n }
@@ -1056,41 +1108,22 @@ class DownloadManager: ObservableObject {
                 for attempt in 0..<maxRetries {
                     try Task.checkCancellation()
 
-                    let existingBytes: Int64
-                    if let attrs = try? fm.attributesOfItem(atPath: partialPath),
-                       let size = attrs[.size] as? Int64, size > 0 {
-                        existingBytes = size
+                    let existingBytes = ChunkedFileDownloader.resumableBytes(partialPath: partialPath, fileSize: fileSize)
+                    if existingBytes > 0 {
                         downloads[repoId]?.statusText = "Resuming \(shardName) from \(formatBytes(existingBytes))..."
                         downloads[repoId]?.fileProgress = fileSize > 0 ? Double(existingBytes) / Double(fileSize) : 0
-                    } else {
-                        existingBytes = 0
-                    }
-
-                    if !fm.fileExists(atPath: partialPath) {
-                        fm.createFile(atPath: partialPath, contents: nil)
-                    }
-                    guard let fileHandle = FileHandle(forWritingAtPath: partialPath) else {
-                        throw URLError(.cannotCreateFile)
-                    }
-                    try fileHandle.seekToEnd()
-
-                    var request = URLRequest(url: fileURL)
-                    if existingBytes > 0 {
-                        request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
                     }
 
                     do {
-                        try await downloadToFile(
-                            request: request,
-                            fileHandle: fileHandle,
+                        try await transferFile(
+                            url: fileURL,
+                            partialPath: partialPath,
                             repoId: repoId,
                             fileSize: fileSize,
-                            existingBytes: existingBytes,
                             baseDownloaded: baseDownloaded,
                             totalSize: totalSize
                         )
-                        try? fm.removeItem(atPath: destPath)
-                        try fm.moveItem(atPath: partialPath, toPath: destPath)
+                        try commitPartial(partialPath, to: destPath)
                         break
                     } catch {
                         if Self.isCancellation(error) { throw CancellationError() }
@@ -1144,45 +1177,50 @@ class DownloadManager: ObservableObject {
         alert.runModal()
     }
 
-    /// Stream download directly to a file on disk (survives interruptions).
-    /// Uses dataTask so bytes are written as they arrive — the .partial file always
-    /// reflects how far we got, enabling Range-header resume on retry.
-    private func downloadToFile(
-        request: URLRequest,
-        fileHandle: FileHandle,
+    /// Fetch one file into its `.partial`, splitting it across
+    /// `DownloadChunking.configuredConnections()` ranged connections when it's
+    /// big enough to be worth it (`ChunkedFileDownloader` decides, and falls
+    /// back to a single stream on its own when the origin won't range). Bytes
+    /// land at their own offsets as they arrive, and per-chunk progress is
+    /// banked beside the partial, so an interrupted transfer resumes exactly the
+    /// hole it left.
+    private func transferFile(
+        url: URL,
+        partialPath: String,
         repoId: String,
         fileSize: Int64,
-        existingBytes: Int64,
         baseDownloaded: Int64,
         totalSize: Int64
     ) async throws {
-        let delegate = StreamingDelegate(fileHandle: fileHandle, existingBytes: existingBytes)
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 7200
-        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
-
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                delegate.onProgress = { [weak self] fileBytesTotal, speed in
-                    let fileProgress = fileSize > 0 ? Double(fileBytesTotal) / Double(fileSize) : 0
-                    let overallDownloaded = baseDownloaded + fileBytesTotal
-                    Task { @MainActor [weak self] in
-                        self?.downloads[repoId]?.fileProgress = fileProgress
-                        self?.downloads[repoId]?.bytesPerSecond = speed
-                        self?.downloads[repoId]?.progress = totalSize > 0 ? Double(overallDownloaded) / Double(totalSize) : 0
-                    }
-                }
-                delegate.onComplete = { error in
-                    if let error { continuation.resume(throwing: error) }
-                    else { continuation.resume() }
-                }
-                session.dataTask(with: request).resume()
+        let downloader = ChunkedFileDownloader(
+            url: url,
+            partialPath: partialPath,
+            fileSize: fileSize,
+            session: DownloadSession.shared,
+            headers: Self.hfHeaders(),
+            connections: DownloadChunking.configuredConnections()
+        )
+        downloader.onProgress = { [weak self] fileBytesTotal, speed in
+            let fileProgress = fileSize > 0 ? Double(fileBytesTotal) / Double(fileSize) : 0
+            let overallDownloaded = baseDownloaded + fileBytesTotal
+            Task { @MainActor [weak self] in
+                self?.downloads[repoId]?.fileProgress = fileProgress
+                self?.downloads[repoId]?.bytesPerSecond = speed
+                self?.downloads[repoId]?.progress = totalSize > 0 ? Double(overallDownloaded) / Double(totalSize) : 0
             }
-        } onCancel: {
-            session.invalidateAndCancel()
         }
+        try await downloader.run()
+    }
+
+    /// Move a finished `.partial` onto its final name and drop the chunk
+    /// sidecar — the two are written together and must be retired together, or
+    /// the next download of the same file resumes against a plan for bytes that
+    /// have already moved.
+    private func commitPartial(_ partialPath: String, to destPath: String) throws {
+        let fm = FileManager.default
+        try? fm.removeItem(atPath: destPath)
+        try fm.moveItem(atPath: partialPath, toPath: destPath)
+        ChunkedResumeState.remove(forPartial: partialPath)
     }
 
     /// Check whether a model has .partial files from an interrupted download.
@@ -1624,142 +1662,51 @@ class DownloadManager: ObservableObject {
         directorySize(path)
     }
 
+    // MARK: - Hugging Face auth
+
+    /// The Hugging Face token to send, or nil. `HF_TOKEN` mirrors the Zig CLI
+    /// (`cli.zig`'s curl prefix) and covers a terminal launch; the token file
+    /// `huggingface-cli login` writes is the one that actually works in the app,
+    /// because a bundle launched from Finder has NO shell environment. Buys
+    /// gated repos and a higher API rate limit — not speed.
+    nonisolated static func hfToken(environment: [String: String] = ProcessInfo.processInfo.environment,
+                                    home: String = NSHomeDirectory()) -> String? {
+        if let raw = environment["HF_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            return raw
+        }
+        var candidates: [String] = []
+        if let hfHome = environment["HF_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines), !hfHome.isEmpty {
+            candidates.append(((hfHome as NSString).expandingTildeInPath as NSString).appendingPathComponent("token"))
+        }
+        candidates.append(((home as NSString).appendingPathComponent(".cache/huggingface") as NSString)
+            .appendingPathComponent("token"))
+        for path in candidates {
+            guard let data = FileManager.default.contents(atPath: path),
+                  let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else { continue }
+            return raw
+        }
+        return nil
+    }
+
+    nonisolated static func hfHeaders(environment: [String: String] = ProcessInfo.processInfo.environment,
+                                      home: String = NSHomeDirectory()) -> [String: String] {
+        guard let token = hfToken(environment: environment, home: home) else { return [:] }
+        return ["Authorization": "Bearer \(token)"]
+    }
+
+    /// A GET against the HF API on the shared session, carrying the token when
+    /// we have one. Every listing call goes through here so a gated repo fails
+    /// the same way everywhere.
+    nonisolated static func hfApiRequest(_ url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        for (key, value) in hfHeaders() { request.setValue(value, forHTTPHeaderField: key) }
+        return request
+    }
+
     private func formatBytes(_ bytes: Int64) -> String {
         if bytes > 1_000_000_000 { return String(format: "%.1f GB", Double(bytes) / 1e9) }
         if bytes > 1_000_000 { return String(format: "%.0f MB", Double(bytes) / 1e6) }
         return "\(bytes) B"
-    }
-}
-
-// MARK: - Streaming Download Delegate
-
-/// Thrown when a download stalls (speed below threshold for too long) — triggers auto-retry.
-private struct DownloadStallError: Error, LocalizedError {
-    var errorDescription: String? { "Download stalled — server stopped sending data" }
-}
-
-/// Writes received data directly to a file handle as it arrives.
-/// If the server returns 200 instead of 206, truncates the file (Range was ignored).
-private class StreamingDelegate: NSObject, URLSessionDataDelegate {
-    let fileHandle: FileHandle
-    var existingBytes: Int64
-    var onProgress: ((Int64, Double) -> Void)?   // fileBytesTotal, speed
-    var onComplete: ((Error?) -> Void)?
-    private var bytesReceived: Int64 = 0
-    private var statusCode: Int = 0
-    private var writeError: Error?
-    private let startTime = Date()
-    private var lastProgressUpdate = Date.distantPast
-
-    // Stall detection — cancels the task if speed stays below threshold
-    private weak var activeTask: URLSessionDataTask?
-    private(set) var stalledOut = false
-    private var stallTimer: DispatchSourceTimer?
-    private var stallCheckBytes: Int64 = 0
-    private var slowSince: Date?
-    private static let stallSpeedThreshold: Double = 10_000  // 10 KB/s
-    private static let stallTimeout: TimeInterval = 30
-
-    init(fileHandle: FileHandle, existingBytes: Int64) {
-        self.fileHandle = fileHandle
-        self.existingBytes = existingBytes
-    }
-
-    deinit {
-        stallTimer?.cancel()
-    }
-
-    private func startStallDetection(task: URLSessionDataTask) {
-        activeTask = task
-        stallCheckBytes = bytesReceived
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + 5, repeating: 5)
-        timer.setEventHandler { [weak self] in
-            self?.checkForStall()
-        }
-        timer.resume()
-        stallTimer = timer
-    }
-
-    private func checkForStall() {
-        let currentBytes = bytesReceived
-        let bytesSinceCheck = currentBytes - stallCheckBytes
-        let recentSpeed = Double(bytesSinceCheck) / 5.0  // ~5s interval
-        stallCheckBytes = currentBytes
-
-        // Push real-time speed to UI (prevents stale speed when data stops flowing)
-        onProgress?(existingBytes + currentBytes, recentSpeed)
-
-        if recentSpeed < Self.stallSpeedThreshold {
-            if slowSince == nil {
-                slowSince = Date()
-            } else if Date().timeIntervalSince(slowSince!) > Self.stallTimeout {
-                stalledOut = true
-                activeTask?.cancel()
-                stallTimer?.cancel()
-            }
-        } else {
-            slowSince = nil
-        }
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
-                    didReceive response: URLResponse,
-                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if statusCode == 200 {
-            // Server ignored Range header — sending full file; start over
-            existingBytes = 0
-            do {
-                try fileHandle.truncate(atOffset: 0)
-                try fileHandle.seek(toOffset: 0)
-            } catch {
-                writeError = error
-                completionHandler(.cancel)
-                return
-            }
-            startStallDetection(task: dataTask)
-            completionHandler(.allow)
-        } else if statusCode == 206 {
-            startStallDetection(task: dataTask)
-            completionHandler(.allow)
-        } else {
-            completionHandler(.cancel)
-        }
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard writeError == nil else { return }
-        do {
-            try fileHandle.write(contentsOf: data)
-        } catch {
-            writeError = error
-            dataTask.cancel()
-            return
-        }
-        bytesReceived += Int64(data.count)
-        let now = Date()
-        guard now.timeIntervalSince(lastProgressUpdate) > 0.25 else { return }
-        lastProgressUpdate = now
-        let elapsed = now.timeIntervalSince(startTime)
-        let speed = elapsed > 0 ? Double(bytesReceived) / elapsed : 0
-        onProgress?(existingBytes + bytesReceived, speed)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        stallTimer?.cancel()
-        try? fileHandle.close()
-        let effectiveError = writeError ?? error
-        if stalledOut {
-            onComplete?(DownloadStallError())
-        } else if effectiveError != nil {
-            onComplete?(effectiveError)
-        } else if statusCode != 0 && statusCode != 200 && statusCode != 206 {
-            onComplete?(URLError(.badServerResponse, userInfo: [
-                NSLocalizedDescriptionKey: "HTTP \(statusCode)"
-            ]))
-        } else {
-            onComplete?(nil)
-        }
     }
 }

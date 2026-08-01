@@ -444,7 +444,7 @@ pub const Slot = struct {
         // slice makes the hot prefix cache treat the model as hybrid and
         // cold-prefill every request.
         var ssm_entries: ?[]SSMCacheEntry = null;
-        if (!is_embedded and (config.has_hybrid_layers or config.full_attention_interval > 0)) {
+        if (!is_embedded and config.needsSsmEntries()) {
             const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
             for (entries) |*e| {
                 e.* = .{
@@ -2305,7 +2305,17 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     // CAVEAT: the KV cache scales with --ctx-size, which this guard doesn't see;
     // a very large context can still exceed this margin (follow-up: plumb ctx +
     // kv_quant to size KV precisely). Bypass with --skip-mem-preflight.
-    const headroom: u64 = weights_bytes / 8 + 1024 * 1024 * 1024;
+    // The proportional term is CAPPED: headroom pays for warmup buffers and a
+    // baseline KV cache, and neither scales with a MoE's TOTAL weights (our
+    // 109.7 GB DeepSeek-V4 mirror activates 13B). Uncapped, weights/8 demanded
+    // 14.7 GB on that model — 124.4 GB total — which a 128 GB Mac cannot have,
+    // so the guard refused the flagship checkpoint on exactly the hardware its
+    // model card names, while --skip-mem-preflight booted it repeatedly and
+    // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
+    // margin for every model under 48 GB (where it was tuned) and stays inside
+    // the measured envelope above it.
+    const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
+    const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
     return avail_bytes < weights_bytes + headroom;
 }
 
@@ -2326,6 +2336,19 @@ test "memInsufficientForLoad: headroom + unknown-query guards" {
     // Unknown figures (query failed / size unknown) → never block.
     try std.testing.expect(!memInsufficientForLoad(0, 44 * GB));
     try std.testing.expect(!memInsufficientForLoad(42 * GB, 0));
+
+    // A PROPORTIONAL margin becomes impossible at the top of the range. Our own
+    // DeepSeek-V4-Flash mirror is 109.7 GB of weights and a 128 GB Mac reports
+    // ~118 GB available with nothing else loaded — but weights/8 demanded 14.7
+    // GB of headroom, i.e. 124.4 GB, which that machine cannot have. The guard
+    // refused to load the flagship checkpoint on exactly the hardware its model
+    // card names, while `--skip-mem-preflight` booted it repeatedly and served
+    // 6.7K-token prefills with ~8.6 GB to spare. Headroom covers warmup
+    // buffers + a baseline KV cache, and neither scales with a MoE's total
+    // weights (13B active here) — so the proportional term is CAPPED.
+    try std.testing.expect(!memInsufficientForLoad(109_730 * MB, 118_330 * MB));
+    // Still refuses when the box genuinely cannot fit it.
+    try std.testing.expect(memInsufficientForLoad(109_730 * MB, 112 * GB));
 }
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -2437,20 +2460,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
-    {
-        var dev = mlx.mlx_device{ .ctx = null };
-        _ = mlx.mlx_get_default_device(&dev);
-        var info = mlx.mlx_device_info_new();
-        if (mlx.mlx_device_info_get(&info, dev) == 0) {
-            var max_rec: usize = 0;
-            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-                var old_limit: usize = 0;
-                _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
-                log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
-            }
-            _ = mlx.mlx_device_info_free(info);
-        }
-    }
+    // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
+    // runUnloadRequest so `fit` capacity tracks the live set across
+    // load/unload churn (this early call covers warmup's forwards).
+    logWiredPolicy(mlx.applyWiredPolicy());
 
     // JIT-compile activation kernels. These are bound to THIS thread's mlx
     // stream — that's exactly the point of doing them here. Skipped entirely
@@ -2489,6 +2502,92 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const slice = std.mem.sliceTo(raw, 0);
         if (std.mem.eql(u8, slice, "1")) {
             xfm_ptr.compileForward();
+        }
+    }
+
+    // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward
+    // passes back to back, with NO sampling, detokenization, stop-checking or
+    // cache bookkeeping around them. The server reports `predicted_ms` around
+    // the whole decode LOOP, so this is the only way to say how much of a
+    // token is the model and how much is everything else. Resets the KV cache
+    // afterwards so the probe cannot pollute real requests.
+    if (std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH")) |raw| {
+        const n = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
+        if (n > 0) {
+            const io_u = @import("io_util.zig");
+            const tio = std.Io.Threaded.global_single_threaded.io();
+            var ctx = xfm_ptr.defaultCtx();
+            const tok: i32 = 1;
+            const tsh = [_]c_int{ 1, 1 };
+            // Warm: first forward pays kernel JIT + lazy weight materialization.
+            for (0..3) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+            }
+            // Split CPU graph CONSTRUCTION from GPU execution. MLX is lazy, so
+            // `forwardWith` only issues ops — if that half dominates, the token
+            // is bounded by op count / FFI overhead, not by memory bandwidth,
+            // and no kernel-level optimization can reach it.
+            var sw = io_u.Stopwatch.init(tio);
+            var build_ns: u64 = 0;
+            var eval_ns: u64 = 0;
+            var ops_total: u64 = 0;
+            var done: usize = 0;
+            for (0..n) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const ops_before = mlx.op_count.load(.monotonic);
+                var swb = io_u.Stopwatch.init(tio);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                build_ns += swb.read();
+                ops_total += mlx.op_count.load(.monotonic) - ops_before;
+                var swe = io_u.Stopwatch.init(tio);
+                _ = mlx.mlx_array_eval(lg);
+                eval_ns += swe.read();
+                _ = mlx.mlx_array_free(lg);
+                done += 1;
+            }
+            const dn: f64 = @floatFromInt(@max(done, 1));
+            const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
+                done,
+                ms,
+                @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(ops_total)) / dn,
+            });
+
+            // Same forward with the vocab projection suppressed. lm_head is
+            // terminal — nothing downstream depends on it — so dropping it
+            // cannot change the work the rest of the graph does, which makes
+            // this the one sound ablation in the probe.
+            ctx.skip_lm_head = true;
+            for (0..3) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+            }
+            var sw_nolm = io_u.Stopwatch.init(tio);
+            var done_nolm: usize = 0;
+            for (0..n) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+                done_nolm += 1;
+            }
+            const ms_nolm = @as(f64, @floatFromInt(sw_nolm.read())) / 1.0e6 / @as(f64, @floatFromInt(@max(done_nolm, 1)));
+            ctx.skip_lm_head = false;
+            log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
+            xfm_ptr.diagProjBench(20, &ctx);
+            log.info("[fwd-ubench] done\n", .{});
+            xfm_ptr.resetCache() catch {};
         }
     }
 
@@ -3113,6 +3212,14 @@ fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8)
 /// `req.entry`, mark ready, and broadcast `req.done_cond` so the conn
 /// thread wakes. On failure, mark `.error_state` so future ensureLoaded
 /// calls fail fast; the conn thread surfaces a 500.
+fn logWiredPolicy(r: mlx.WiredPolicyResult) void {
+    if (r.target) |t| {
+        log.info("[wired] mode={s} limit={d} MB\n", .{ @tagName(r.mode), t / (1024 * 1024) });
+    } else {
+        log.debug("[wired] mode={s} declined (no gpu / empty live set)\n", .{@tagName(r.mode)});
+    }
+}
+
 fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
     // never holds the old + new model at once. unloadResident() drops
@@ -3148,6 +3255,9 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
         req.entry.id,
         @as(f64, @floatFromInt(req.entry.bytes_resident)) / 1_073_741_824.0,
     });
+    // Re-apply so `fit` capacity covers everything this load brought in
+    // (MTP head / drafter / vision land after the mid-load apply).
+    logWiredPolicy(mlx.applyWiredPolicy());
     finishLoadRequest(sch, req, null);
 }
 
@@ -3236,6 +3346,11 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
     sch.registry.mutex.unlock(sch.io);
+
+    // Shrink `fit` capacity back to the surviving live set — leaving the
+    // freed model's headroom in place is exactly the per-transient-commit
+    // configuration the policy exists to avoid.
+    logWiredPolicy(mlx.applyWiredPolicy());
 
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
@@ -3350,6 +3465,12 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (hc_opt) |hc| {
         if (stream_opt) |s| hc.flushPendingDisk(s);
     }
+    // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
+    // clear inside `Generator.advanceStep` can't cover the tail of a turn, and
+    // MLX parks freed buffers in a size-keyed pool rather than releasing them —
+    // so without this a short turn hands everything it stranded to the next one
+    // and the process footprint ratchets across a session (issue #110).
+    _ = mlx.mlx_clear_cache();
 }
 
 /// ds4 prefill: create a session sized to the configured ctx and sync it to
@@ -3734,9 +3855,22 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.capture_hidden = null;
     slot.ctx.kv_attn_fused = slot.kv_attn_fused;
 
-    const use_mtp = slot.enable_mtp and slot.mtp != null;
-    const use_drafter = !use_mtp and slot.enable_drafter and slot.drafter != null;
-    const use_pld = !use_mtp and !use_drafter and slot.enable_pld;
+    // deepseek_v4: PLD/drafter/qwen-MTP verify passes through forwardWith
+    // would APPEND draft tokens to module-owned state and corrupt every later
+    // step, so their handles stay off here. The request's spec INTENT is
+    // passed through anyway (as pld_enabled) so the Generator chokepoint —
+    // the single authority since the DSpark port — can arm dsv4's OWN draft
+    // mode (stage-bearing checkpoint + clean-greedy request) or zero
+    // everything. skip_lazy_preforward deliberately ignores the intent bit:
+    // a non-armed dsv4 request keeps today's synchronous-t1 serial init.
+    const is_dsv4 = slot.model.transformer != null and slot.model.transformer.?.dsv4 != null;
+    const use_mtp = !is_dsv4 and slot.enable_mtp and slot.mtp != null;
+    const use_drafter = !use_mtp and !is_dsv4 and slot.enable_drafter and slot.drafter != null;
+    const use_pld = !use_mtp and !use_drafter and !is_dsv4 and slot.enable_pld;
+    // DSpark rides the MTP flag alone (the "model's native head" semantics):
+    // the server defaults enable_mtp ON for a stage-bearing dsv4, the n-gram
+    // prompt gate never touches it, and enable_mtp:false opts out.
+    const dsv4_spec_intent = is_dsv4 and slot.enable_mtp;
 
     // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
     // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on
@@ -3794,7 +3928,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         sampling,
         slot.eos_token_ids,
         .{
-            .pld_enabled = use_pld,
+            .pld_enabled = use_pld or dsv4_spec_intent,
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,
@@ -3816,6 +3950,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // chunks so a ghost 40K prefill stops within one chunk.
             .cancel_flag = &slot.cancelled,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            // Init's argmax-only gate must see logprobs BEFORE the split-
+            // prefill final-token forward runs — a post-init field write is
+            // too late for the certified lm_head prune.
+            .logprobs_n = slot.logprobs_n,
         },
     );
     gen.timeout_ns = slot.timeout_ns;
@@ -3917,6 +4055,38 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 }
 
+/// Which spec mode a decode tick drives for a slot.
+pub const SpecTickMode = enum { dspark, mtp, drafter, pld, regular };
+
+/// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
+/// wish; the generator-side values carry what `Generator.initWithOptions`
+/// actually armed (after its deepseek_v4 spec chokepoint). Every arm must
+/// require BOTH: dispatching on the slot flag alone is the exact wiring that
+/// put PLD verify forwards through a dsv4 trunk (2026-07-31) — mtp/drafter
+/// had their generator-state conjunct (`gen.mtp != null`), model-less PLD
+/// did not, so runPrefill's `use_pld=false` shaped init options while every
+/// tick still called `gen.nextPld`.
+///
+/// DSpark (dsv4's own draft mode) wins first and rides the MTP flag alone —
+/// the "model's native head" semantics: defaulted ON server-side for a
+/// stage-bearing dsv4, never n-gram prompt-gated, `enable_mtp:false` opts
+/// out. The chokepoint only arms it after zeroing every other spec.
+pub fn specTickMode(
+    slot_enable_mtp: bool,
+    gen_has_mtp: bool,
+    slot_enable_drafter: bool,
+    gen_has_drafter: bool,
+    slot_enable_pld: bool,
+    gen_pld_enabled: bool,
+    gen_dspark_enabled: bool,
+) SpecTickMode {
+    if (gen_dspark_enabled and slot_enable_mtp) return .dspark;
+    if (slot_enable_mtp and gen_has_mtp) return .mtp;
+    if (slot_enable_drafter and gen_has_drafter) return .drafter;
+    if (slot_enable_pld and gen_pld_enabled) return .pld;
+    return .regular;
+}
+
 /// Drive one Generator step (regular / PLD / drafter) and push emitted
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
@@ -3960,7 +4130,39 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    if (slot.enable_mtp and gen.mtp != null) {
+    const tick_mode = specTickMode(
+        slot.enable_mtp,
+        gen.mtp != null,
+        slot.enable_drafter,
+        gen.drafter != null,
+        slot.enable_pld,
+        gen.pld_enabled,
+        gen.dspark_enabled,
+    );
+    if (tick_mode == .dspark) {
+        const result = try gen.nextDspark(slot.allocator);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
+        }
+        defer slot.allocator.free(result.?.tokens);
+        for (result.?.tokens) |t| {
+            if (slot.cancelled.load(.acquire)) return;
+            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+                finishSlot(sch, slot, "stop");
+                return;
+            }
+            slot.pushToken(t);
+            slot.completion_tokens = gen.completion_tokens;
+            if (t != 0) slot.was_pad_only = false;
+            if (slot.completion_tokens >= slot.max_tokens) {
+                finishSlot(sch, slot, "length");
+                return;
+            }
+        }
+        return;
+    }
+    if (tick_mode == .mtp) {
         const result = try gen.nextMtp(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -3984,7 +4186,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    if (slot.enable_drafter and gen.drafter != null) {
+    if (tick_mode == .drafter) {
         const result = try gen.nextDrafter(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -4008,7 +4210,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    if (slot.enable_pld) {
+    if (tick_mode == .pld) {
         const result = try gen.nextPld(slot.allocator, slot.pld_draft_len, slot.pld_key_len);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -4161,8 +4363,7 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             slot.markError(@errorName(err));
             continue;
         };
-        gen.completion_tokens += 1;
-        gen.step += 1;
+        gen.advanceStep(1);
         gen.next_token_id = @intCast(val);
 
         // Stop checks (mirrors Generator.checkStop).
@@ -4227,6 +4428,36 @@ test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
         cfg.num_experts = 8;
         try testing.expect(!modelBatchable(&cfg));
     }
+}
+
+test "modelBatchable: a PARSED deepseek_v4 config can never route to batched decode" {
+    // dsv4 is serial-only (module-owned per-request state); its exclusion
+    // from `forwardBatchedDecode` rides isMoe(), so the parse arm must never
+    // regress to leaving num_experts unset. Parse a minimal real-shaped
+    // config rather than hand-building the struct.
+    const json =
+        \\{"model_type":"deepseek_v4","hidden_size":64,"num_hidden_layers":4,
+        \\ "num_attention_heads":4,"num_key_value_heads":1,"head_dim":96,
+        \\ "qk_rope_head_dim":32,"q_lora_rank":32,"o_lora_rank":16,"o_groups":2,
+        \\ "sliding_window":8,"compress_ratios":[0,4,16,4],
+        \\ "compress_rope_theta":160000.0,"rope_theta":10000.0,
+        \\ "rope_scaling":{"factor":16,"original_max_position_embeddings":64,
+        \\  "beta_fast":32,"beta_slow":1,"type":"yarn"},
+        \\ "index_n_heads":2,"index_head_dim":32,"index_topk":4,
+        \\ "n_routed_experts":256,"num_experts_per_tok":6,"num_hash_layers":1,
+        \\ "n_shared_experts":1,"moe_intermediate_size":32,
+        \\ "routed_scaling_factor":1.5,"swiglu_limit":10.0,"norm_topk_prob":true,
+        \\ "scoring_func":"sqrtsoftplus","topk_method":"noaux_tc","hc_mult":4,
+        \\ "hc_sinkhorn_iters":20,"hc_eps":1e-6,"rms_norm_eps":1e-6,
+        \\ "vocab_size":64,"max_position_embeddings":4096}
+    ;
+    const cfg = try model_mod.parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("deepseek_v4", cfg.model_type);
+    try testing.expect(cfg.isMoe());
+    try testing.expect(!modelBatchable(&cfg));
+    // Prefix-cache exclusion rides the same parsed config (module-owned
+    // decode state — see prefix_cache.shouldUse).
+    try testing.expect(!prefix_cache_mod.HotPrefixCache.shouldUse(&cfg, true));
 }
 
 test "modelBatchable permits pure-attention" {
@@ -4320,4 +4551,51 @@ test "loopStopReason: a degenerate tail cut reports length, a healthy tail is no
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("length", reason);
+}
+
+test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
+    // The dsv4 PLD-corruption wiring class (2026-07-31): runPrefill's
+    // per-site guard computed use_pld=false for a deepseek_v4 slot and wired
+    // it into Generator init options — but the decode tick dispatched on
+    // `slot.enable_pld` alone, so every tick still called `gen.nextPld` and
+    // its verify forward appended draft tokens into dsv4's module-owned
+    // state with no rollback (mangled DSML, log 166348-166361). mtp/drafter
+    // were saved only by their accidental generator-state conjunct
+    // (`gen.mtp != null`); PLD has no model handle, so its conjunct must be
+    // the generator's post-chokepoint `pld_enabled`.
+
+    // Slot wants PLD, generator was NOT armed (chokepoint or per-site guard
+    // flipped it off) → the tick must run the regular path.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false));
+    // Slot wants PLD and init armed it → PLD runs.
+    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, true, true, false));
+    // Generator armed but the slot never asked (stale generator state must
+    // not resurrect spec either) → regular.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false));
+
+    // mtp/drafter keep their existing both-sides contract.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false));
+
+    // Priority: MTP > drafter > PLD (the spec-dispatch rule).
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, true, true, true, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, true, true, false));
+
+    // DSpark: the generator's post-chokepoint bit AND the slot's MTP flag —
+    // the "model's native head" semantics (server defaults it ON for a
+    // stage-bearing dsv4; the n-gram gate never touches enable_mtp). It wins
+    // over everything (a set mtp/pld generator conjunct alongside dspark is
+    // unreachable by the chokepoint's construction, but priority must hold).
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, false, false, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, true, true, true, true));
+    // PLD/drafter intent alone never drives dspark (their flags are
+    // prompt-gated — riding them made engagement depend on the n-gram gate).
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, true));
+    // Generator armed but the request opted enable_mtp off → serial.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, true));
+    // Slot asked, generator never armed dspark → falls through as before.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
 }

@@ -323,6 +323,26 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertEqual(c.state, .listening)                  // mic reopened for next turn
     }
 
+    func testSessionRepublishAfterStreamEndsDoesNotRespeakTheAnswer() async {
+        // The Combine feed re-fires on ANY chatSessions publish (another surface
+        // touching a session, auto-title, …). When one lands after the stream
+        // ended but before the queue drains — state still `.speaking`, same
+        // message — the answer must not be enqueued a second time. Live bug:
+        // the whole response was spoken twice.
+        let (c, rec, syn) = make()
+        await beginAndSubmit(c, rec)
+        c.observeAssistant(messageId: "A", content: "One. Two. Done", generating: true)
+        c.observeAssistant(messageId: "A", content: "One. Two. Done", generating: false)
+        let spoken = syn.enqueued
+        XCTAssertEqual(c.state, .speaking)                   // queue not drained yet
+
+        c.observeAssistant(messageId: "A", content: "One. Two. Done", generating: false)
+        XCTAssertEqual(syn.enqueued, spoken, "a republish of the finished answer must not re-speak it")
+
+        syn.simulateDrain()
+        XCTAssertEqual(c.state, .listening)
+    }
+
     func testReasoningIsNeverSpoken() async {
         // The controller only ever receives visible `content`; thinking text is a
         // separate field upstream and never routed here.
@@ -870,5 +890,50 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertFalse(allowed)
         XCTAssertNil(c.pendingApproval)
         XCTAssertEqual(c.state, .idle)
+    }
+
+    // MARK: - Per-session binding (voice is ONE instance, bound to ONE chat)
+
+    /// Voice is a single physical instance (one mic, one synthesizer); what is
+    /// per-session is the BINDING — the conversation voice is in. The orb and
+    /// the composer toggle's on-tint render only in the bound chat's tab, so
+    /// enabling voice in agent 1's chat doesn't light up agent 2's or a new one.
+    func testBeginBindsVoiceToItsLaunchSession() async {
+        let (c, _, _, _, sid) = makeRunnable()
+        XCTAssertNil(c.boundSessionId, "no binding before voice starts")
+        _ = await c.begin()
+        XCTAssertEqual(c.boundSessionId, sid, "begin binds to the turn context's session")
+    }
+
+    func testEndClearsTheBinding() async {
+        let (c, _, _, _, _) = makeRunnable()
+        _ = await c.begin()
+        c.end()
+        XCTAssertNil(c.boundSessionId, "an ended voice session owns no chat")
+    }
+
+    /// A spoken turn re-binds to wherever the turn actually routed — this is
+    /// how a "hey mickey" handover moves the orb to mickey's thread (the turn
+    /// context resolves the new agent's own session).
+    func testSubmittedTurnRebindsToTheTurnsSession() async {
+        let (c, rec, _, runner, _) = makeRunnable()
+        _ = await c.begin()
+        let moved = UUID()
+        c.turnContext = { (moved, nil) }      // handover: context now resolves elsewhere
+        rec.onFinalTranscript?("hello there")
+        XCTAssertEqual(runner.calls.last?.sessionId, moved)
+        XCTAssertEqual(c.boundSessionId, moved, "the binding follows the turn")
+    }
+
+    /// The pure decision the orb + toggle render from.
+    func testVoiceOwnedHereScopesToTheBoundSession() {
+        let bound = UUID(), other = UUID()
+        XCTAssertTrue(VoiceModeController.voiceOwnedHere(isActive: true, boundSessionId: bound, sessionId: bound))
+        XCTAssertFalse(VoiceModeController.voiceOwnedHere(isActive: true, boundSessionId: bound, sessionId: other),
+                       "another chat's tab shows voice OFF")
+        XCTAssertFalse(VoiceModeController.voiceOwnedHere(isActive: false, boundSessionId: bound, sessionId: bound),
+                       "inactive voice is owned nowhere")
+        XCTAssertTrue(VoiceModeController.voiceOwnedHere(isActive: true, boundSessionId: nil, sessionId: other),
+                      "an active-but-unbound voice (defensive) shows everywhere rather than becoming invisible")
     }
 }

@@ -892,6 +892,17 @@ private struct ServerSectionContent: View {
                 .frame(minWidth: 180)
             }
         }
+        if let m = meta["logToFile"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.logToFile)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.logToFile)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,
@@ -1210,6 +1221,19 @@ private struct SpecDecodeSectionContent: View {
                     .disabled(!appState.serverOptions.enableMTP)
             }
         }
+        // DSpark is DeepSeek-V4's own draft — independent of the Qwen MTP
+        // toggles above, so it is never disabled by them.
+        if let m = meta["enableDSpark"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.enableDSpark)
+            ) {
+                Toggle("", isOn: opts.enableDSpark)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
     }
 }
 
@@ -1259,6 +1283,17 @@ private struct PerformanceSectionContent: View {
                     Text("\(appState.serverOptions.maxConcurrent)")
                         .font(.body.monospacedDigit())
                 }
+            }
+        }
+        if let m = meta["decodeAttnQuant"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.decodeAttnQuant)
+            ) {
+                Toggle("", isOn: opts.decodeAttnQuant)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
             }
         }
         if let m = meta["kvQuant"] {
@@ -1458,14 +1493,16 @@ private struct Ds4PerformanceSectionContent: View {
 ///     batch=1 (verify expert-routing penalty), so PLD is the recommended
 ///     path. Per-request `enable_drafter:true` still works.
 ///   - **Unavailable** → disabled toggle, with a one-line explainer naming
-///     the reason (non-Gemma-4 target, or no matching drafter on disk). When
-///     it's a missing checkpoint, a "Browse" button jumps to the Model
-///     Browser.
+///     the reason (non-Gemma-4 target, or no matching drafter on disk). A
+///     missing checkpoint gets a "Download drafter" button right here — the
+///     Model Browser's drafter catalog is gone (the drafter now rides along
+///     with its target, `DownloadManager.companionDrafterRepo`), and HF search
+///     filters drafter repos out, so this is the only way to fetch one for a
+///     Gemma 4 that landed before that.
 private struct DrafterRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
-    @Environment(\.openWindow) private var openWindow
 
     private var dirty: ServerLaunchDirty {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
@@ -1494,7 +1531,7 @@ private struct DrafterRow: View {
 
     private var explainer: String {
         if let r = recommended {
-            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). Auto-discovered: \(r.url.lastPathComponent)."
+            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). On automatically: \(r.url.lastPathComponent)."
         }
         // Server hasn't reported a model yet — either it's not started or
         // we're mid-handshake. Don't claim the architecture is wrong.
@@ -1513,7 +1550,16 @@ private struct DrafterRow: View {
         if !targetIsGemma4 {
             return "Drafter is Gemma 4 only."
         }
-        return "Drafter checkpoint not found. Download from the Model Browser."
+        if isMoeTarget {
+            return "No drafter for the MoE Gemma 4 — it regresses decode there. Use PLD instead."
+        }
+        return "Drafter checkpoint not found. New Gemma 4 downloads bring it automatically."
+    }
+
+    /// The drafter this target would pair with, whether or not it's on disk —
+    /// what the Download button fetches.
+    private var pairedDrafterRepo: String? {
+        DownloadManager.companionDrafterRepo(forRepoId: appState.selectedModelPath)
     }
 
     private var toggleEnabled: Bool { recommended != nil }
@@ -1564,14 +1610,18 @@ private struct DrafterRow: View {
                     }
                 }
                 .padding(.top, 2)
-            } else if server.modelInfo != nil && targetIsGemma4 {
-                // Server has a Gemma 4 target loaded but the matching drafter
-                // isn't on disk. Jump straight to the Model Browser so the
-                // user can pick the right `*-it-assistant-bf16` repo.
-                Button("Browse") {
-                    AppActivation.openWindow(id: "modelBrowser", using: openWindow)
+            } else if server.modelInfo != nil, targetIsGemma4, let repo = pairedDrafterRepo {
+                // A dense Gemma 4 is loaded but its drafter isn't on disk —
+                // a model downloaded before drafters rode along. Fetch it from
+                // here: the browser has no drafter catalog any more, and HF
+                // search filters these repos out, so a "Browse" button would
+                // send the user somewhere that can't help.
+                Button(downloads.downloads[repo]?.status == .downloading
+                       ? "Downloading drafter…" : "Download drafter") {
+                    downloads.start(repoId: repo) { appState.refreshModels() }
                 }
                 .controlSize(.small)
+                .disabled(downloads.downloads[repo]?.status == .downloading)
                 .padding(.top, 2)
             }
         }
@@ -1579,9 +1629,14 @@ private struct DrafterRow: View {
 
     @ViewBuilder
     private var control: some View {
+        // Off writes `drafterOptOut` as well as clearing the path: the app pairs
+        // a dense Gemma 4 with its drafter on its own now, so an empty path
+        // alone would read as "not paired yet" and pair itself again at the next
+        // model switch. Turning it back on clears the opt-out.
         let isOn = Binding<Bool>(
             get: { !appState.serverOptions.drafterPath.isEmpty },
             set: { newValue in
+                appState.serverOptions.drafterOptOut = !newValue
                 if newValue {
                     if let r = recommended {
                         appState.serverOptions.drafterPath = r.url.path
@@ -1844,13 +1899,130 @@ private struct VoiceCloneSectionContent: View {
     @EnvironmentObject var appState: AppState
     @StateObject private var recorder = AudioRecorder()
     @State private var voiceError: String?
+    /// Built lazily against the app's server so previews reuse the resident
+    /// Kokoro model instead of loading it per click.
+    @StateObject private var previewer = VoicePreviewer()
+    @EnvironmentObject private var downloads: DownloadManager
 
     private static let explainer = "A few seconds of clean speech works best. Answers are synthesized locally by the Audio pane's TTS model (downloaded on first use)."
+    /// Per-engine blurb. The old single string described Kokoro AND cloning and
+    /// was shown under every tab, so picking "System voice" read as advice about
+    /// a model you had not chosen.
+    private static func engineExplainer(_ e: VoiceEngine) -> String {
+        switch e {
+        case .system:
+            return "The built-in macOS voice. No download and no GPU, but the least natural of the three."
+        case .clone:
+            return "Copies the voice from the clip below using Qwen3-TTS. Slower and much heavier than Kokoro, and it needs the model downloaded from the Audio tile."
+        case .kokoro:
+            return "A small, very fast model (about 17x realtime, a tenth of the memory of the cloning model) with 54 built-in voices you can blend. It can't copy your voice."
+        }
+    }
 
     var body: some View {
-        SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"]) {
-            clipBody
+        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"]) {
+            engineBody
         }
+        // The clip control only makes sense for the backend that can USE it —
+        // Kokoro has no cloning and asking it to clone is a named 400, so the
+        // control is hidden rather than left dead (the image-preset rule).
+        if appState.serverOptions.voiceEngine == .clone {
+            SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"]) {
+                clipBody
+            }
+        }
+        if appState.serverOptions.voiceEngine == .kokoro {
+            SearchableRow(searchText: ["Kokoro voice", "blend", "preview"]
+                          + AudioModelPreset.kokoroVoices) {
+                kokoroBody
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var engineBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Voice engine").font(.subheadline.weight(.semibold))
+            Picker("", selection: $appState.serverOptions.voiceEngine) {
+                ForEach(VoiceEngine.allCases, id: \.self) { e in
+                    Text(e.label).tag(e)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            Text(Self.engineExplainer(appState.serverOptions.voiceEngine))
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // Stop a preview when the engine changes — otherwise a Kokoro sample
+        // keeps talking after switching to the system voice.
+        .onChange(of: appState.serverOptions.voiceEngine) { _, _ in previewer.stop() }
+        .onAppear { previewer.attach(server: appState.server) }
+    }
+
+    private var kokoroBundle: MediaBundle { AudioModelPreset.kokoro82M.bundle }
+    private var kokoroReady: Bool { downloads.bundleReady(kokoroBundle) }
+
+    @ViewBuilder
+    private var kokoroBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Kokoro voice").font(.subheadline.weight(.semibold))
+            // Selecting the engine has to be able to GET the model — the gen
+            // panes have had this bar all along; Settings ▸ Voice was the one
+            // place that offered a backend with no way to fetch it. Collapses to
+            // nothing once the bundle is complete.
+            BundleDownloadBar(bundle: kokoroBundle)
+            // A bare `.frame(maxWidth:)` centres the popup inside the flexible
+            // width; the row needs an explicit leading alignment plus a Spacer
+            // to sit against the left edge like every other control here.
+            HStack(spacing: 8) {
+                Picker("", selection: $appState.serverOptions.kokoroVoice) {
+                    // Grouped by language so 54 entries are navigable, and named
+                    // rather than shown as raw wire ids.
+                    ForEach(KokoroVoiceCatalog.grouped(), id: \.language) { group in
+                        Section(group.language) {
+                            ForEach(group.voices, id: \.self) { v in
+                                Text(KokoroVoiceCatalog.displayName(for: v)).tag(v)
+                            }
+                        }
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 260)
+
+                Button {
+                    previewer.preview(appState.serverOptions.kokoroVoice)
+                } label: {
+                    if previewer.isPreviewing(appState.serverOptions.kokoroVoice) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Play", systemImage: "play.circle")
+                    }
+                }
+                .help(kokoroReady ? "Hear a short sample of this voice"
+                                  : "Download the model first")
+                .disabled(previewer.active != nil || !kokoroReady)
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text("Voices blend: type several separated by commas (af_bella,af_sky) to make a new one.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let e = previewer.error {
+                Text(e).font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        // Auditioning on SELECTION is the whole point — the user asked to hear
+        // the voice they just picked, not to hunt for a play button.
+        // Audition on SELECTION — but only once the weights are here, or every
+        // pick would fire a request that can only fail.
+        .onChange(of: appState.serverOptions.kokoroVoice) { _, newValue in
+            if kokoroReady { previewer.preview(newValue) }
+        }
+        .onDisappear { previewer.stop() }
     }
 
     @ViewBuilder
@@ -2084,7 +2256,7 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "Agent mode (tools)",
+            title: "Tools",
             explainer: "OFF = plain chat (safe). ON = the bot can run shell commands and read/write files on this Mac, triggered from your phone. Confined to ~/.mlx-serve/telegram-workspace. Only enable if you understand the risk — anyone who can message the locked chat gets this power."
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.agentMode)
@@ -2094,7 +2266,7 @@ private struct MessagingSectionContent: View {
 
         SettingsRow(
             title: "MCP tools",
-            explainer: "Expose your enabled MCP servers (configured in the MCP marketplace) to the bot and to the tasks it creates. Works with or without Agent mode. Servers start on first use."
+            explainer: "Expose your enabled MCP servers (configured in the MCP marketplace) to the bot and to the tasks it creates. Works with or without Tools. Servers start on first use."
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.useMCP)
                 .labelsHidden()
@@ -2108,6 +2280,20 @@ private struct MessagingSectionContent: View {
             Toggle("", isOn: $appState.serverOptions.telegram.enableThinking)
                 .labelsHidden()
                 .toggleStyle(.switch)
+        }
+
+        SettingsRow(
+            title: "Answer as agent",
+            explainer: "Reply as one of your agents (Chat window ▸ Agents): its prompt, tools, model and workspace. \"None\" uses the settings above."
+        ) {
+            Picker("", selection: $appState.serverOptions.telegram.agentId) {
+                Text("None").tag(UUID?.none)
+                ForEach(appState.agents.allAgents) { agent in
+                    Text(agent.name).tag(UUID?.some(agent.id))
+                }
+            }
+            .labelsHidden()
+            .frame(width: 200)
         }
 
         // Allow-list / lock control.

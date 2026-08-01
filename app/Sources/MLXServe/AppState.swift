@@ -23,20 +23,15 @@ class AppState: ObservableObject {
         didSet {
             UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath")
             guard oldValue != selectedModelPath, !selectedModelPath.isEmpty else { return }
-            // Drafter auto-sync: a drafter is paired to a specific Gemma 4
-            // size (E2B / E4B / 31B / 26B-A4B). Switching the base model
-            // without swapping the drafter to match crashes the server with
-            // `DrafterTargetMismatch`. If the user already had a drafter on,
-            // try to find the matching one for the new model — fall back to
-            // clearing it (auto-disable) when no match is on disk or the new
-            // model isn't Gemma 4.
-            if !serverOptions.drafterPath.isEmpty {
-                if let match = downloads.recommendedDrafterFromPath(selectedModelPath) {
-                    serverOptions.drafterPath = match.url.path
-                } else {
-                    serverOptions.drafterPath = ""
-                }
-            }
+            // Drafter pairing: a drafter is paired to a specific Gemma 4 size,
+            // and carrying the wrong one over crashes the server with
+            // `DrafterTargetMismatch` — so every model change re-decides from
+            // scratch (`DrafterPairing.decide`). It pairs a dense Gemma 4 with
+            // the drafter that came down with it whether or not one was on
+            // before: the checkpoint is a dependency of the model now, not
+            // something the user went shopping for. `drafterOptOut` is what
+            // makes an explicit off stick.
+            syncDrafterPairing()
             // Plan 05 Phase G — when hot-switch is enabled AND the server is
             // already running, ask the server to load the new model in-place
             // instead of restarting. Falls back to restart on failure (404
@@ -46,7 +41,11 @@ class AppState: ObservableObject {
             if (server.status == .running || server.status == .starting) {
                 if hotSwitchEnabled, server.status == .running {
                     let id = (selectedModelPath as NSString).lastPathComponent
-                    let drafterPath: String? = downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path
+                    // The decision `syncDrafterPairing()` just made, not a
+                    // second read of the disk: a hot-switch that ignores the
+                    // user's off switch loads a drafter the restart path
+                    // wouldn't, and only one of the two would be reproducible.
+                    let drafterPath: String? = serverOptions.drafterPath.isEmpty ? nil : serverOptions.drafterPath
                     let mgr = server
                     // Tracked so `useModelAndAwaitReady` can await this exact
                     // switch — hot-switch never moves `server.status` off
@@ -103,6 +102,25 @@ class AppState: ObservableObject {
     }
     @Published var pendingSandboxAgentLaunch: SandboxAgentLaunch?
     @Published var agentMemory = AgentMemory()
+    /// Saved personas (`~/.mlx-serve/agents/index.json`) plus the read-only
+    /// starters. Views observe it directly (`.environmentObject(appState.agents)`),
+    /// the same way they observe `server` — see `AppStateAgents` for what picking
+    /// one does.
+    let agents = AgentStore()
+    /// The agent used where there's no per-conversation pick: the voice tray and
+    /// the Quick Launcher. nil = none (app defaults), which is the default.
+    @Published var defaultAgentId: UUID? {
+        didSet {
+            UserDefaults.standard.set(defaultAgentId?.uuidString, forKey: "defaultAgentId")
+            // The tray/launcher speak with this agent's voice from the next
+            // sentence; a chat tab's own pick overrides it when a turn runs there.
+            Task { await applyAgentSelection(defaultAgentId, previousWorkingDirectory: nil) }
+        }
+    }
+    /// The agent the Agents window should open ON, set by whoever deep-links
+    /// into it (`openAgentSettings`) and consumed by the window. Not persisted —
+    /// it's a one-shot request, not a setting.
+    @Published var pendingAgentSelection: UUID?
     @Published var toolExecutor = ToolExecutor()
     /// Owns every agent-spawned background process (started via shell
     /// run_in_background, or adopted by the foreground timeout backstop).
@@ -175,17 +193,21 @@ class AppState: ObservableObject {
             quickLauncher.setEnabled(quickLauncherEnabled)
         }
     }
-    /// Bumped by the quick launcher's "Open in chat" action. The menu-bar
-    /// label observes it (the label is always installed, so this works with no
-    /// window open — same bridge as the task-notification deep-link) and opens
-    /// the chat window. An Int tick so every bump fires onChange, no reset dance.
-    @Published var quickLauncherChatOpenTick = 0
+    /// "Open the chat window" for callers that can't reach SwiftUI's
+    /// `openWindow`: the quick launcher's "Open in chat" (a non-activating
+    /// NSPanel) and the welcome window (a bare `NSHostingView` outside the
+    /// Scene graph). The menu-bar label observes it — the label is always
+    /// installed, so this works with no window open, same bridge as the
+    /// task-notification deep-link. An Int tick so every bump fires onChange,
+    /// no reset dance. ONE bridge for both callers rather than a second
+    /// near-identical tick: they want the same window.
+    @Published var pendingChatOpenTick = 0
 
     /// Bumped by the welcome window's "Browse Models" nudge (shown when no
     /// chat model is downloaded yet) — the welcome window is a bare
     /// `NSHostingView` outside the SwiftUI Scene graph, so it can't reach
     /// `openWindow` itself. Same always-present-menu-bar-label bridge as
-    /// `quickLauncherChatOpenTick`.
+    /// `pendingChatOpenTick`.
     @Published var pendingModelBrowserOpenTick = 0
 
     /// Owns the global hotkey + floating panel. App-level like the voice
@@ -221,7 +243,15 @@ class AppState: ObservableObject {
     }()
 
     init() {
-        self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
+        // Defaults to ON when the key is absent — `UserDefaults.bool` would
+        // read a never-set key as false, which is why a fresh install used to
+        // download a model and then sit there with the server stopped. The
+        // launch gate below is `autoStartServer && !selectedModelPath.isEmpty`,
+        // so this stays a no-op until a model exists; the first download's
+        // completion hook is what actually starts it. No migration: existing
+        // users who never touched the toggle get it turned on, which is the
+        // intent.
+        self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
         self.hotSwitchEnabled = UserDefaults.standard.bool(forKey: "hotSwitchEnabled")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
@@ -238,8 +268,16 @@ class AppState: ObservableObject {
         }
         self.serverOptions = opts
         self.mcpMode = UserDefaults.standard.bool(forKey: "mcpMode")
+        self.defaultAgentId = UserDefaults.standard.string(forKey: "defaultAgentId")
+            .flatMap(UUID.init(uuidString:))
         self.quickLauncherEnabled = UserDefaults.standard.bool(forKey: "quickLauncherEnabled")
         server.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        // Same forwarding for the agent store: the chat chip and the tray picker
+        // observe AppState, not the store, so a newly created or renamed agent
+        // has to reach them without waiting for an unrelated publish.
+        agents.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
 
@@ -265,6 +303,11 @@ class AppState: ObservableObject {
         // And the quick launcher's global ⌃Space hotkey.
         if quickLauncherEnabled { quickLauncher.setEnabled(true) }
 
+        // The app-level agent's voice, applied once at launch (didSet doesn't
+        // fire for the init assignment above). Everything else it owns is
+        // resolved per turn.
+        ActiveAgentVoice.set(agents.agent(id: defaultAgentId)?.resolvedVoice)
+
         // Auto-update: stop the server child before the installer relaunches
         // the app (the old process's willTerminate doesn't stop it), then
         // start the once-a-day releases/latest check.
@@ -276,14 +319,27 @@ class AppState: ObservableObject {
         // ⌘Tab-selectable; menu-bar-only → back to accessory.
         ActivationPolicyManager.shared.start()
 
-        // Show the welcome window on every launch — it's the app's intro /
-        // quick-start screen and hosts the CLI install button.
+        // The welcome window is the app's intro / quick-start screen and hosts
+        // the CLI install button, so it shows on every launch — unless the user
+        // ticked "Don't show this again", in which case the launch goes
+        // straight to Chat (`LaunchDecision`). Either way the user ends up in
+        // front of a composer rather than looking at an empty desktop.
+        let suppressed = UserDefaults.standard.bool(forKey: LaunchDecision.suppressDefaultsKey)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            Self.showWelcomeWindow(
-                hasChatModels: self?.localModels.contains(where: \.isChatPickable) ?? true,
-                onDismiss: { Self._welcomeWindow?.close() },
-                onOpenModelBrowser: { self?.pendingModelBrowserOpenTick += 1 }
-            )
+            guard let self else { return }
+            let hasChat = self.localModels.contains(where: \.isChatPickable)
+            switch LaunchDecision.resolve(welcomeSuppressed: suppressed, hasChatModels: hasChat) {
+            case .openChat:
+                self.pendingChatOpenTick += 1
+            case .showWelcome:
+                Self.showWelcomeWindow(
+                    appState: self,
+                    hasChatModels: hasChat,
+                    onDismiss: { Self._welcomeWindow?.close() },
+                    onOpenModelBrowser: { self.pendingModelBrowserOpenTick += 1 },
+                    onOpenChat: { self.pendingChatOpenTick += 1 }
+                )
+            }
         }
 
         // Auto-start server if enabled and a model is available
@@ -354,6 +410,37 @@ class AppState: ObservableObject {
         let repaired = reconciledModelSelection(current: selectedModelPath,
                                                 pickablePaths: baseModels.map(\.path))
         if repaired != selectedModelPath { selectedModelPath = repaired }
+        adoptNewlyAvailableDrafter()
+    }
+
+    // MARK: - Drafter pairing
+
+    /// Re-decide the drafter for the selected model. Called on every model
+    /// change — it both pairs and UNPAIRS, because a drafter carried onto the
+    /// wrong Gemma 4 size is `DrafterTargetMismatch` at server start.
+    private func syncDrafterPairing() {
+        let paired = DrafterPairing.decide(
+            modelPath: selectedModelPath,
+            optedOut: serverOptions.drafterOptOut,
+            onDiskPath: downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path)
+        if serverOptions.drafterPath != paired { serverOptions.drafterPath = paired }
+    }
+
+    /// The model list changed (a download landed): fill in a pairing that
+    /// wasn't possible a moment ago — downloading a Gemma 4 fetches its drafter
+    /// too, and it finishes after the model is already selected.
+    ///
+    /// Only ever ADDS. Clearing belongs to the model switch: this runs on every
+    /// refresh (1 Hz while a download is in flight), and a user who deliberately
+    /// switched a drafter on where we don't recommend one — the MoE caution in
+    /// Settings — must not have a background rescan take it away.
+    private func adoptNewlyAvailableDrafter() {
+        guard serverOptions.drafterPath.isEmpty, !serverOptions.drafterOptOut else { return }
+        let paired = DrafterPairing.decide(
+            modelPath: selectedModelPath,
+            optedOut: false,
+            onDiskPath: downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path)
+        if !paired.isEmpty { serverOptions.drafterPath = paired }
     }
 
     /// What `useModelAndAwaitReady` must do once `selectedModelPath`'s
@@ -416,16 +503,58 @@ class AppState: ObservableObject {
     }
     var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
-    func newChatSession() -> UUID {
+    func newChatSession(agentId: UUID? = nil) -> UUID {
         var session = ChatSession()
         // Seed the new tab's MCP toggle from the global default so a user who
-        // generally runs with MCP on keeps it; Think/Agent start off. Each tab
+        // generally runs with MCP on keeps it; Think/Tools start off. Each tab
         // then remembers its own choice (ChatSession.useMCP/enableThinking).
         session.useMCP = mcpMode
+        session.agentId = agentId
         chatSessions.insert(session, at: 0)
         activeChatId = session.id
         saveChatHistory()
         return session.id
+    }
+
+    /// Which existing thread a turn for `agentId` belongs in, or nil to start a
+    /// fresh one. Every agent keeps its OWN conversation, so speaking to Chef
+    /// continues Chef's thread instead of talking into whatever tab was open (and
+    /// instead of quietly rebranding that tab as Chef).
+    ///
+    /// An ACTIVE thread of the same agent wins over a more recently touched one —
+    /// the user opened that one deliberately. Task-run and Telegram-bridge
+    /// sessions are never adopted: they're hidden/transient vehicles (and task
+    /// runs now carry an `agentId` too), so a turn landing in one would corrupt a
+    /// run or write into a read-only mirror. Pure → `AgentSessionThreadTests`.
+    nonisolated static func sessionForAgent(_ agentId: UUID?,
+                                           sessions: [ChatSession],
+                                           activeId: UUID?) -> UUID? {
+        func isConversation(_ s: ChatSession) -> Bool {
+            s.taskRunId == nil && !s.isExternalBridge
+        }
+        let active = sessions.first { $0.id == activeId }.flatMap { isConversation($0) ? $0 : nil }
+        guard let agentId else {
+            // No agent: today's behavior — keep talking into the active tab.
+            return active?.id
+        }
+        if active?.agentId == agentId { return active?.id }
+        return sessions
+            .filter { $0.agentId == agentId && isConversation($0) }
+            .max { $0.updatedAt < $1.updatedAt }?
+            .id
+    }
+
+    /// The thread a turn for `agentId` runs in, creating one when the agent
+    /// doesn't have a conversation yet. Also makes it the ACTIVE chat: the voice
+    /// controller speaks the active session's trailing assistant message, so a
+    /// turn running anywhere else would never be read aloud.
+    @discardableResult
+    func sessionForAgent(_ agentId: UUID?) -> UUID {
+        if let existing = Self.sessionForAgent(agentId, sessions: chatSessions, activeId: activeChatId) {
+            if activeChatId != existing { activeChatId = existing }
+            return existing
+        }
+        return newChatSession(agentId: agentId)
     }
 
     func deleteSession(_ id: UUID) {
@@ -440,9 +569,9 @@ class AppState: ObservableObject {
         SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
         chatSessions.removeAll { $0.id == id }
         // Stop the in-flight turn if it belonged to this session — otherwise
-        // it ghost-runs invisibly, holds the shared engine (every other chat
-        // reports "answering another chat" with no Stop control), and no
-        // server restart can clear it. See ChatTurnEngine.turnOrphaned.
+        // it ghost-runs invisibly with no Stop control anywhere, and no server
+        // restart can clear it. The sweep is per turn: only the deleted chat's
+        // turn stops. See ChatTurnEngine.stopIfOrphaned / TurnLedger.orphaned.
         chatEngine.stopIfOrphaned()
         if activeChatId == id {
             activeChatId = chatSessions.first?.id
@@ -490,6 +619,29 @@ class AppState: ObservableObject {
             let title = String(message.content.prefix(40))
             chatSessions[idx].title = title + (message.content.count > 40 ? "..." : "")
         }
+    }
+
+    /// Drop one message from a conversation.
+    ///
+    /// It leaves the history the model sees, not just the view — pruning a bad
+    /// turn so the next request isn't built on it is the whole point. Any
+    /// HIDDEN tool-result messages belonging to the same assistant turn go with
+    /// it: a tool result whose call is gone is an orphan the model can only be
+    /// confused by, and it is invisible, so nothing would ever clean it up.
+    func deleteMessage(in sessionId: UUID, messageId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        var removed = IndexSet(integer: mIdx)
+        var i = mIdx + 1
+        while i < chatSessions[sIdx].messages.count,
+              chatSessions[sIdx].messages[i].toolCallId != nil {
+            removed.insert(i)
+            i += 1
+        }
+        chatSessions[sIdx].messages.remove(atOffsets: removed)
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
     }
 
     func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil) {
@@ -554,11 +706,21 @@ class AppState: ObservableObject {
     // MARK: - Welcome Window
 
     private static func showWelcomeWindow(
+        appState: AppState,
         hasChatModels: Bool,
         onDismiss: @escaping () -> Void,
-        onOpenModelBrowser: @escaping () -> Void
+        onOpenModelBrowser: @escaping () -> Void,
+        onOpenChat: @escaping () -> Void
     ) {
-        let view = WelcomeView(onDismiss: onDismiss, hasChatModels: hasChatModels, onOpenModelBrowser: onOpenModelBrowser)
+        // This is an NSHostingView, so it inherits NO environment — the starter
+        // card's `@EnvironmentObject`s have to be handed to it explicitly or
+        // SwiftUI traps the first time the card renders.
+        let view = WelcomeView(onDismiss: onDismiss,
+                               hasChatModels: hasChatModels,
+                               onOpenModelBrowser: onOpenModelBrowser,
+                               onOpenChat: onOpenChat)
+            .environmentObject(appState)
+            .environmentObject(appState.downloads)
         let hostingView = NSHostingView(rootView: view)
 
         // Let SwiftUI compute the intrinsic size

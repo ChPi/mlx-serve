@@ -28,10 +28,9 @@ enum QuickLauncherLogic {
         case submit
     }
 
-    /// The engine runs one turn at a time app-wide and `runTurn` silently
-    /// no-ops while `isGenerating` — so a busy engine must either be stopped
-    /// first (our own conversation: the new question supersedes) or block the
-    /// submit (another chat's turn: never clobber it).
+    /// The engine is multi-turn: another chat's turn never blocks the
+    /// launcher. Only OUR OWN in-flight answer needs superseding (stop first —
+    /// the new question replaces the old one in the same conversation).
     static func submitDecision(text: String,
                                serverRunning: Bool,
                                composer: ChatTurnEngine.ComposerState) -> SubmitDecision {
@@ -40,7 +39,6 @@ enum QuickLauncherLogic {
             return .blocked("Server is not running — start it from the menu bar tray.")
         }
         switch composer {
-        case .busyElsewhere: return .blocked("The model is answering another chat — try again in a moment.")
         case .generatingHere: return .stopThenSubmit
         case .idle: return .submit
         }
@@ -53,15 +51,19 @@ enum QuickLauncherLogic {
         return !existing.contains(current)
     }
 
-    /// Launcher turns are plain chat: no agent tools, no MCP, no thinking, no
-    /// voice styling — a quick question deserves a fast, clean answer. The
-    /// full agent belongs in the chat window ("Open in chat" is one keystroke).
-    static func turnConfig() -> ChatTurnEngine.TurnConfig {
-        ChatTurnEngine.TurnConfig(agentMode: false,
-                                  mcpMode: false,
-                                  enableThinking: false,
-                                  voiceStyle: false,
-                                  workingDirectory: nil)
+    /// Launcher turns are plain chat: no tools, no MCP, no thinking, no voice
+    /// styling — a quick question deserves a fast, clean answer.
+    ///
+    /// The app-level agent's PERSONA and sampling do apply (that's what picking
+    /// one means), but its tool loop deliberately does not: this panel has no
+    /// tool-call cards and no approval surface, so a loop here would run blind.
+    /// "Open in chat" is one keystroke away, and that window has both.
+    static func turnConfig(resolved: ResolvedAgentSettings = ResolvedAgentSettings()) -> ChatTurnEngine.TurnConfig {
+        var config = ChatTurnEngine.TurnConfig.from(resolved)
+        config.agentMode = false
+        config.mcpMode = false
+        config.tools = []
+        return config
     }
 
     // MARK: Geometry
@@ -227,13 +229,13 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
     }
 
     /// Focus the launcher's session in the chat window. The window itself is
-    /// opened by the menu-bar label observing `quickLauncherChatOpenTick` —
+    /// opened by the menu-bar label observing `pendingChatOpenTick` —
     /// SwiftUI `Window` scenes can only be opened via the `openWindow`
     /// environment, and the always-installed label is the established bridge
     /// (see the task-notification deep-link).
     func openInChat() {
         if let sessionId { appState.activeChatId = sessionId }
-        appState.quickLauncherChatOpenTick += 1
+        appState.pendingChatOpenTick += 1
         hide()
     }
 
@@ -251,7 +253,7 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
             updatePanelFrame(keepTopEdge: true)
             return false
         case .stopThenSubmit:
-            appState.chatEngine.stop()
+            stopOwnTurn()
             startTurn(text)
             return true
         case .submit:
@@ -260,10 +262,15 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
         }
     }
 
+    /// Stop the LAUNCHER's own in-flight turn — never anyone else's. The
+    /// engine is multi-turn now, so a chat tab's answer keeps streaming.
+    func stopOwnTurn() {
+        guard let sessionId else { return }
+        appState.chatEngine.stop(sessionId: sessionId)
+    }
+
     private func composerState() -> ChatTurnEngine.ComposerState {
-        guard let sessionId else {
-            return appState.chatEngine.isGenerating ? .busyElsewhere : .idle
-        }
+        guard let sessionId else { return .idle }
         return appState.chatEngine.composerState(for: sessionId)
     }
 
@@ -277,8 +284,9 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
         } else {
             sid = sessionId! // needsNewSession(false) implies non-nil
         }
+        let resolved = appState.resolvedAgentSettings(agentId: appState.defaultAgentId)
         appState.chatEngine.runTurn(sessionId: sid, userText: text, images: nil, audio: nil,
-                                    config: QuickLauncherLogic.turnConfig(),
+                                    config: QuickLauncherLogic.turnConfig(resolved: resolved),
                                     approval: { _ in false })
         updatePanelFrame(keepTopEdge: true)
     }

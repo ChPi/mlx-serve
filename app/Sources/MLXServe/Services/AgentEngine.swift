@@ -27,6 +27,10 @@ enum AgentEngine {
     static func tokenCostForMessage(_ msg: ChatMessage) -> Int {
         var cost = 4  // role + formatting envelope
         cost += roughTokenCount(msg.content)
+        // Round-tripped reasoning is part of what gets sent — a long thinking
+        // trace not billed here silently blows the budget it was never
+        // counted against.
+        if let rc = msg.reasoningContent { cost += roughTokenCount(rc) }
         if let tcs = msg.toolCalls {
             for tc in tcs {
                 cost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
@@ -223,6 +227,13 @@ enum AgentEngine {
                     .replacingOccurrences(of: "<pad>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 dict["content"] = content.isEmpty ? "" : content
+                // Round-trip the turn's reasoning: templates that persist
+                // reasoning across turns (laguna) render <think></think> on
+                // every prior turn without it and the model stops thinking
+                // from turn 2. Key omitted when absent (`is string` gates).
+                if let rc = msg.reasoningContent, !rc.isEmpty {
+                    dict["reasoning_content"] = rc
+                }
                 dict["tool_calls"] = tcs.map { tc -> [String: Any] in
                     [
                         "id": tc.id,
@@ -254,6 +265,13 @@ enum AgentEngine {
                 dict["content"] = multimodal(content, imgs)
             } else {
                 dict["content"] = content
+            }
+            // Same reasoning round-trip as the tool-call branch above. The
+            // pinned-plan emission stays bare on purpose: it's a truncated
+            // 500-char summary of an old turn, and stale reasoning there
+            // costs budget without informing the current step.
+            if msg.role == .assistant, let rc = msg.reasoningContent, !rc.isEmpty {
+                dict["reasoning_content"] = rc
             }
             history.append(dict)
         }
@@ -488,6 +506,44 @@ enum AgentEngine {
         return name
     }
 
+    /// Capability gate: nil when the call may proceed, a named refusal when the
+    /// tool is outside the agent's allowed set.
+    ///
+    /// Filtering the ADVERTISED list isn't enough — models call tools that were
+    /// never advertised (a habit, a leaked example, a stale system prompt), so the
+    /// dispatcher refuses them too. Same belt-and-braces shape as
+    /// `FileToolSandboxGate`. `allowed == nil` gates nothing, which is what
+    /// callers with no agent (TestServer, older surfaces) get.
+    ///
+    /// Only names that resolve to a built-in tool are gated: MCP tools are
+    /// governed by the MCP dispatch gate (`mcpEnabled` + `mcpDisabledRefusal` —
+    /// "servers aren't started when it's off" is NOT enough, see there), and a
+    /// genuinely unknown name keeps its existing "Unknown tool" answer, which
+    /// is what steers the model back to a real one.
+    static func disallowedToolRefusal(name raw: String, allowed: Set<AgentToolKind>?) -> String? {
+        guard let allowed else { return nil }
+        let name = canonicalToolName(raw)
+        guard let kind = AgentToolKind(rawValue: name) else { return nil }
+        guard !allowed.contains(kind) else { return nil }
+        return "Error: the `\(name)` tool is turned off for this agent, so it was not run. "
+            + "Do not call it again. Available tools are listed in this request; "
+            + "if none of them can do this, say so in plain text instead."
+    }
+
+    /// Named refusal for an MCP-namespaced call arriving while the turn's MCP
+    /// toggle is OFF. The toggle must gate DISPATCH, not just server spawn and
+    /// advertising: MCP servers started by an earlier MCP-on turn stay
+    /// connected for the app's lifetime (`MCPManager.stopAll` only runs at
+    /// quit), and models re-call `<server>__<tool>` names they saw in this
+    /// chat's own history — so without this gate the call executed (or hung
+    /// against a dead upstream) in a chat where MCP was supposedly off.
+    /// Leads with the fact, forbids the retry, steers to the advertised tools.
+    static func mcpDisabledRefusal(name: String) -> String {
+        "Error: MCP is turned off for this chat, so `\(name)` was not run. "
+            + "Do not call it again — no MCP tool is available in this turn. "
+            + "Use the tools listed in this request, or answer in plain text."
+    }
+
     /// Detects when the agent loop is making no progress — consecutive rounds in
     /// which every tool call failed or was blocked — so the loop can stop with a
     /// summary instead of grinding to the iteration cap on an unrecoverable name.
@@ -588,16 +644,28 @@ enum AgentEngine {
         iteration: Int,
         agentMemory: AgentMemory,
         mcpRouter: (any MCPToolRouting)? = nil,
+        /// Whether THIS turn may execute MCP tools. Default false: secure by
+        /// default — a call site that injects a router without opting in gets
+        /// refusals (immediately visible), never silent MCP execution.
+        mcpEnabled: Bool = false,
         documentIndex: DocumentIndex? = nil,
         createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil,
-        generateImage: ((_ prompt: String) async -> String)? = nil,
+        generateMedia: ((_ kind: MediaKind, _ args: [String: String]) async -> String)? = nil,
         processRegistry: ProcessRegistry? = nil,
-        sessionId: UUID? = nil
+        sessionId: UUID? = nil,
+        allowedTools: Set<AgentToolKind>? = nil
     ) async -> ToolResult {
         // Normalize the model-emitted name (strip a leaked trailing ':' etc.)
         // before resolving the tool. Repetition tracking stays on the raw
         // `tc.name` to match the caller's `RepetitionTracker.track(toolCalls:)`.
         let name = canonicalToolName(tc.name)
+
+        // The agent's capability gate, ahead of EVERYTHING — including the
+        // meta-tools below, which aren't ToolHandlers and would otherwise run
+        // before any handler-level check could see them.
+        if let refusal = disallowedToolRefusal(name: name, allowed: allowedTools) {
+            return ToolResult(id: tc.id, name: name, output: refusal)
+        }
 
         // createTask is a meta-tool: it schedules an unattended run via the
         // TaskScheduler, which this static dispatcher can't reach. The caller
@@ -612,20 +680,19 @@ enum AgentEngine {
         }
 
         // Media-generation meta-tools, handled before the repetition / built-in
-        // dispatch (a heavy one-shot, no workdir, not a ToolHandler). Like
-        // createTask the image generator is injected by the caller (ChatTurnEngine
-        // owns ImageGenService + AppState); audio/video are stubbed this release.
-        if name == "generate_image" {
-            let out = generateImage != nil
-                ? await generateImage!(tc.arguments["prompt"] ?? "")
-                : "Error: image generation isn't available in this context."
+        // dispatch (heavy one-shots, no workdir, not ToolHandlers). Like
+        // createTask they're injected by the caller (ChatTurnEngine owns the four
+        // gen services + AppState); absent it they're gracefully unavailable.
+        //
+        // ONE seam for all four modalities rather than four closures: the raw
+        // argument dict passes straight through to `MediaToolArgs`, so parsing
+        // and clamping stay in the one tested pure place, and the per-turn media
+        // budget is claimed at one point instead of four.
+        if let kind = MediaKind.allCases.first(where: { $0.toolName == name }) {
+            let out = generateMedia != nil
+                ? await generateMedia!(kind, tc.arguments)
+                : "Error: media generation isn't available in this context."
             return ToolResult(id: tc.id, name: name, output: out)
-        }
-        if name == "generate_audio" {
-            return ToolResult(id: tc.id, name: name, output: AgentPrompt.comingSoonAudio)
-        }
-        if name == "generate_video" {
-            return ToolResult(id: tc.id, name: name, output: AgentPrompt.comingSoonVideo)
         }
 
         // ── Single repetition guard for ALL tools — built-in and MCP alike ──
@@ -641,8 +708,13 @@ enum AgentEngine {
         if repetition.isBlocked(name: tc.name, arguments: tc.arguments, iteration: iteration) {
             output = toolBlockMessage(for: tc.name)
         } else if let mcpRouter, mcpRouter.owns(toolName: tc.name) {
-            output = await mcpRouter.executeToolCall(
-                name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments)
+            // `owns` says the server is CONNECTED — a lifetime property, not a
+            // toggle property (sessions outlive the turn that spawned them).
+            // The turn's own MCP flag decides whether the call may execute.
+            output = mcpEnabled
+                ? await mcpRouter.executeToolCall(
+                    name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments)
+                : mcpDisabledRefusal(name: tc.name)
         } else {
             output = await executeBuiltinTool(tc, name: name, workingDirectory: &workingDirectory,
                                               agentMemory: agentMemory, documentIndex: documentIndex,

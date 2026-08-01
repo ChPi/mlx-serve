@@ -51,22 +51,15 @@ final class PerSessionUIStateTests: XCTestCase {
 
     func testComposerIdleWhenNothingGenerating() {
         let s = UUID()
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: false, activeTurnSessionId: nil, for: s), .idle)
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: false, activeTurnSessionId: s, for: s), .idle)
+        XCTAssertEqual(ChatTurnEngine.composerState(activeTurnSessionIds: [], for: s), .idle)
     }
 
-    func testComposerGeneratingHereOnlyForActiveTurnSession() {
+    func testComposerGeneratingHereOnlyForSessionsOwningATurn() {
         let a = UUID(); let b = UUID()
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: true, activeTurnSessionId: a, for: a), .generatingHere,
-                       "the chat that owns the in-flight turn shows Stop")
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: true, activeTurnSessionId: a, for: b), .busyElsewhere,
-                       "a different chat never shows Stop — it shows Send (disabled while busy)")
-    }
-
-    func testComposerBusyElsewhereWhenActiveSessionUnknown() {
-        let s = UUID()
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: true, activeTurnSessionId: nil, for: s), .busyElsewhere,
-                       "generating with no recorded owner is still 'not this chat'")
+        XCTAssertEqual(ChatTurnEngine.composerState(activeTurnSessionIds: [a], for: a), .generatingHere,
+                       "the chat that owns an in-flight turn shows Stop")
+        XCTAssertEqual(ChatTurnEngine.composerState(activeTurnSessionIds: [a], for: b), .idle,
+                       "another chat's turn no longer blocks this chat's Send (multi-turn engine)")
     }
 
     // MARK: - Think / MCP toggles persist per session (ChatSession migration)
@@ -113,5 +106,30 @@ final class PerSessionUIStateTests: XCTestCase {
         let back = try dec.decode(ChatSession.self, from: legacy)
         XCTAssertFalse(back.enableThinking, "missing Think key → off, not a decode failure")
         XCTAssertFalse(back.useMCP, "missing MCP key → off, not a decode failure")
+    }
+
+    // MARK: - Which agent a tab is talking to
+
+    func testAgentIdSurvivesACodableRoundTrip() throws {
+        // Same per-tab story as Think/MCP: the picked agent belongs to the chat,
+        // not to the reused detail view or an app-wide flag.
+        var s = ChatSession(title: "t")
+        let agentId = UUID()
+        s.agentId = agentId
+        let back = try JSONDecoder().decode(ChatSession.self, from: JSONEncoder().encode(s))
+        XCTAssertEqual(back.agentId, agentId, "the tab remembers who it's talking to across a relaunch")
+    }
+
+    func testLegacySessionWithoutAnAgentDecodesToNoAgent() throws {
+        let legacy = """
+        {"id":"\(UUID().uuidString)","title":"old","messages":[],
+         "createdAt":0,"updatedAt":0,"mode":"chat","isExternalBridge":false}
+        """.data(using: .utf8)!
+        let back = try JSONDecoder().decode(ChatSession.self, from: legacy)
+        XCTAssertNil(back.agentId, "absent key → no agent → today's behavior, unchanged on upgrade")
+    }
+
+    func testNewSessionsStartWithNoAgent() {
+        XCTAssertNil(ChatSession().agentId, "the default is still \"None (app defaults)\"")
     }
 }

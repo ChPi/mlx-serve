@@ -278,3 +278,1350 @@ clamp), plus fp32 and f16 cases in the blocked-parity sweep, which run through
 the same `gdnBlockTFor` the production path does — so a regression that declines
 the blocked route instead of clamping fails with `error.GdnBlockedDeclined`
 rather than passing on the stock fallback.
+
+### MLX's buffer pool is effectively unbounded, the clear cadence was skippable, and KV growth orphaned a whole cache every 256 tokens (#110)
+
+Live 2026-07-27, reported against `ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve` driven from
+Zed on a 128 GB Mac: the process climbed to **81.4 GB** in Activity Monitor while the
+app's own panel read **GPU Memory 19.6 GB**, until the reporter killed it. Two
+screenshots, taken at the same moment, ~61 GB apart.
+
+Per this file's own diagnosis ladder — `active_bytes` NOT dropping after unload =
+leaked HANDLES; active flat while phys climbs = allocator-CACHE growth — that gap is
+MLX's buffer pool. Nothing was leaked; 61 GB was freed, parked, and never returned to
+the OS. Three independent defects fed it.
+
+**1. The pool has no useful bound.** `lib/mlx-src/mlx/backend/metal/allocator.cpp:63-64`:
+
+```cpp
+block_limit_ = std::min(1.5 * device_info()["max_recommended_working_set_size"], 0.95 * memsize);
+gc_limit_    = 0.95 * device_info()["max_recommended_working_set_size"];
+```
+
+~121 GB and ~91 GB on a 128 GB Mac. MLX will not trim until the machine is already
+dead. Our only real defense is explicit `mlx_clear_cache()`.
+
+**2. Three decode paths never called it.** Auditing every `self.step` advance:
+
+| path | advance | cleared? |
+|---|---|---|
+| `Generator.next` | +1 | yes, `step % 256` |
+| `Generator.nextConstrained` | +1 | yes |
+| `Generator.nextPld` | +1 / +num_emit | yes |
+| **`Generator.nextDrafter`** | +1+m / +1+accepted | **no** |
+| **`Generator.nextMtp`** | +1+m / +1+accepted | **no** |
+| **`scheduler.runBatchedDecodeTick`** | +1 | **no** |
+
+The reporter runs the `-mtp` checkpoint on a dense trunk, so `defaultEnableMtp` is on
+and every one of his decode rounds took the one path that never cleared. `finishSlot`
+didn't clear either, so what a turn stranded survived every later turn.
+
+The `% 256` form is separately broken for exactly these paths: a spec round advances by
+`1 + accepted`, so it can step clean over every multiple. Measured on the pure helper:
+**at stride 5, zero clears in steps 0..1024.** A modulo cadence and a variable stride
+are incompatible, and the failure is silent — a decode path that never clears is
+output-identical to one that does.
+
+**3. Linear KV growth made each strand enormous.** `updateDense`/`updateAffine` both
+grew by a fixed `chunk_step = 256`: allocate a new capacity-sized buffer, copy, free the
+old. MLX reuses a cached buffer only when `cached < size + 2*page_size`
+(`buffer_cache.h:34`) — the next KV buffer is 512 KB past a 32 KB tolerance, so the
+superseded buffer can never be reused for anything, least of all its own successor.
+
+The arithmetic on his model: 64 layers, `full_attention_interval: 4` → 16 attention
+layers, `head_dim: 256`, 4 KV heads, bf16 = **64 KiB/token**. At 89 K context that is
+**~5.6 GB stranded every 256 generated tokens**. Eleven growth events ≈ 61 GB — the
+observed gap, near exactly.
+
+**Fixes, all three layers:**
+
+- `server.mlxCacheLimitBytes` = `max(2 GB, min(8 GB, RAM/16))`, applied by
+  `applyMlxCacheLimit()` ONCE at the top of `main()`. Not per serve path — this is the
+  same shape as `runHeadlessServe` hand-rolling its own `ServerConfig` and silently
+  eating the `--pld*` flags. `MLX_SERVE_CACHE_LIMIT` (bytes; `0` = leave MLX's default)
+  is the A/B off-switch, and a tighter existing cap is never raised (media gen drops to
+  1 GB on small-RAM machines, iOS boots at 384 MB).
+- `Generator.advanceStep(n)` is the ONE place `step` and `completion_tokens` move, and it
+  owns the clear. The predicate is `step -| last_clear >= interval` — interval
+  arithmetic, which a variable stride cannot skip, and byte-identical to the modulo form
+  for the stride-1 paths. `finishSlot` clears once more so a turn can't hand its
+  transients to the next.
+- `KVCache.nextCapacityPolicy` grows by +25%, floored at one chunk and capped at 8192
+  tokens. Over a 100 K-token walk that is 27 growth events instead of 391, and the total
+  superseded capacity drops from ~195× the final capacity to ~5.5×.
+  `MLX_SERVE_KV_GROW=linear` restores the old policy.
+
+The slack is honest, not hidden: `denseView` slices to `entry.offset` so attention never
+sees it, and `prefix_cache.snapshotBytes` bills `mlx_array_size` (full capacity), so a
+committed hot-cache entry is charged for what it actually pins. `truncate`,
+`snapshot`/`restore` and the disk tier were all already capacity-agnostic (they work off
+`offset` and explicit chunk positions) — audited, and worth keeping that way.
+
+**Measurements.**
+
+- Hermetic star test (`KV growth does not ratchet the MLX buffer pool`): 20,000
+  single-token updates against a real 4-layer KVCache, sampling
+  `mlx_get_cache_memory()`. **1544 MB → 274 MB.** Runs in ~3 seconds and needs no
+  checkpoint — it reproduces the reporter's exact mechanism at toy scale.
+- Integration (`tests/test_kv_cache_growth_memory.sh`, his model, 23 K prompt ×3 turns):
+  `memory_mb - active_bytes` **14.61 GB → 3.87 GB** after one turn; footprint ratchet
+  across turns 1→3 is 0.56 GB; pool peaks at 2.3 GB against the 8 GB cap. Red-on-revert
+  verified against a rebuilt pre-fix binary.
+- Pool sizing, measured rather than guessed: peak pool during a **66 K-token** turn on
+  the 27B is **5.83 GB**, so the 8 GB cap has headroom at the context this class bites
+  at.
+
+**Perf.** The pool cap was the one plausible regression source, and a first pass at
+65 K decode read −14%. That was **thermal contamination plus n=1**: the isolation runs
+declined monotonically in temporal order (34.51 → 33.51 → 30.89 → 28.48) regardless of
+arm. Re-run cooled and tightly alternated per boot, the same rung gives fix
+33.76/34.90/29.96 vs old 30.56/32.10/33.35 — pair signs `+,+,−` with a spread far larger
+than the mean gap. A full ABBA `bench.sh --family all` (34 mlx-serve cells, default vs
+`MLX_SERVE_CACHE_LIMIT=0 MLX_SERVE_KV_GROW=linear`) lands at **decode −0.0%, prefill
++0.5%**. The absolute diff against `all-26.7.10.csv` looked like −12% to −25% across the
+board — and the OLD arm measured in the same session showed the same depressed
+absolutes, which is the whole reason cross-session absolutes are not admissible here.
+
+**Visibility.** This was invisible for as long as `active_bytes` was the only memory
+figure we served. `/props` now carries `memory.cache_bytes`, `/metrics` carries
+`mlx_serve:mlx_cache_bytes` + `mlx_serve:mlx_active_bytes` beside the existing
+`mlx_serve:memory_mb` (phys_footprint), and the tray renders `19.6 GB (+61 GB cache)`
+once the pool passes 1 GB. Any future instance of this class names itself.
+
+**Guards.** `KVCache growth strands bounded bytes` (pure, walks the policy and counts
+events + superseded bytes), `KV growth does not ratchet the MLX buffer pool` (real MLX),
+`clear cadence survives variable spec strides` (strides 1/3/5/9), `no decode path
+advances `step` outside advanceStep` (source scan over `@embedFile("generate.zig")` +
+`@embedFile("scheduler.zig")` — this is what stops the whack-a-mole; a new decode path
+cannot reintroduce the hole), the `mlxCacheLimitBytes`/`mlxCacheLimitFromEnv` tables, and
+`tests/test_kv_cache_growth_memory.sh`.
+
+**Noted, not fixed:** `computeMemoryContext` (server.zig) bills `num_hidden_layers` as
+full-attention layers. On `qwen3_5` only 1 in 4 are, so `kv_per_tok` is ~4× over-billed
+and auto-context is correspondingly conservative (the reporter's "GPU-safe max 104K" on
+a 256K model). Safe direction, real capability left on the table — separate change,
+separate bench.
+
+## Laguna XS 2.1 NVFP4: the decode gap was an f32 constant table (CLOSED)
+
+Measured 2026-07-28 on an M4 Max (128 GB, ~546 GB/s) against the
+Layr-Labs/mlxfast-challenge tree at `main` 55f965f — the same weights (SHA-verified
+byte-identical to the challenge's pinned revision `841778bd`), the same silicon, the same
+timed window (512-token prompt, 128 decode steps, temp 0, serial non-speculative).
+
+**Measure the reference tree in the same window as your own, every time.** Mid-session the
+box picked up concurrent GPU work from another process and every number inflated ~1.62x
+(ours 40.5 → 65.6 ms/token). Re-running THEIR harness as a control showed 13.44 → 21.78 —
+the same 1.62x — so the machine moved uniformly and the mlx-serve : mlxfast ratio was
+**3.01 in both windows, identical to three significant figures**. Without the control run
+the second window reads as a 60% regression in our tree. A cross-engine comparison is only
+as trustworthy as the interleaved re-measurement of the thing you are comparing against.
+
+| tree | decode ms/token | prefill tok/s |
+|---|---|---|
+| mlxfast **frontier** (every DARKBLOOM optimization on) | 13.442 | ~1463 |
+| mlxfast **baseline** (every DARKBLOOM flag ablated off) | 17.173 | ~1460 |
+| **mlx-serve**, as measured | 40.515 | ~1005 |
+| **mlx-serve**, after the mscale dtype fix below | **13.384** | **~1335** |
+| mlxfast frontier, control re-run in the SAME window as that fix | 13.099 | ~1451 |
+
+Their entire published optimization catalogue is worth **+27.8%** (17.17 → 13.44).
+mlx-serve started **2.36× slower than their UNOPTIMIZED baseline**, so porting their
+fusions was never going to be the lever — the gap was in our forward pass, and it was one
+line. The remaining gap after the fix is ~2% on decode and ~8% on prefill; their catalogue
+(fused QKV, gate folded into `o_proj`, a fused routed `[gate; up]` bank, a certified
+two-pass lm_head prune) is what that ~2% would have to come from, and none of it was worth
+porting on top of a forward that was widening every weight read.
+
+**Where the gap is not.** Each of these was A/B'd on the live decode and moved nothing:
+
+- MLX's command-buffer batching (`MLX_MAX_MB_PER_BUFFER` / `MLX_MAX_OPS_PER_BUFFER`).
+  Plausible on paper — MLX commits a buffer every 50 ops **or 50 MB of touched arrays**
+  (`CommandEncoder::needs_commit`), and XS's bf16 attention weights are ~33 MB EACH, so we
+  flush roughly per op. Sweeping 50 → 4096 MB: 40.9 / 40.5 / 40.9 / 41.8 ms. Flat.
+- Metal residency (`mlx_set_wired_limit`; MLX's default is 0, i.e. nothing wired, and the
+  routed expert banks are ~17.5 GB read at 8 random experts of 256 per layer). Wiring 24 GB
+  and 48 GB: 40.1 / 40.1 / 40.4 ms. Flat.
+- The MLX buffer-pool cap added in `c6413b4` (`MLX_SERVE_CACHE_LIMIT=0`). Flat.
+- `MLX_SERVE_COMPILE_FORWARD=1` — compiles, but only the prefill chunk loop routes through
+  the closure, so decode is untouched. Flat, as expected.
+
+**Where the gap IS (RESOLVED 2026-07-28): a load-time f32 constant table silently
+promoted the whole residual stream to float32.** Laguna's YaRN mscale vector
+(`yarn_mscale`, `[head_dim]`, the reference's `cos/sin *= attention_factor`) was built
+`.float32` at load and multiplied straight into post-RoPE q/k, which are bf16. mlx
+promotes bf16 ⊕ f32 → f32, so:
+
+```
+q_rope * mscale(f32)  ->  q,k become f32
+  -> SDPA runs f32     -> attn_out f32
+  -> o_proj = mlx_matmul(f32 x, bf16 o_w)   -> o_w UPCAST on every token
+  -> h + attn_out      -> the RESIDUAL is f32 from the first full-attn layer on
+  -> every later q/k/v/o/gate, every routed expert, and lm_head upcast too
+```
+
+One line, and every weight read for the rest of the forward paid a widening pass.
+`[dtype-trace]` says it plainly: residual **bfloat16** entering the layer loop,
+**float32** leaving it. Fix = `constTableAs`, which hands the table back in the
+activation's own dtype, cached per dtype (`DtypeCastCache`).
+
+| | before | after |
+|---|---|---|
+| Laguna XS forward (`MLX_SERVE_DECODE_FWD_UBENCH`) | 41.2 ms | **14.6 ms** |
+| Laguna XS decode, bench window | 40.585 ms/tok | **13.384 ms/tok** |
+| Laguna XS prefill | 994 tok/s | **1335 tok/s** |
+| Laguna S forward (also YaRN) | 23.2 ms | **17.7 ms** |
+| lm_head alone | 4.6 ms | **1.2 ms** |
+
+That is **3.03x** on decode, and it moves us from 2.36x slower than the mlxfast-challenge
+tree's *unoptimized baseline* (17.173) to within 2.2% of its fully-optimized *frontier*
+(13.384 vs a 13.099 control re-run interleaved in the same window). gemma-4-26B and
+Qwen3.6-27B are unchanged — the path is laguna-only.
+
+**Why every earlier hypothesis missed it.** The promotion is invisible to each thing you
+would naturally reach for: op count is IDENTICAL (3226 with the bug vs 3080 in a clean
+reconstruction), kernel choice is irrelevant (all three MoE decode kernels within 4%),
+the KV cache is irrelevant (bypassing it entirely moved 0.4 ms), there is no host sync
+(CPU graph build is 0.95 ms of a 41 ms token), and RAM was 94% free. It presents as a
+*uniform ~3x* on attention, MoE and lm_head alike — which reads like a global platform
+problem, not a one-line bug. The previous session's "dtype promotion ruled out, x/q_w/o_w
+all bf16" was measured **before the layer loop**, which is exactly where it is still true.
+
+**How it was actually found — bisect FORWARD, and let the reconstruction diverge.**
+`diagProjBench` grew from a bare matmul loop into a rung ladder (`ProjRung`), each rung
+adding one more piece of the real attention block, in both issue orders:
+
+```
+matmul_only  7.04 ms (405 GB/s)  442 ops     <- bare q/k/v/o
+rope         7.38                 882
+norms        7.88                1242        <- + input/post-attn norms + residuals
+mlp         13.15                3080        <- + the REAL moeMLP: a whole layer
+real_attn   36.29                3220        <- same layer, but the SHIPPED lagunaAttnWith
+```
+
+The reconstruction and the shipped function do the same number of ops on the same weights
+and are 2.8x apart, so the bug had to be *inside* `lagunaAttnWith` and could only be a
+difference the op count cannot see. Two rungs later (a `yarn_rope` rung proved the custom
+YaRN freqs array was innocent, 13.17 vs 13.25) the only remaining difference was the
+mscale multiply. **The rung that made the reconstruction disagree with the real function
+is what localized it** — a reconstruction that merely matched would have proved nothing.
+
+Probes kept, all env-gated: `MLX_SERVE_DECODE_FWD_UBENCH=N` (forward-only timing, split
+into CPU graph-build vs GPU eval, ops/forward, and a sound lm_head ablation — lm_head is
+terminal so removing it cannot change upstream work), the `diagProjBench` rung ladder it
+fires, `MLX_SERVE_LAYER_CAP=N` (layer-count sweep: Laguna XS is dead linear at
+**0.896 ms/layer + 5.2 ms fixed**, which is how "outside the loop" was priced), and
+`MLX_SERVE_LAGUNA_UBENCH=1`.
+
+**Still ruled out, each by live A/B — do not re-litigate:** command-buffer batching
+(`MLX_MAX_MB_PER_BUFFER` 50→4096, `MLX_MAX_OPS_PER_BUFFER` 50→1000); Metal residency
+(`mlx_set_wired_limit` 0→48 GB); the buffer-pool cap from `c6413b4`
+(`MLX_SERVE_CACHE_LIMIT=0`); `MLX_SERVE_COMPILE_FORWARD=1` (only the prefill chunk loop
+routes through the closure); graph-scheduler lookahead (`MLX_BFS_MAX_WIDTH` 20→4000); a
+lazy load-time transpose re-materialized per step; 2-D vs 3-D activations; dispatch count
+(trivial dependent ops are 1.7–2.4 µs each, ~2 ms of the token).
+
+**This fix is a correctness fix, not a speed/accuracy trade.** It is not bit-identical to
+the pre-fix binary, and that is the point: the f32 product was the DEVIATION. The stock
+MLX path for a bf16 Laguna is `rope_input_with_mscale<bfloat16, true>`, which applies
+`float(bfloat(x * bfloat(mscale)))` — mscale cast to bf16, product rounded to bf16 — and
+the mlxfast-challenge tree's hand-written kernel reproduces exactly that
+(`bfloat rounded_mscale = bfloat(yarn_mscale)`, then
+`float(bfloat(normalized[i] * rounded_mscale))`, `LagunaRuntimeModel.swift`). Casting the
+table to the activation dtype puts us ON that path. Running attention in accidental f32
+was never "safer": this is a quantized checkpoint calibrated against bf16 arithmetic, the
+same trap as the MageFlow Turbo rule (f32 is not "more accurate", it washes). Nothing in
+the repo pins Laguna token bytes, so there was no baseline to re-cut.
+
+**The class, and the guard.** A constant table built in one dtype at load and multiplied
+into an activation in another silently widens everything downstream of it. The two other
+f32 tables on this decode path already got it right and are the pattern to copy: the MoE
+router computes in f32 deliberately and `astype`s back to bf16 before returning, and
+M-RoPE's cos/sin are built f32 then cast to bf16 before they touch q/k. Same family as
+MageFlow's `scalarLike` rule. Guards: `constTableAs hands a load-time f32 table back in
+the activation dtype`, `a constant table must not widen the activation it scales`, and a
+source scan (`the YaRN mscale table never reaches a multiply in its load-time dtype`) —
+the scan needles are assembled at comptime, because spelled whole they appear in the
+test's own source and the scan satisfies itself (it did, on the first attempt, and passed
+green against a reverted fix).
+
+### The intra-step async-eval ladder is a null lever for us (measured, not assumed)
+
+`DARKBLOOM_DECODE_ASYNC_STAGE` is worth +9.7% in their tree: fire `asyncEval` at layer
+boundaries so the GPU starts while the CPU is still building the graph. Ported as
+`Transformer.ladderStep` / `MLX_SERVE_DECODE_ASYNC_LADDER` and swept on Laguna XS:
+
+```
+off 39.88 | stride 8 40.22 | stride 4 40.37 | stride 2 41.08 | stride 1 41.49 ms/token
+```
+
+Monotonically WORSE as the stride tightens. The reason is structural: their worker cannot
+pipeline BETWEEN steps (its protocol is one token per request), so the ladder is the only
+overlap it can buy; mlx-serve already overlaps at the step boundary (`generate.zig`'s
+build-next → `mlx_async_eval` → resolve-pending), so the overlap is already collected and
+the ladder only adds submissions. It also confirms we are **not** CPU-graph-build-bound —
+if we were, the ladder would have paid.
+
+Shipped **default OFF** with the sweep recorded in the doc comment; `"auto"`/`"<n>"` opt in
+for a future arch whose CPU side is the bottleneck. Output is bit-identical either way
+(verified: 160 greedy tokens, temp 0, byte-for-byte). **Rule**: a lever that pays in
+another engine's harness may be paying for a constraint that engine has and we do not —
+port it, measure it, and let the number decide the default.
+
+## The f16 checkpoint whose per-channel tables turned the whole residual f32
+
+**2026-07-29, `prism-ml/Ternary-Bonsai-27B-mlx-2bit`, worth 14.8%.**
+
+The Laguna YaRN-mscale bug (above) was found by luck: the MoE forward happened to carry a
+`[dtype-trace]` log and the other five forward paths had none. So the follow-up was to
+generalize the trace and sweep every arch on disk — `DtypeTrace` in `src/mlx.zig`, armed by
+all five `forward*With` paths plus batched-decode, the diffusion decoder and both vision
+towers, with a class guard (`every transformer forward path is watched by a dtype trace`)
+that keys on the forward-path SIGNATURE rather than on the shape of its layer loop. That
+distinction is load-bearing: BERT iterates its layer slice directly while every other path
+counts to `num_hidden_layers`, and a rule that keyed on the loop form would have skipped it
+silently.
+
+The trace logs both endpoints and, in between, only the layers where the dtype actually
+MOVES — so a mid-stack widening names one layer instead of drowning in forty identical
+lines, and after the first forward the whole thing costs nothing.
+
+One arch out of nine widened:
+
+```
+[dtype-trace] moe: residual in = bfloat16, first weight = n/a
+[dtype-trace] moe: residual widened at layer 0: bfloat16 -> float32
+[dtype-trace] moe: residual out = float32
+```
+
+The checkpoint is F16 throughout — despite `config.text_config.dtype: "bfloat16"`, which is
+simply wrong (read the CHECKPOINT, not the config: the Kokoro `AdaIN1d` rule again).
+`loadSafetensorsFile` already narrowed f16 `.scales`/`.biases` to bf16 (the hy_v3 mixed-dtype
+gather story), but deliberately left plain weights alone — including every NORM weight. So
+`rmsNorm(bf16 residual, f16 weight)` promoted at layer 0 and the residual stayed f32 for all
+64 layers, upcasting every weight read after it. Same class as the mscale bug, one level up:
+there it was one constant table, here it is a whole category of per-channel table.
+
+Fix: extend the load-site rule to any 1-D f16 tensor (`narrowsLoadedF16`). A 1-D tensor is a
+per-channel table — norm weight, bias, `A_log`, `dt_bias` — that is multiplied or added
+straight into the residual. Multi-dimensional dense f16 weights are left alone: those are
+matmul OPERANDS, MLX picks its kernel off that dtype, and narrowing one is a
+kernel-selection change rather than a promotion fix. Measured as a wash (23.15 vs 23.47 ms,
+inside boot drift), so the minimal rule shipped.
+
+**27.99 → 23.88 ms/forward, 14.8%**, greedy output byte-identical at temp 0 over 160 tokens,
+and a strict no-op on every bf16 checkpoint (`[dtype] narrowed 0` — Laguna, gemma4-26B-A4B
+and Qwen3.6-35B-A3B all unchanged). Kill switch `MLX_SERVE_F16_NARROW_1D=0`.
+
+**The measurement nearly went the other way, twice.** The first paired readings said the fix
+made the model 2x slower (51.3 ms) and then 5x slower (136 ms, with lm_head at 72.5 ms
+against 1.4 ms). Both were garbage — first-boot artifacts from loading an 8.4 GB checkpoint
+back-to-back with the previous one still in the page cache. Re-running the same two configs
+reversed the sign completely (23.5 vs 27.6). Then a four-boot alternating sweep drifted
+monotonically (23.5, 23.2, 32.0, 34.6) with no relation to the mode — thermal soak. Only a
+paired A/B with a 45 s cooldown between boots gave a stable answer, three rounds with no
+overlap. **A model this size needs a settle window between boots; the first boot after
+another large load is not a measurement.** Two separate wrong conclusions were one run away
+from being written down as fact.
+
+Two things found on the way and left explicitly open:
+
+- The same checkpoint's Qwen3-VL vision tower runs f32 end-to-end (`residual in = float32,
+  first weight = float16`) because its weights are 2-D f16. Vision is a one-shot prefill
+  cost, and narrowing matmul operands is a kernel-selection change that needs its own A/B —
+  not folded into this rule.
+- `diagProjBench` reshapes q back through `num_attention_heads * head_dim` and Qwen3.5-2B
+  ships a q_proj of 4096 against a computed 2048, so the diagnostic raised an MLX reshape
+  error — an uncatchable process kill — and one probe boot took the server down.
+  `projLadderFits` now declines with a log, because a silent skip is indistinguishable from
+  "this model has no dense attention".
+
+**Archs still unswept** (not on this disk): `qwen3`, `qwen3_next`, `nemotron_h`, `lfm2`,
+`hy_v3`, `diffusion_gemma`, and the media engines. The trace is armed on every path they
+would take, so booting one is now the whole check.
+
+## What a 3x forward fix invalidated: two Laguna defaults and a spec gate
+
+**2026-07-29.** Fixing the YaRN mscale promotion did not just make Laguna faster — it
+moved every ratio that had been calibrated against the slow forward. Three decisions were
+re-measured on the fixed tree and two of them flipped.
+
+### The KV half was real, but it pays LESS at long context, not more
+
+`updateDense` takes the cache dtype from `new_k`, so while the residual was f32 the
+full-attention KV was STORED in f32. Laguna XS has 10 full-attention layers of 40 (the
+other 30 cap at a 512-token sliding window), 8 KV heads x 128 head_dim.
+
+Paired ladders in one window (serial, `--no-pld`, prompt caches off, one boot per lane,
+the fix reverted at its single `constTableAs` call site for the pre lane):
+
+| ctx | pre ms/tok | post ms/tok | speedup | pre prefill | post prefill |
+|---|---|---|---|---|---|
+| 512 | 39.89 | 13.29 | 3.00x | 907 | 1232 |
+| 4096 | 41.84 | 13.83 | 3.02x | 903 | 1232 |
+| 16384 | 43.35 | 14.93 | 2.90x | 382 | 637 |
+| 32768 | 48.64 | 17.66 | 2.75x | 253 | 403 |
+| 65536 | 52.85 | 20.27 | 2.61x | 141 | 233 |
+
+Subtract the 512-token base and the KV term falls out exactly: at 32K it is 8.75 ms before
+and 4.37 ms after — **2.00x**, precisely the f32→bf16 halving, and 4.37 ms for 1.34 GB is
+307 GB/s, a sane rate. The mechanism is confirmed to two significant figures.
+
+The *prediction* that it would therefore be worth MORE than 3.03x at 32K is wrong, and
+wrong for a reason worth keeping: the forward term shrinks 3x while KV only shrinks 2x, so
+KV becomes a larger share of a smaller token and the blended ratio FALLS with context
+(3.00x → 2.61x). A fix that improves two terms by different factors does not compound.
+
+### gatherQmv lost to stock `gather_qmm` on both Laguna models
+
+`batchedExpertDecodePolicy` opted Laguna into the batched/gatherQmv expert path by default
+on a measured 17→48 tok/s. That measurement was taken while the forward was ~3x inflated.
+Re-measured on the fixed tree, alternating boots, 512-token window, serial:
+
+| model | gatherQmv | stock gather | batched take+qmm |
+|---|---|---|---|
+| Laguna XS | 13.296 ms/tok | **13.113** (+1.4%) | 14.839 |
+| Laguna S | 17.02 ms/tok | **15.45** (+9.2%) | — |
+
+Every round, no overlap. The reason is the one already written down for gemma4-26B-A4B:
+these kernels beat MLX only where the O(EXPERT-BANK-SIZE) addressing term DOMINATES the
+expert math. Making the rest of the token 3x cheaper made the expert math a much larger
+share and the bank term a smaller one, so MLX's better-tuned `gather_qmv_fast` tile wins.
+No arch opts in by default any more; both alternatives stay one env var away, and the next
+arch with a genuinely bank-dominated decode gets measured back in. Laguna XS forward:
+14.203 → 13.447 ms, ops/forward 3226 → 2329.
+
+### The PLD yield gate was warming up 4x too long
+
+The yield gate exists because PLD's cold path (no n-gram match) runs an UNPIPELINED forward
+plus a synchronous host read of the sampled token, against `next()`'s async-pipelined step.
+Its 32-step warmup was calibrated when the AR step cost 3x more; the same absolute tax is
+now a ~3x larger share.
+
+Swept on Laguna XS — one boot, serial vs unconstrained alternating per REQUEST, timings
+from the server's own `timings` object, 5 runs median. The matrix deliberately includes
+PLD's WIN case: an earlier sweep over only loss cases drove the warmup toward zero, which
+would have thrown the win away.
+
+| warmup | echo-edit | code-edit | free-form | explain | qa |
+|---|---|---|---|---|---|
+| 32 (was) | +76.9% | -4.3% | -1.2% | -1.4% | -7.2% |
+| 16 | +70.1% | -3.4% | -0.4% | -0.3% | -0.8% |
+| **8 (now)** | **+77.4%** | **+0.3%** | **-0.2%** | **-0.3%** | **-1.5%** |
+| 4 | +76.6% | +3.9% | -0.2% | -0.1% | -1.7% |
+
+8 recovers essentially the whole loss with the +77% untouched. 4 measured no worse, but a
+gate deciding on four observations is fitting noise, and a short preamble before a file
+echo is the NORMAL agent shape — exactly what a too-eager trip punishes. A premature trip
+is bounded anyway (`specShouldReenable` re-checks every 32 steps). `SPEC_YIELD_WARMUP`
+sweeps it without a rebuild.
+
+Note the shape of the loss: `free-form` and `explain` emit NO `[spec-stats]` line at all —
+PLD never engages — and were still 1.2-1.4% slower. Enabling speculation costs something
+even when the prompt gate declines it, because the request still routes through the
+unpipelined step function.
+
+### Method notes from this round
+
+- **Single runs lied three times, in both directions.** A "clean re-run" of gemma4-31b
+  produced anomalously HIGH values that got merged into the baseline, so the next run read
+  as a -14% regression; two repeats put it back at baseline. `qwen36-27b/mtp/code` read
+  74.3 against a 75 floor and then 77.3. `gemma4-31b/*/prefill` is BIMODAL (~178-191 vs
+  ~205) across the whole session. The baseline is now per-cell MEDIANS over repeated runs
+  with the spread recorded, because a one-run baseline makes every later diff a coin flip.
+- **Attribute before believing.** Every flagged cell this round was structurally
+  unreachable from the changes (gemma4 prefill cannot be touched by a PLD-decode gate, a
+  no-op f16 narrowing, or a gather policy that was already `false` for gemma4). Check
+  reachability first; it is faster than another bench run and it is what makes the repeat
+  a confirmation rather than a hope.
+- **`MLX_SERVE_DECODE_PROFILE` is not a sizing tool.** It forces an eval at every phase
+  boundary, which destroys pipelining: 47.4 ms/token against a real 13.1, with the router
+  phase absorbing sync cost and reading LARGER than the experts it gates. Use the ladder or
+  the real forward.
+- **The `diagProjBench` ladder still has a constant input**, so its `mlp` rung reads a
+  resident expert bank and is a LOWER bound (4.63 ms, 34% of the token). Feeding it eight
+  varying inputs was tried and reverted: the lazy `astype` nodes outlive their f32 sources
+  in a way the single-input form never exposed and the rungs SIGBUS (status 138). It is a
+  diagnostic; the real forward is the honest number.
+- **A ladder guard must use the same geometry the ladder does.** `projLadderFits` first
+  compared against a global `num_attention_heads * head_dim`, but the rung uses
+  `cfg.layerNumHeads(li)` — Laguna runs 48 heads on full-attention layers and 72 on sliding
+  ones, so the global form declined 30 of 40 layers and silently under-reported the
+  ladder's bytes by 5x (85 GB/s instead of 412).
+
+## Fusing decode dispatches: only the critical path pays (2026-07-29)
+
+Round on top of the 26.7.12 tree, on Laguna XS 2.1 NVFP4 (M4 Max, 20 GB checkpoint,
+`tests/fwd_ubench.sh`, 20 decode-width forwards per boot, paired per boot).
+
+### Pricing a dispatch: `MLX_SERVE_DISPATCH_PROBE=N`
+
+Before writing any fusion, the probe injects N extra elementwise kernels per MoE layer
+inside `moeMLP2` — a multiply by an exact 1.0, which is output-identical for every finite
+value and, crucially, FEEDS the expert path so MLX cannot elide it. That is what makes it
+sound where the obvious "run the component twice and read the marginal cost" is not: it is
+pure (no KV writes) and observable (the result is consumed).
+
+    probe   0        4        8
+    run A   13.083   13.371   13.630 ms/forward
+    run B   13.131   13.305   13.657
+
+Slope ≈ 0.067 ms per dispatch-per-layer, i.e. **~1.5–1.7 us per GPU dispatch** at 40
+layers. Handy, and misleading if used alone — see the null result below.
+
+### What that price does NOT buy: the attention output gate
+
+Laguna's per-head `softplus(g_proj(x))` gate is four dispatches a layer (cast to f32,
+logaddexp, cast back, broadcast multiply). `fusedAttnGate` replaces all four with one
+kernel that is bit-identical to the chain (MLX's `LogAddExp` text, same rounding points,
+pinned by test). By the probe slope that is worth ~0.2 ms. Measured, three pairs:
+
+    off  13.112  13.098  13.030
+    on   13.117  13.116  13.160
+
+Nothing — slightly negative. **The gate chain does not sit on the critical path**: it
+depends only on the layer input, so the GPU already overlaps it with the q/k/v projections
+and SDPA, and deleting overlapped work buys zero wall clock. The probe measures dispatches
+inserted INTO the dependency chain, so its slope is an upper bound that only materialises
+for fusions that actually shorten that chain. Ships default OFF
+(`MLX_SERVE_ATTN_GATE_FUSED=1` opts in).
+
+A first version of the same kernel was worse still (+2.3%): it staged the per-head gate in
+threadgroup memory and had ONE 256-thread group walk all 6144 activations of a row. At
+decode that is a single GPU core doing what the elementwise multiply it replaced spread
+over the whole device. Recomputing softplus once per element — 10 ALU ops on a cached
+value — and shaping the launch as one thread per output element got it back to neutral.
+A fused kernel inherits the parallel shape you give it, not the one the ops had.
+
+### What it does buy: the MoE router, and the SwiGLU
+
+Both sit on the chain (router → expert gather; gate/up → activation → down_proj), and both
+paid, byte-identical, on three consecutive pairs each:
+
+    MLX_SERVE_MOE_ROUTER_FUSED   off 13.315 13.322 13.411 | on 13.113 12.934 13.395
+    MLX_SERVE_SWIGLU_FUSED       off 13.204 13.106 13.180 | on 13.012 12.974 12.978
+
+Together, position-balanced across six pairs in both orders, medians 13.418 → 13.061,
+**−2.7%**, with `/v1/chat/completions` at temp 0 byte-identical over 260 tokens on Laguna
+XS, gemma4-26B-A4B (the softmax router arm) and dense Qwen3.6-27B (the SwiGLU arm).
+
+### Reproducing MLX's arithmetic is not the same as reproducing MLX's formula
+
+The router kernel's first version computed "the same" softmax in one clean f32 pass. It
+diverged from the chain on gemma4-26B-A4B at token ~80 — the known INT4 near-tie argmax
+class, triggered by an avoidable numerical change. Making it bit-equal took three separate
+corrections, each found by asserting BIT equality with the chain in a unit test:
+
+1. **`fast::exp`, and a multiply by the RECIPROCAL.** `softmax_single_row` divides once,
+   into a reciprocal, and uses `fast::exp` (its own comment says softmax does not need the
+   precise one). Both matter after the rounding to bf16.
+2. **The reduction TREE, not just the reduction.** MLX launches `ceil(E/4)` threads, each
+   summing four CONSECUTIVE elements in order, then one `simd_sum` per simdgroup, then a
+   final `simd_sum` over the per-simdgroup partials in lanes 0..S-1 with zeros above.
+   A strided-by-32 sum over the same 256 values is a different float and was 1 ulp off.
+   The kernel emulates those virtual threads 32 at a time so the butterfly is identical.
+3. **`sum` over the top-K accumulates in the INPUT's dtype.** `reduce.metal` instantiates
+   bfloat16 sums as `(bfloat16_t, bfloat16_t)` — U is bf16, not f32 — and `row_reduce_small`
+   gives an 8-wide row to ONE thread, folding it in ascending order. A simd butterfly in
+   f32 over the same eight probabilities is off by 2 ulps.
+
+Same discipline for the sigmoid arm: MLX's `Sigmoid` is the two-sided
+`y = 1/(1+exp(|x|)); (x<0) ? y : 1-y`, not `1/(1+exp(-x))`, and the hy3 chain casts to f32
+FIRST so that arm is genuinely f32.
+
+### A JIT custom kernel and MLX's metallib do not agree on transcendentals
+
+The fused SwiGLU replaces `sigmoid + multiply + multiply`. Writing MLX's `Sigmoid` source
+verbatim, on the same `T`, still diverged live at token ~55 while a random-sampling unit
+test said bit-identical. Cause: MLX's kernels ship in a metallib built with one Metal math
+mode; `metal_kernel` JITs custom sources with `CompileOptions{math_mode = Safe}` and mlx-c
+exposes no way to ask for another. So `1 / (1 + exp(|x|))` lands a rounding apart.
+
+An exhaustive sweep of all 65536 bf16 patterns found it on **exactly one** value
+(-6.84375, ref -0.0072631836 vs -0.0073242188). One in 65536 sounds unreachable; an
+8192-wide MLP draws 8192 values from that domain every layer, so a 260-token greedy run
+hits it in the first few dozen tokens. **A 16-bit activation has only 65536 possible
+inputs — sweep them all instead of sampling.** Random values over `[-5, 5]` plus a few
+extremes passed every time.
+
+The fix removes the transcendental instead of chasing it: `mlx_sigmoid` is evaluated over
+every 16-bit pattern once at first use and the kernel indexes the result by the input's
+bit pattern (`swigluSigTable`, 128 KB resident, built with MLX's own op so it is exact by
+construction). The two multiplies need no such care — a bf16/f16 product is exact in
+float, so one rounding is one rounding on any compiler. f32 is DECLINED outright rather
+than shipped exact-for-some-dtypes.
+
+Also rejected on the way: extending `mlx_compile` to the silu arm of `compileGeglu`. It is
+one line, gets the same 2.4%, and is NOT output-preserving — a same-binary greedy A/B
+diverged at token ~55. mlx_compile's elementwise fusion does not reproduce the chain's
+intermediate rounding.
+
+### Two other numbers from the round
+
+- **`gatherQmv` rebuilds its `mlx_fast_metal_kernel_config` on every call** — 3 per MoE
+  layer, ~10 FFI calls each — which shows up as `ops/forward` 3226 vs 2329 and **+0.4 ms
+  of CPU graph build per token**. Its GPU eval is 12.73 ms against stock `gather_qmm`'s
+  12.47, so it loses on both counts today, but roughly 60% of the gap it is charged is
+  host-side config construction, not kernel time. The new kernels cache their config keyed
+  by geometry; anything reaching for `metal_kernel` in a per-layer loop should.
+- **Layer-cap refit on the fixed tree** (`MLX_SERVE_LAYER_CAP`, N = 10/20/30/40 →
+  4.345/7.293/9.779/12.743 ms GPU): Laguna XS is linear at **0.280 ms/layer + 1.55 ms
+  fixed**, and ~0.72 ms of that fixed part is lm_head. The rest is the probe's own
+  per-forward `mlx_array_eval` sync, which a real decode loop pipelines away.
+
+## The MoE expert path: fusing gate+up flipped a losing kernel into the default (2026-07-29)
+
+Second half of the same round. The expert path was the biggest addressable block left —
+Laguna XS reads ~630 MB of expert weights per token and was doing it at roughly 175 GB/s
+against 412 GB/s for the dense attention projections in the same forward.
+
+### The kernel was never the problem; the SHAPE of the work was
+
+`gatherQmv` (our in-place gather-qmv, which reads the expert bank without materialising
+the top-K) had been demoted earlier in 26.7.12 because it lost to stock `gather_qmm`. Two
+separate things were being charged to it:
+
+- **+0.4 ms per token of CPU graph build.** It rebuilt its `mlx_fast_metal_kernel_config`
+  on every call — three calls per MoE layer, ~10 FFI calls each — which shows up as
+  `ops/forward` 3226 vs 2329. That is roughly 60% of the margin it was losing by, and none
+  of it is kernel time. Now cached, keyed by geometry.
+- **Three dispatches where one would do.** gate gather -> up gather -> activation, all
+  strictly serial into `down_proj`.
+
+`gatherQmvGateUp` computes BOTH dot products in the same simdgroup — the x element loaded
+for the gate FMA is reused for the up FMA, the two dequant chains interleave instead of
+running as separate launches, and the SwiGLU is applied before the write. It halves the
+simdgroup count rather than the work (4096 over 40 cores was ~100 per core, so there was
+occupancy to spend on ILP).
+
+    Laguna XS, ms/forward     stock 13.007 / 13.568   fused-qmv 12.768 / 13.114
+    (GPU eval)                      12.136 / 12.569             11.854 / 12.051
+
+That is the same kernel family that lost by 2% before the fusion winning by 2-3% after.
+
+### The predicate is "would the fused kernel engage", not a model_type list
+
+Split `gatherQmv` lost on Laguna AND on gemma4-26B-A4B, so no arch opted in. Rather than
+add laguna back to a list, `useGatherQmvDecode` gates on exactly the conditions the fused
+kernel needs — silu activation (it is baked into the kernel) and matching quant geometry
+on gate and up. gemma4's gelu MoE therefore keeps stock gather and cannot regress, with no
+arch name anywhere in the predicate. Validated on the two archs the predicate newly opts
+in:
+
+    Qwen3.6-35B-A3B (qwen3_5_moe, affine 4-bit gs64)
+      GPU eval  stock 7.489 / 7.558   fused 7.390 / 7.306     (total: neutral to -1.6%)
+
+Not bit-identical to stock `gather_qmm` — that is the sanctioned qmv-vs-qmm reduction-order
+class, and the evidence chain is transitive: a new test pins fused == split `gatherQmv`
+bit-for-bit, and the existing tests pin split `gatherQmv` no-worse-than-stock against fp32
+dequant ground truth. Coherence spot-checked live on Qwen3.6-35B-A3B.
+
+### Cumulative, measured properly
+
+Laguna XS decode forward, whole round in ONE window, four pairs alternating which arm
+boots first:
+
+    base  13.331  13.348  13.204  13.344   median 13.338
+    new   12.823  12.787  12.762  12.778   median 12.783   = -4.2%
+
+All four pairs favour the new tree and each arm's spread is under 0.5%.
+
+An earlier write-up of this round quoted **-5.8%**, obtained by chaining a baseline median
+from the morning's window to a post-change median from the afternoon's. That is the trap
+this very file warns about one section up, committed while documenting the round that
+found it. A cumulative figure has to come from one window with both arms interleaved, or
+it is arithmetic on two different machines. The per-lever numbers were each paired inside
+one window and are unaffected.
+
+
+## A second null: fused residual + RMSNorm (2026-07-29)
+
+mlxfast item 5's norm tail. `h = h + branch; normed = rms_norm(h, w)` is two dispatches and,
+unlike the attention gate, they really are on the critical path — so by the round's first
+rule it should have paid. It did not: six pairs in both orders (on a machine under other
+GPU load, so read the RATIO only) gave ON median 14.890 vs OFF 14.747 ms/forward, 4 of 6
+pairs favouring OFF. Ships DEFAULT OFF, `MLX_SERVE_ADD_RMSNORM_FUSED=1` opts in; the
+kernel is bit-identical to `mlx_add` + `mlx_fast_rms_norm` (all four widths x both dtypes,
+including the ragged tail and a non-power-of-2 axis) and stays for future use.
+
+The reason completes the rule. **Being on the critical path is necessary, not sufficient —
+the fusion also has to remove real work.** Here it barely does: `add` is 2 reads + 1 write
+of a 4 KB row, `rms_norm` is 1 read + 1 write, and the fused kernel still needs 2 reads +
+2 writes because the residual sum is required downstream and must be emitted as a second
+output. Net saving: one 4 KB read, in exchange for replacing MLX's metallib-compiled
+`rms_single_row` with a JIT copy compiled under a different math mode.
+
+Contrast the three that paid, each of which replaced something substantial rather than a
+launch: the router killed a 256-wide `argpartition` sort, the SwiGLU killed a three-op
+activation chain, and `gatherQmvGateUp` merged two whole GEMV passes over the expert bank.
+
+The port also has a reusable piece: replicating `rms_single_row` exactly means keeping
+MLX's launch geometry (ceil(axis/4) threads, four CONSECUTIVE elements each, `simd_sum` per
+simdgroup, a zero-initialised `local_sums` plane, one final `simd_sum` over the partials)
+so the reduction is the same TREE, plus `metal::precise::rsqrt` — upstream uses the precise
+variant precisely so this is reproducible. Anything past `RMS_LOOPED_LIMIT` (4096) switches
+MLX to a differently-shaped kernel and is declined rather than guessed at.
+
+## Item 1, fused QKV: a null at BOTH widths, and two layout traps on the way (2026-07-29)
+
+mlxfast item 1, and the one the handoff doc guessed our prefill gap was. Implemented as a
+WEIGHT-LAYOUT fusion rather than a kernel: concatenate q/k/v along their output axis at
+first use, one matmul, three slices (`buildFusedQkv` / `sliceQkvPart`,
+`MLX_SERVE_FUSED_QKV=1`). The norm half of `lagunaFusedNormQKVProjection` was deliberately
+left out — `fusedAddRmsNorm` had already shown that a 4 KB norm is not real work next to a
+33 MB weight read.
+
+**Decode** (Laguna XS, four pairs, both orders): on 12.924 / 12.890 / 12.733 / 12.669
+against off 12.750 / 12.979 / 13.023 / 12.808 — medians 12.812 vs 12.879, one pair
+favouring off and three favouring on, all inside each arm's own spread. **Prefill**
+(`tests/prefill_ab.sh`, ~7 900-token prompts, server-reported `prompt_ms`, nonce-defeated
+cache): on 8856 / 8993 / 9401 / 9157 / 9481 / 9202, off 9373 / 9773 / 9678 / 8866 / 8909 /
+9128 — the two blocks CONTRADICT each other (on wins 4% in the first, off wins 3% in the
+second). Both null.
+
+Decode is the attention-gate story again: q, k and v are independent, so the GPU was
+already overlapping their launches. Prefill is the more interesting miss — the "one pass
+over x instead of three" argument is real (32 MB read once instead of three times) but at
+M≈7900 each projection is already a compute-saturating GEMM, so the saved activation reads
+hide behind the math. Ships opt-in, and it would stay opt-in even if it had won: the
+concatenated copy is ADDITIVE (the originals stay live for other paths), +33.6 MB per layer
+= ~1.34 GB on Laguna XS.
+
+### Trap 1: concatenating pre-transposed weights silently changes which kernel runs
+
+Dense weights are lazy TRANSPOSE VIEWS of row-major `[out, in]` buffers
+(`maybeTransposeForBf16`), and mlx's matmul recognises that and dispatches the gemv that
+walks each output's row contiguously. Concatenating the VIEWS on axis 1 and materialising
+produces a genuinely row-major `[in, out_total]` matrix — a different kernel with a
+different accumulation order. It passed a small unit test and diverged on the live model at
+byte 164 of a 260-token greedy run. The fix is to transpose each back to `[out, in]`, join
+on the OUTPUT axis, materialise, and hand back a transposed view of THAT: row j of the
+joined buffer is then byte-identical to row j of the original and the same kernel reads it.
+Divergence moved from byte 164 to byte 695.
+
+### Trap 2: same layout is still not bit-identical, because mlx picks kernels by SHAPE
+
+Even with the layout right it still diverges eventually — the concatenated output is 8192
+wide where q alone was 6144, and mlx's gemv heuristics (split-K and tiling) key on that, so
+the reduction order can change. This is the sanctioned qmv-vs-qmm class, not a bug, but it
+means **a weight-layout fusion cannot be assumed output-preserving just because the maths
+is identical.** Prove it per shape or treat it as a numerics change.
+
+### And the test that should have caught trap 1
+
+The first unit test used a 256-wide contraction dim and passed both traps. Over 256 terms
+the two accumulation orders happened to agree in bf16; at 2048 they do not. A parity test
+for a reduction-order bug needs a contraction dim in the same ballpark as the real one —
+small shapes make the bug invisible, not smaller.
+
+## Decode-only dense-attention requant (`--decode-attn-quant`, 2026-07-29)
+
+Ported from the mlxfast-challenge tree's biggest single lever (their "native affine"
+DARKBLOOM_NATIVE_AFFINE_QKV / _OPROJ stack, which took their frontier from ~1.12 to
+~1.385 in two days of band-limited ratchets). The observation: Laguna ships BF16
+attention over NVFP4 experts, and at decode the four attention projections are ~3 GB of
+a ~4 GB per-token weight read. An INT8 group-32 affine side copy halves that traffic.
+
+Implementation (`transformer.zig`): `attnDqFor` builds the side copy lazily on the first
+eligible dispatch, keyed by the weight's ctx pointer (a probed-ineligible weight caches
+its refusal); `buildAttnDqCopy` transposes the loaded [in, out] dense weight back to
+[out, in], materialises, quantizes int8 g32 affine, and evals eagerly so the build never
+rides a token's graph. The dispatch hook is `attnProj`, called from `lagunaAttnWith` and
+`gatedFullAttnWith` with `batch == 1 and !is_prefill`.
+
+Measured (Laguna XS, fwd_ubench, 3 pairs alternating boot order): 13.285 -> 10.205
+ms/forward median, -23.2%, all pairs in both orders. Quality characterization: six greedy
+code/reasoning prompts on/off — two byte-identical, four diverged in WORDING while
+reaching the same correct answers (the quantized arm's Zig snippet was the more correct
+of the two). Shipped default ON per that characterization; `--no-decode-attn-quant`,
+the app Settings toggle, or `MLX_SERVE_DECODE_ATTN_QUANT=0` restore exact dense decode.
+
+The three load-bearing subtleties:
+
+1. **Spec-verify must see the SAME weights as decode.** The gate is `!is_prefill`, not
+   `seq_len == 1`: a verify forward that read the dense weights would score drafts
+   against a different distribution than the decode steps that produced them, making
+   PLD-on vs PLD-off diverge at temp 0 (the spec-equivalence invariant). With verify
+   quantized too, draft/verify/AR are all consistent and prefill stays the exact anchor.
+2. **Prefill stays dense deliberately.** It is compute-bound (no perf win available) and
+   it writes the KV that the whole conversation attends to — keeping it exact bounds the
+   compounding. Decode-written KV positions do carry the perturbation, which also means
+   a disk-cache entry written by an ON boot restored into an OFF boot differs from what
+   that boot would compute — same order of effect as the int8 step itself, noted not tagged.
+3. **The side copies are additive memory** (~9/16 of the dense attention bytes; ~1.7 GB
+   on Laguna XS) and live until the model unloads.
+
+Not attempted yet from the mlxfast stack: their NVFP4-g16 tail-layer variant (layers >=32
+of 40 quantize to 4-bit — per-layer amplification is ~15x lower late; worth another ~6% of
+the token if the band holds) and o_proj/QKV single-layer depth probes. The toggle name
+stays format-agnostic so those can land behind it.
+
+## Fused decode QK-norm+RoPE (2026-07-29, mlxfast 9e06de6 class)
+
+At decode the q/k chain (reshape → per-head RMSNorm → transpose → RoPE → YaRN mscale on
+full layers) is strictly serial ahead of SDPA — nothing overlaps it — and costs 4-6
+dispatches per layer for a few KB of work. `fusedQkNormRope` does q AND k in one
+32-thread-per-head dispatch. mlxfast promoted the same fusion at +1.73%, their largest
+single bit-exact win, AFTER first rejecting it at -0.19% — the regression was one
+redundant `threadgroup` broadcast + barrier for a value `simd_sum` already hands every
+lane; our kernel never had the barrier.
+
+The three things that made it bit-identical (pinned by the `qk norm rope fused` tests,
+max_diff exactly 0.0 across offsets and both laguna geometries):
+
+1. **cos/sin extracted, never re-derived**: a [1,1,1,rd] f32 probe (ones | zeros) through
+   the stock `mlx_fast_rope` at the token's offset rotates to exactly [cos | sin] — the
+   same floats the composed kernel uses, because the angle math inside rope is float
+   regardless of tensor dtype. Cached per rope family per offset (`qkAngleFor`): 2 probe
+   dispatches per token replace ~160 removed ones.
+2. **Every rounding boundary spelled**: RMS mirrors `rms_single_row` at axis 128 (lane
+   owns 4 contiguous elements, f32 squares in index order, one simd_sum,
+   `precise::rsqrt`), the `T(x*inv)` rounding inside the w-multiply is the value the
+   separate kernel writes, rotation is f32 with one T rounding, and mscale is a SEPARATE
+   bf16 multiply after it (matching the shipped post-rope broadcast, 1.0 on the tail).
+3. **The one bug found by the parity test**: the second-half rotation is
+   `x1*sin + x2*cos` where x2 is the lane's OWN element — writing the naively-symmetric
+   `partner*cos + own*sin` passes at offset 0 (identity rotation) and fails everywhere
+   else. A host-side reconstruction from the probe angles (6e-8 max) localized it to the
+   kernel in one step.
+
+Measured: the eval-per-step fwd_ubench read the fusion +1.2% SLOWER; the LIVE paired A/B
+(real generations, server timings, 2 pairs both orders) reads 8.94 -> 8.80 ms/tok, -1.6%,
+tight spreads. Ship decisions come from the live number (the µbench forces a sync per
+forward, which un-hides exactly the latency this fusion removes). Default ON for laguna;
+`MLX_SERVE_QK_NORM_ROPE_FUSED=0` restores the composed chain. The qwen/gemma wiring
+(gatedFullAttnWith / gemma4MoeAttnWith — every QK-norm arch has this chain) is the
+documented next step; gemma's head_dim 256 needs a different lane mapping.
+
+## Round 4 (2026-07-29): the remaining mlxfast levers — two ship, one is a µbench-vs-live scalp, one dissolves on contact with the checkpoints
+
+Fourth mining pass over the mlxfast-challenge tree, executing the "next round" list from
+`docs/perf-next-levers.md`. Outcomes, in the order attempted:
+
+### Certified lm_head prune: kernels sound, argmax provable, LIVE NULL — ships opt-in
+
+Port of `LagunaLmHeadPrune.swift` (notes/68): an init-time MXFP8-g32 copy of the dense
+bf16 lm_head (half the bytes), one coarse GEMV emitting per-row coarse logit + a
+CERTIFIED bound (half-ulp e4m3 cells + a 2^-15 rounding allowance, top cell 186) + a bf16
+pre-fill; a dense one-byte candidate mask (`coarse+delta >= max(coarse-delta) - |L|/64`);
+an exact pass whose per-row arithmetic textually replicates the stock
+`gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` (verified to be what MLX dispatches
+for this matvec) so every candidate row is bit-identical to the stock GEMV. Every
+argmax-reachable row is provably a candidate; every non-candidate is provably below the
+winner; the emitted token is the stock token.
+
+Three lessons:
+
+1. **The gate is REQUEST-level and must be known at init.** The pruned row is exact
+   at candidates and coarse elsewhere — enough for an argmax, not for a tail
+   distribution. `ForwardCtx.argmax_only` is set by the Generator (greedy or top-1, no
+   penalties, no logprobs, no grammar), and logprobs had to move into `InitOptions`:
+   the split-prefill final-token forward is a single-row dispatch that runs BEFORE any
+   post-init `gen.logprobs_n = n` write, so a logprobs request would have had its first
+   token's logprobs computed from a pruned row.
+2. **A hermetic parity test cannot see reduction order at this scale.** A deliberate
+   perturbation of the exact kernel's accumulation order (grouped instead of sequential)
+   STILL passed the bit-equality test: an f32 last-ulp difference almost always vanishes
+   in the final bf16 cast, and catching one empirically needs ~hundreds of thousands of
+   casts. The live >=160-token greedy on/off run (16M casts) is the real bit-identity
+   bar — same lesson as round 3's fused-QKV divergence at byte 164.
+3. **The µbench-vs-live class, third instance, with the strongest live design yet.**
+   µbench at the real [100352, 2048] geometry, with a separated-winner weight matrix
+   reproducing the LIVE candidate regime (median ~19 of 100352 candidates, measured by
+   `MLX_SERVE_LMHEAD_PRUNE_TRACE=1`): dense 1.04 -> pruned 0.63 ms/iter, a ~0.4 ms/token
+   saving. Live: an INTERLEAVED same-boot A/B — the gate is per-request, and
+   `presence_penalty: 1e-9` clears `argmax_only` while the lazy greedy sampler never
+   applies penalties, so the dense arm is byte-identical work in the SAME boot,
+   alternating per generation, and thermal drift cancels per pair. 20 rounds: median
+   +0.84% per pair, 3/20 wins; the on-arm's early −1.8% advantage decays within a few
+   generations while the off arm stays flat. The µbench saving does not survive the
+   live graph, and the boot-level A/B that "showed" −1.3%/+1.6% was just drift. Where
+   the ~0.5 ms goes live remains unattributed (candidates stay tiny all boot — traced;
+   the threshold chain and select are flat in the stage bisection; the exact pass with
+   a zero mask costs ~0.02 ms net). Shipped `MLX_SERVE_LMHEAD_PRUNE=1` opt-in with the
+   trace + µbench left in place for whoever picks it up.
+
+### MoE down-path tail fusion: −1.5%, bit-identical, default ON
+
+`gatherQmvDownReduce`: the decode expert tail ran down-gather -> score multiply -> sum
+over K as three serial dispatches with a [K, hidden] intermediate between them. One
+kernel now does all three: each simdgroup owns a top-K slot and computes 4 output rows
+(mlxfast tuned 1-vs-4 rows per simd; 4 won), parks bf16 row values in threadgroup
+memory, and slot 0 finishes with the composed pair's exact semantics.
+
+Bit-identity came from two replications, not one:
+- the per-row dot is the SAME `GQMV_BODY_*` text `gatherQmv` compiles (same lane-strided
+  pack loop, same 4-accumulator split, same `simd_sum((a0+a1)+(a2+a3))`, same 2^22 nvfp4
+  fold, same `T(acc)` rounding), so per-(slot,row) values match by construction;
+- the reduction replicates `mlx_multiply` + `mlx_sum_axis(-2)`: per-slot product rounded
+  to T, then an ascending T accumulate — MLX's bf16 sum reduction accumulates in the
+  INPUT dtype (the moeRouterTopK lesson generalizes from row_reduce to this col reduce).
+  The parity test runs BOTH a small geometry and the real [1,1,8,2048] because MLX picks
+  its reduce kernel by shape; both are max_diff 0.0 exactly, nvfp4 AND affine.
+
+Declines are the kernel's own conditions, incl. scores dtype == activation dtype (a
+mismatch would make the composed pair promote to f32 — replicating that would mean an
+f32 tail, so it falls back instead). Live paired A/B on Laguna XS: 8.58 vs 8.71 and
+8.56 vs 8.70 ms/tok, −1.45%/−1.53%, on-arm wins both pairs both orders. Greedy 200-token
+on/off byte-identical. `MLX_SERVE_MOE_DOWN_REDUCE_FUSED=0`.
+
+The reference's shared-expert + residual absorption (their 9th simdgroup) was NOT
+ported: our shared-expert down runs through stock qmv, and absorbing it bit-identically
+means replicating THAT kernel too; the residual+RMS+router fold
+(`DARKBLOOM_FUSED_RESIDUAL_RMS_ROUTER`) was likewise deferred — two more stock-kernel
+replicas for an upper bound of ~0.1–0.2 ms of mostly launch latency, in the same family
+as two measured nulls (fusedAttnGate, fusedAddRmsNorm).
+
+### QK-norm+RoPE for "qwen archs": the checkpoints say no
+
+The port itself was small: rd=32 support in the shipped kernel (the qwen3.5/3.6
+partial-rotary width; the `lane ^ (half_rd/4)` shuffle mapping is exact for 32/64/128),
+wiring into `gatedFullAttnWith` after the `attn_output_gate` split (the strided q view
+rides `ensure_row_contiguous` — parity-pinned including that exact case), M-RoPE decode
+handled via the offset+delta the probe row reproduces exactly. All 4 parity tests are
+max_diff 0.0.
+
+Then the engagement check: SILENT. Every qwen3.5/3.6 checkpoint on disk — 2B, 9B, 27B,
+35B — is **head_dim 256**, not 128. The "hd 128 fits as-is" line in the handoff doc was
+written from the arch family's reputation, not the checkpoints. qwen sits in gemma4's
+needs-a-new-lane-mapping bucket, and the only hd-128 QK-norm models here are the lagunas
+(already fused). The wiring ships dormant (declines at hd != 128, verified byte-identical
+composed-path behaviour on the 2B and the real 27B MoE+MTP stack), and will engage
+unchanged on a future hd-128 arch.
+
+### NVFP4-g16 tail for --decode-attn-quant: −3.3% more, quality holds, default ON
+
+mlxfast quantizes attention layers >= 32 of 40 to real nvfp4 (late-layer quantization
+amplification ~15x lower than early layers). Ours: `attnDqFor` threads the layer,
+`attnDqUseNvfp4` puts the boundary at 80% of `num_hidden_layers`
+(`MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<n>` moves it, `off` restores int8-only), and
+`AttnDqCopy` carries its own (bits, group_size, mode) so the dispatch reads the copy's
+geometry — a tail nvfp4 copy and a body int8 copy ride the same `qmatmulBits` call.
+`buildAttnDqCopy` returns 2 parts for nvfp4 (no biases by construction; null-ctx handle,
+deinit guards it).
+
+Live paired A/B on Laguna XS (on top of the down+reduce fusion): 8.25 vs 8.52 and 8.26
+vs 8.55 ms/tok, −3.15%/−3.39%, 2/2 pairs. The mandatory 6-prompt greedy
+characterization (int8-only vs nvfp4-tail, temp 0, code + arithmetic + SQL + reasoning)
+re-run: all six answers identical in substance (53361, 50 km/h, correct IPv4/SQL/
+quicksort/binary-search), wording-level divergence only — the same class as the round-3
+int8 characterization, so the tail rides the existing default-ON lossy toggle.
+
+### Prefill sorted-MoE tail: already correct by construction
+
+The investigation item ("does our sorted prefill path pay a scatterUnsort-style full
+expert-bank copy?") closes with no change: our tail already does
+`take_axis(down_squeezed, inv_order)` — an ACTIVATIONS-only gather through the inverse
+permutation, which IS mlxfast's fix. The prefill fused gate+up bank (load-time weight
+concat, additive memory) remains open in `docs/perf-next-levers.md`.
+
+## A cached metal_kernel config keyed on element COUNT crashes the server on shape collision (2026-07-29)
+
+**Live failure**: voice-mode chat on `poolside/Laguna-XS-2.1-NVFP4-mlx` killed the server after a
+few turns, twice in one session. The log ends abruptly right after
+`[hot-cache] reused 1015/1032 tokens (matched 1015)` — no error in the file (the MLX fatal goes to
+stderr, which only the app's in-memory buffer sees), no crash report (the mlx-c error handler
+exits). The app-side symptom read as "server crashes with a very long base64" because the debug
+log's last big entries were the voice-clone TTS bodies (~550 KB of `ref_audio` each).
+
+**Actual error** (recovered by replaying the session):
+
+    MLX error: [matmul] Last dimension of first input with shape (1,16,512) must match
+    second to last dimension of second input with shape (8192,2048).
+
+**Root cause**: `fusedSwiGLU`'s cached `mlx_fast_metal_kernel_config` was keyed on
+`{n, tg, ndim, dtype}` — element count, not shape — while the config bakes the builder's OUTPUT
+SHAPE. On Laguna XS a MoE layer's SwiGLU at a 16-token forward has shape (1,16,512) = 8192
+elements; a dense `mlp_only` layer at decode has (1,1,8192) = the same 8192 elements, rank 3,
+bf16, tg 256. Equal key, different shape: the decode call was served the MoE config and returned
+its activation labeled (1,16,512), and the dense down-proj (`x @ W(8192,2048)`) raised an
+uncatchable frontend shape error → process death.
+
+Why EXACTLY 16 tokens: 16 × 512 == 1 × 8192. And the only source of a 16-token forward is a
+hot-cache-restore suffix prefill (cold prefills are whole prompts or ≥1024-token chunks; PLD
+verify is ≤ depth+1). Voice mode was merely the environment that produced it: short spoken turns
+→ the next prompt matches the stored entry to its FULL length → the unmatched suffix (turn
+scaffolding + a short user sentence) lands near 17 tokens → 16 after t1 is split off. Live turns
+died at suffix 17 and survived at 14/15/16/18 — the bisect that looked like a "≥16 kernel gate"
+was really "suffix−1 == 16".
+
+**Diagnosis path worth keeping**: the debug log dumps every request body whole, so the fatal
+session is REPLAYABLE — extract bodies byte-exact (`[http] request body (Nb):` + N bytes) and
+curl them back in order. A byte-exact serial replay did NOT reproduce (the fatal condition needs
+the hot-cache entry to match the previous turn's own generated reply, and a replayed server
+generates different tokens at temp 0.7); an INTERACTIVE replay (feed the server's own answers
+forward) reproduced it on turn 2. Env-var bisect then took minutes: kv-quant off → still dies,
+`--no-pld` → still dies, `--prefix-cache-entries 0` → survives, `MLX_SERVE_SWIGLU_FUSED=0` →
+survives. Note the big TTS bodies are truncated at 16 KB in the log dump, so audio bodies can't
+be replayed from the log alone (chat bodies can).
+
+**Fix**: `ShapeKey` (full dims + rank) replaces every product-derived field in the four cached
+config keys that bake input-derived shapes: `SwigluCfgKey`, `RouterCfgKey`, `AddNormCfgKey`,
+`AttnGateCfgKey`. The gather-family keys (`GateUpCfgKey`, `GqmvCfgKey`, `DownRedCfgKey`) are
+decode-only with fixed-rank shapes fully determined by {topk, n} and were left alone. Guard:
+`test "fused SwiGLU config cache keys on the SHAPE, not the element count (Laguna restore crash)"`
+— (1,16,512) then (1,1,8192), asserting the second output's shape.
+
+**Class rule**: any future cached `metal_kernel` config whose config encodes an output shape,
+grid, or template arg derived from an input shape must key on the FULL shape via `ShapeKey` —
+"same element count" is not "same geometry". Also note the observability lesson: a mislabeled
+elementwise output is byte-correct and only crashes when a downstream op checks shapes; a
+BROADCASTABLE collision would have been silently wrong instead.
+
+## Quantized-KV fused decode reads (2026-07-30, docs/kv-quant-perf.md round)
+
+Three war stories from one round, each already distilled into a `## Rules` line:
+
+**1. The fused flag was a silent no-op on the live decode path.** `--kv-attn-mode fused`
+existed, parsed, was documented, had an equivalence script — and engaged on NOTHING. The
+decode forward calls `cache.update()`, whose affine arm returned its `DenseKVView` WITHOUT
+the quant triples; only the read-only `denseView()` (used by batched decode + diffusion,
+both deliberately excluded) set them. Every "fused vs dense" measurement to date compared
+dense against dense and read neutral. Same class as the two hardcoded `use_drafter=false`
+call sites: output-equality tests structurally cannot see a silent fallback — the
+equivalence script now FAILS unless the fused arm logs both `[kv-attn] fused engaged` and
+`[kv-attn] decode kernel engaged` and the dense arm logs neither.
+
+**2. `0 × -inf = NaN`, and every parity loop was NaN-blind.** The composed causal arm built
+its additive mask as `triu(ones) * -inf` — below the diagonal that is 0 × -inf = NaN, which
+softmax propagates everywhere. Live symptom: gemma-4-e4b answered `<pad><pad>` to any short
+prompt under the (finally-engaged) fused mode; layer-by-layer live diff showed maxdiff=nan
+from the FIRST "causal" layer onward. It shipped green because every parity comparison in
+kv_quant.zig/transformer.zig used `if (e > max_err) max_err = e` — `NaN > x` is FALSE, so an
+all-NaN candidate scores max_err 0 and PASSES. Both fixed together: masks via `mlx_where`,
+and every parity loop asserts `!isNan` per element BEFORE the diff (red-on-revert verified:
+un-fixing the mask fails 4 tests).
+
+**3. The decode kernel's first two designs lost by 5x and 1.7x — both occupancy, not math.**
+v1 (one threadgroup per q head, per-row simd_sum online-softmax chain) starved the GPU: 48
+threadgroups, serial reduction+exp chain per row. v2 (block-parallel two-phase, 2048-row
+blocks) had the right shape but 24-28 KiB of threadgroup memory per group → ~1 threadgroup
+resident per core → no latency hiding (1.9 ms vs dense 1.1 at 48/8 32K). Same kernel at
+≤10 KiB (256-row blocks) wins every ≥32K cell. The µbench→live ladder: 5.7 → 1.9 → 0.83 ms
+against dense 1.10. Live A/B (same boot, per-request `kv_attn_mode` interleave, prefix cache
+serving the long prompt so requests measure DECODE): Laguna XS +10% @10.7K, +56% @42K;
+Qwen3.6-27B +26% @37K — and a −2% regression when Laguna's 512-window sliding layers fused,
+which is where the per-layer `KV_ATTN_FUSED_MIN_TK` floor comes from. The wired-site lesson
+repeated mid-round: the first Laguna A/B read EXACTLY neutral because `lagunaAttnWith` was
+not yet wired and both arms ran dense — the engagement grep (0) was the tell.
+
+## The SSM-checkpoint stride was quietly the biggest prefill lever in the engine (2026-07-30)
+
+llm_context_benchmarks read mlx-serve 19-20% behind oMLX on Qwen3.6-27B prompt processing
+at 8K/32K (196.9 vs 243.6, 179.6 vs 224.6 tok/s) while we WON decode — and the falloff
+shape (us 230→197→180 across 2k/8k/32k, them flat) pointed at something that engages
+between 2K and 8K. `MLX_SERVE_PREFILL_TRACE=1` showed an 8238-token prompt prefilling in
+**33 chunks**: the dense-hybrid arm of `effectiveSsmCheckpointStride` kept the raw
+256-token stride, and `nextChunkEnd` dutifully ended a chunk at every 256-boundary. The
+old rationale ("dense prefill is compute-bound, extra chunks are ~free") pre-dated
+`prefillDqGemm`: with the dq route gated at M ≥ 2048, EVERY projection of EVERY chunk ran
+the slow small-M qmm path, plus 33 graph builds, eval barriers and per-chunk MTP history
+captures. One flag flip (`--ssm-checkpoint-stride 2048`) recovered +19% at 8K same-session.
+Fixes, each measured paired on the 27B (M4 Max):
+
+1. **Stride never sub-divides the prefill chunk, on ANY arch** — the MoE coarsening arm
+   is now universal (`effectiveSsmCheckpointStride(base, prefill_chunk)`); tiny tails also
+   merge under checkpoint alignment (a 1-token trailing chunk existed only to lay a
+   snapshot one token before the always-on end snapshot).
+2. **SSM states are materialized in EVERY chunk's eval batch** (they were gated on
+   stride-aligned boundaries): a tail-merged final chunk ends off-boundary, and the
+   always-on end snapshot then captured an UN-evaluated state — `materializedOwnedCopy`
+   re-executed the whole last chunk's GDN scan (−4% at 8K, invisible in the trace's
+   `eval=` bucket because the re-execution bills to the capture).
+3. **Dense hd-256 fused-causal chunk cap is 8192; MoE keeps 4096** (`boundedPrefillChunk`
+   grew an `is_moe` param): dense hybrids have no expert-gather transients, and the full
+   chunk halves per-chunk dequant sweeps (+1.4% at 8K, flat at 32K). The gemma-26B@99K
+   "+3% for +22 GB peak" lesson still governs MoE.
+4. **The always-on snapshot sits `SSM_SNAPSHOT_BACKOFF` (30) tokens BEFORE prompt end,
+   and the held-back tail rides the final logits forward.** A snapshot exactly at the
+   prompt end is unreachable for the next turn's prefix match: the template's
+   generation-prompt suffix (`<|im_start|>assistant\n` + think opener) renders differently
+   once the turn enters history, so the match always lands a few tokens short —
+   `[hot-cache] hybrid miss (no checkpoint ≤ 870 of 897)` was llmprobe's
+   prompt-cache-prefix cell failing. This is the REAL mechanism behind the 2026-06-10
+   "coarsening disabled every prefix-cache hit" event; the fine stride never fixed it, it
+   just happened to lay boundaries underneath the match point. Backoff sizing matters
+   twice: 64 pushed the tail forward to seq ≥ 32, which `prefillEvalCadenceApplies`
+   treats as a prefill — ~450ms of mid-loop eval bubbles on the 27B; 30 keeps it on the
+   verify-shaped fast path (~1ms). MTP history for the held-back span is appended from
+   the final forward's capture-all (a history hole right before the generation point is
+   acceptance-critical).
+
+Result (same-session, defaults vs defaults): 2k 268 vs oMLX 243 (+10%), 8k ~tie at 252,
+32k ~tie at 224 — from −4/−19/−20%. The 8K/32K ties are physics, not a remaining bug:
+2×27e9 FLOP/token at MLX's measured 14.4 TFLOPS bf16 GEMM rate (89% of the M4 Max's
+theoretical 16.2) puts the 8K roofline at ~30.9s and both engines within 3-6% of it.
+Nobody beats anybody by 5% on a dense-27B prefill on this hardware; the winnable margins
+live at short contexts (fixed overheads) and on MoE/small models.
+
+### A synthetic-dtype reference probe nearly shipped a 2x-bandwidth Inkling forward (2026-07-30)
+Porting Inkling Small, the dtype question was "does the residual stream run bf16 or f32?" — the reference multiplies every dense-MLP output by a `[1]` `global_scale` tensor, and an early python probe (reference modules, MY casts: global_scale → f32 like the "keep_hi" converter comment implied) showed bf16 × f32-array promoting the whole stream to f32 from layer 0. Plan accordingly: f32 KV, f32 experts, 2x bandwidth. WRONG: the REAP25 checkpoint STORES the dense `mlp.global_scale` tensors as BF16 (the base model's were bf16, so the converter's f32-keep condition never fired); only the ROUTER's `gate.bias`/`gate.global_scale` are f32. The real stream is bf16 end-to-end. The probe proved the reference's promotion SEMANTICS while saying nothing about the checkpoint — same family as "read the CHECKPOINT, not the reference source" (Kokoro AdaIN, laguna YaRN), one level up: read the checkpoint's DTYPES, not the converter's intent.
+
+What caught it: the mandatory `[dtype-trace]` arm on first live boot read "residual widened at layer 2: bfloat16 -> float32" — layer 2, not 0. Layers 0-1 (dense) NOT widening disproved the f32-global_scale theory on the spot, and the layer-2 widening localized MY deviation: the routing weights came out of the f32 router chain and multiplied the bf16 expert outputs un-cast, where the reference does `topk_weights.astype(x.dtype)` (and rounds the shared gammas through x.dtype before its f32 shared sum). Fixed to mirror the reference; greedy output then matched the ground truth byte-for-byte on the 32-token prompt (the second prompt diverged at token ~12 into an equivalent continuation — the sanctioned INT4 kernel-order class). Related trap in the same round: the load-time fold of `gate.global_scale` into `route_scale` reads the tensor via `mlx_array_data_float32`, which returns null on a non-f32 tensor — the fold would have been a SILENT no-op had that tensor been bf16 too. Dtype-gate any raw-data read whose tensor dtype you didn't verify.
+
+## mlx_array_new_data copies shape-worth of bytes: the guard-page latent test bug (2026-07-31, dsv4 port session 2)
+
+`transformer.zig`'s "fused residual+RMSNorm declines what it cannot reproduce" test needed a
+[1, 8192] array only for its SHAPE (the fusion's decline path never reads the data), so it
+passed a 16-float stack buffer with an 8192-wide shape. `mlx_array_new_data` memcpy's
+shape×itemsize bytes — a 32 KB read out of a 64-byte buffer. That's UB, but stacks are
+mapped generously and the test stayed green for weeks; the dsv4 GPU-chain edits shifted
+code (and thus frame layout) elsewhere in the binary, the buffer landed near the stack
+guard page, and the memcpy Bus-errored — in a test whose subject had nothing to do with
+the change. Fix: the buffer is really 8192 floats now. Rule: every `mlx_array_new_data`
+buffer must be at least shape-product elements, even when "only the shape matters".
+
+## dsv4: module-owned decode state vs prefix cache + Transformer teardown (2026-07-31)
+
+DeepSeek-V4-Flash native keeps ALL per-request state (raw-kv GPU rows, compressed caches,
+compressor pending rings) on `Dsv4Model.dec_state` — the Transformer's KVCache is a
+0-entry shell whose only live field is `cache.step`, and the serving seam keys on
+`step == 0` to rebuild the state. Two lifecycle consequences, both found by review before
+they shipped:
+
+1. `HotPrefixCache.shouldUse` returned true for dsv4 (no hybrid layers), so a prefix cache
+   would attach, match a repeated prompt, trim it and set `cache.step != 0` — WITHOUT
+   restoring the module-owned state. Best case that silently serves the previous
+   request's rings (often "works" on bench re-runs of the same prompt — the worst kind of
+   wrong); on a fresh boot `mdl.dec_state.?` is null → unreachable = ReleaseFast UB.
+   `shouldUse` now rejects `deepseek_v4` by model_type until the dsv4 state rides the
+   ssm-entry machinery. Guard: prefix_cache + scheduler unit tests.
+
+2. `Transformer.deinit` had no dsv4 arm — the BERT shell inlines its fields into the
+   Transformer (freed by the normal paths), so the MODULE-POINTER pattern (`allocator.create`
+   in initDsv4) had no teardown precedent, and unloading a dsv4 model leaked the entire
+   ~108 GB of mlx handles + host arenas. Any future module-owned arch (the dsv4 pattern is
+   the template) owes the same deinit arm.
+
+## dsv4: the PLD guard bypass — a guard that shapes init options does not bind dispatch (2026-07-31)
+
+The live tool-call request on the DSV4 mirror came back with mangled DSML (dropped token
+runs, wrong-order tag fragments leaked into content) despite TWO spec guards reading as
+airtight: `scheduler.runPrefill` computed
+`is_dsv4 = slot.model.transformer.?.dsv4 != null` and hard-off'd `use_pld`, and (added the
+same session) `Generator.initWithOptions` chokepoint-forced `options.pld_enabled=false`
+when `xfm.dsv4 != null`.
+
+**The log evidence and the illusion.** `~/.mlx-serve/logs/mlx-serve-11234.log` 166348–166361:
+on the two tool-less requests, `spec-gate: ngram-score=0.000` → `pld=disabled (ngram…)` — but
+those lines are printed by the CONN THREAD in server.zig, before the scheduler ever sees the
+request. They prove nothing about what the generator ran; "the guards held" was the ngram
+gate declining naturally. On the tool request the tools JSON is repetitive, the ngram gate
+passed (0.093), and the smoking guns were generator-internal lines:
+`pld=disabled (yield gate: 0 drafted tokens over 8 steps)` (generate.zig) and
+`[spec-stats] mode=pld attempts=2` — `pld_attempted` increments only after a VERIFY forward.
+
+**Root cause: the decode tick dispatched on the slot flag alone.** `runSingleDecodeTick`:
+
+- `if (slot.enable_mtp and gen.mtp != null)` — generator-state conjunct, chokepoint nulls `gen.mtp` → safe
+- `if (slot.enable_drafter and gen.drafter != null)` — same → safe
+- `if (slot.enable_pld)` — NO generator-state conjunct (PLD has no model handle, so there
+  was nothing natural to check) → every tick called `gen.nextPld` regardless
+
+And `nextPld` trusts its caller: it checked only `done` / `specDecodeUnsupported` /
+`spec_disabled_runtime` — `InitOptions.pld_enabled` only ever influenced init behavior (skip
+of the lazy preforward, a log suffix). So both guards worked exactly as written and neither
+mattered: the tick ran nextPld's lookup, found matches in the repetitive tool schema, ran
+verify forwards `[t1, draft…]` through `forwardWith` → dsv4's module-owned decode state
+(compressor rings, kv/comp GPU caches, position bookkeeping) appended 1+m tokens, and the
+KV-snapshot rollback restored only the KVCache SHELL. Two rejected drafts left the module
+state permanently ahead of `cache.step` → every later token attended at wrong
+positions/windows → mangled DSML. mtp/drafter were saved by an ACCIDENT of representation,
+not by design.
+
+**Fix (both sides must agree, and the generator defends itself):**
+
+1. `Generator.pld_enabled` field, set from the POST-chokepoint options — PLD's explicit
+   counterpart of `gen.mtp != null`.
+2. `nextPld` self-declines at the top when `!self.pld_enabled`: delegates to the plain
+   serial `next()` (single-token PldStepResult). Unlike `spec_disabled_runtime` this is
+   permanent — the mid-request re-enable check can never resurrect it (the generated tail
+   of a tool turn IS echo-heavy; a resurrectable disable would re-corrupt).
+3. Tick dispatch through the pure `scheduler.specTickMode(slot flags × generator state)`,
+   hermetic contract test: slot-wants-pld + generator-not-armed → `.regular` for all three
+   modes, plus the MTP > drafter > PLD priority.
+
+**Regression test trick** (`generate.zig` "nextPld on a chokepoint-disabled generator stays
+serial", DSV4_MINI-gated): a random-content prompt can idle in PLD's cold path forever and
+mask the bug — the corruption needs a LOOKUP MATCH. Prompt = every vocab id once (mini
+V=64) + `key_len=1` makes any sampled t1 match an earlier position, guaranteeing a draft
+and therefore a verify forward on the broken code (red read `pld_attempted=5`; green
+requires 0 AND byte-identical tokens vs a serial-arm run on fresh weights).
+
+Audit of the other non-Generator paths: ds4/llama/diffusion slots route out of
+`runSingleDecodeTick` before the spec arms (session pointers / runner checked first) — not
+exposed to this class. Encoder-only models never reach a generator (`textGenRejectReason`).
+
+Bonus find while running the gates: the DSV4_MINI fixtures parity test leaked its
+`loadDsv4Weights` layer table on the skip path (`readAll(fixtures.json) catch return` sat
+AFTER the weight load; ownership only transfers at `initModel`). Skip-path reads now come
+first.
+
+## dsv4 DSpark: lazy stage weights + Metal's zero-filled OOM = fake 100% acceptance of `<BOS>` (2026-07-31)
+
+**Symptom** (real mirror, `MLX_SERVE_DSV4_DSPARK` default-on): greedy chat answered ~2
+correct tokens then `<｜begin▁of▁sentence｜>` (token 0) forever; `[spec-stats]` read
+`accepts=15 avg_per_round=5.00` — a fake 100%. `=0` arm byte-correct. Three mysteries had
+to explain together: (a) stage-2 `moeGpu` returned EXACT zero with healthy inputs AND
+healthy weights (ones-probes read real norms); (b) round-1 VERIFY rows — the trunk path,
+pinned 6/6 on the mini — all argmaxed 0 on a clean prefill; (c) draft `conf` values
+differed per BOOT for the identical request (1+hc_eps / the fp8 amax floor / 0 — "stale
+pool bytes").
+
+**Root cause A (the production bug)**: the DSpark stage weights were never materialized.
+MLX loads are lazy; the house materializer is the WARMUP forward — and dsv4 is the first
+arch whose warmup does not touch every loaded weight (stages only run in the draft). The
+first `dsparkRound` first-touch-materialized ~10.9 GB of 4-bit expert banks MID-REQUEST,
+on top of a 110.8 GB resident trunk, into a 118 GB `max_recommended_working_set_size` box.
+The `[dspark-trace]` active/cache/peak counters caught it as a clean ramp: 110.8 GB →
++1.15 GB per expert bank touched → 117.9 GB at stage-2's w2 gather — where Metal command
+buffers began failing `Insufficient Memory`. **Failing command buffers hand back unwritten
+(zero-filled) buffers with NO surfaced error for many evals** — draft logits all zero →
+argmax token 0; verify logits all zero → argmax token 0; they "agree", so the accept loop
+committed 5/5 `<BOS>` per round. The uncatchable MLX abort only fired boots later (or not
+at all), and where the cliff landed in the ramp varied with pool state — mystery (c)'s
+boot-to-boot nondeterminism. Every earlier structural suspect (ShapeKey collisions,
+arena/lifetime bugs in the draft) was innocent; the all-zero + independent-chains +
+nondeterminism triple is a MEMORY signature.
+
+**Fix**: `initModel` collects every stage tensor via a comptime-reflective walker
+(`appendWeightArrays` — Q triples, optionals, nested structs; a future field cannot be
+silently left out), then decides `dsparkFitsBudget(stage_bytes, trunk_bytes, max_rec,
+6 GB headroom)` on LOGICAL bytes (size × itemsize, known pre-eval) — at init the TRUNK is
+also still lazy, so `mlx_get_active_memory` sees neither side and cannot feed the
+decision (the first fix attempt used active and admitted an 11 GB overflow). Fits → one
+batched `mlx_eval` pays the true footprint at load, where preflight/wired/auto-context
+can see it. Doesn't fit → `n_mtp = 0`: DSpark disabled with a log naming every number,
+serial serve, and the untouched lazy stages cost zero bytes. `MLX_SERVE_DSV4_DSPARK=1`
+(explicit) forces past the check for paging experiments. On the 128 GB box the guard
+fires (trunk 101.4 GB logical + stages 11.0 + headroom 6.1 > 118) — the 4-bit-stage
+mirror structurally cannot serve DSpark there; that is now an honest boot-time line, not
+mid-request corruption.
+
+**Root cause B (found by the same session, SIGBUS)**: `toHostF32` did astype→eval→
+`mlx_array_data_float32`→memcpy. `mlx_astype` to the SAME dtype is a no-op VIEW, so a
+strided/broadcast **f32** input (the dsv4 stream is f32 by design) kept its strides and
+its raw buffer held FEWER elements than the logical count — the memcpy overread stale
+pool bytes (garbage norms in the trace; conf values echoing unrelated constants) and, one
+boot, crossed into another thread's stack guard region (SIGBUS in `_platform_memmove`,
+"crash was associated with thread 3 — possible stray access"). Fix: check
+`isRowMajorContiguous` AFTER eval (strides are unpopulated before), materialize via FLAT
+RESHAPE — a non-row-major layout can never be expressed as a 1-D view, so MLX must copy.
+Add-scalar-zero (the `materializedOwnedCopy` pattern) does NOT materialize a broadcast:
+MLX binary ops propagate the broadcast input's strides to the OUTPUT and compute only the
+unique elements (measured: post-add strides still `{0,1}`). bf16 inputs were always safe
+(cross-dtype astype materializes) — the class needed an f32-stream arch to surface.
+
+**Class guards**: "toHostF32 reads non-contiguous f32 views in logical order" (broadcast
++ column-slice); `dsparkFitsBudget` unit test with the real mirror's numbers; collector
+assertions in the DSV4_MINI load test; and the FULL-ACCEPT seam test
+(`dsparkRoundWith` + a draft rigged to the serial continuation) covering the no-rollback
+branch the random mini can never reach — commits the block, bonus token correct, 3 serial
+tail tokens bit-identical after the round.
+
+## DSpark round-cost round: the barrier, not the transfer (2026-07-31, dsv4)
+
+DSpark shipped correct but SLOW: 13.5–14.0 tok/s against 22.6 serial on the same box.
+The plan's first item was a per-round cost audit, and doing that before touching anything
+is what kept three plausible theories from being implemented in the wrong order.
+
+**The profiler is honest only because the phases already synced.** `MLX_SERVE_DSPARK_PROFILE`
+wall-clocks draft / snapshot / verify / rollback. Unlike `MLX_SERVE_DECODE_PROFILE` (whose
+per-phase evals kill pipelining and make it a lying sizing tool) every boundary measured
+here is ALREADY a host sync in the shipping path: the draft ends in the confidence read,
+both verify paths end in a logits read, the snapshot is pure host work. Zero added evals.
+
+First reading, 195 ms/round committing 4.69 tokens (43 ms/token): **verify 142, rollback 40,
+draft 12.6 (markov 5.0), snapshot 0.24.**
+
+**Trap inside the audit: a phase that is zero on some rounds must not be read as a per-round
+average.** Rollback showed 40 ms/round, which looked like 20% — but it is 0 on every full
+accept, so the real partial-round cost was ~65 ms. The average was right; the interpretation
+("this is a fifth of the round") was not, and it nearly demoted the biggest lever.
+
+### 1. A rollback that re-forwards the accepted prefix is a SECOND forward (+34%)
+
+The partial-accept path restored the entry snapshot and re-ran `extendState` over
+`accepted+1` tokens — a whole batched trunk forward to reproduce state the verify had
+already computed. The comment justifying it was true but too pessimistic: "the compressor
+pending rings are overwritten in place, so partial-position rollback has no anchor short of
+the snapshot". Everything ELSE already rolls back by offset (GpuRows `used`, the append-only
+compressed caches, `st.n`, the DSpark main_kv rings). So capture ONLY the rings, per token,
+while the verify runs: ~12 MB of memcpy for a whole block, measured at **0.24 ms**, replacing
+a ~65 ms forward. Round 195 → 156 ms, decode 22.9 → 30.7 tok/s.
+
+`DsparkAnchors` captures inside the compressor push loop (`captureComp`), so position p holds
+the state after p+1 tokens; `restoreToAnchor` takes offsets from the entry snapshot and ring
+contents from the anchor. Guard: "anchored rollback replays like snapshot + re-extend" runs
+BOTH strategies from the same entry state at every acceptance count and demands bit-identical
+tail decodes — proven red by sabotaging the `sc_pend` copy.
+
+### 2. A host read inside a layer loop is a GPU BARRIER (+16%)
+
+With the rollback gone, verify was 142 of a 156 ms round — and sub-lapping it showed the
+vocab head was only 5.5 ms (the M=B+1 qmm cliff was the obvious suspect and was innocent).
+The real number: **the per-layer compressor-input read was 128 ms of the 143 ms verify.**
+
+The read itself is a few KB. What costs is that each of the 41 reads DRAINS the queue and
+then idles the GPU across the host push loop, so a 43-layer forward is chopped into 41
+serialized stages. The tell was a comparison the profile made free: a batched forward at
+C≈1.6 already cost ~70 ms, while a serial `decodeStep` at C=1 costs 44 — the batched path
+was paying a fixed tax per layer that decode had already fixed for itself (perf round 10's
+`processDeferredComp`, +21.8% at the time, deferred exactly these reads).
+
+Generalized to chunks: a chunk owes the read only if it CLOSES a compression window, because
+only then is a slot emitted that the same chunk's later tokens can see. That is pure position
+arithmetic (`chunkCrossesBoundary` — no data dependency), so the decision is exact rather
+than heuristic. At a C=6 verify the 20 ratio-128 layers defer into ONE batched eval after the
+layer loop; the 21 ratio-4 layers always close a window and still stall. Round 156 → 136 ms,
+decode 30.7 → **35.3 tok/s**.
+
+**The remaining lever is now measured, not guessed**: sync is still 109 ms of the 124 ms
+verify, all of it the ratio-4 layers, and the only way to remove it is to compute the
+compressor emission itself on the GPU (pending ring mirrored GPU-side, masked softmax combine
++ norm/rope/QAT-sim, ring update by slice_update). Estimated ceiling if the barriers go: verify
+~50-60 ms, round ~70 ms, ~15 ms/token. That work also lands on batched prefill and on decode's
+remaining boundary syncs.
+
+### 3. Two levers that measured NEGATIVE, and why they stay in the tree
+
+**The confidence gate.** antirez's ds4 makes the checkpoint's confidence head its biggest
+lever: it truncates the submitted block (and skips the draft LM head entirely below the
+threshold), default `--dspark-confidence 0.9`. Our head is equally informative — harvested
+over 86 live rounds, position 0 scores mean **+5.08** on rounds that accept it vs **+0.02**
+on rounds that reject it. It still lost: no gate 30.7 tok/s, 0.5 → 29.9, **0.9 → 25.3**.
+The reason is in the same profile: our batched forward is FIXED-COST dominated. Fitting
+verify(C) across three live arms (C=6 → 143 ms, 2.86 → 109.5, 1.61 → 87.6) gives roughly
+**70 ms + 12 ms·C** — a narrower block pays nearly the same and commits less. The gate is
+shipped OFF behind `MLX_SERVE_DSV4_DSPARK_CONF` (sigmoid units, matching the reference's
+CLI) with the numbers in the source. A lever's default belongs to the engine that measured
+it, not to the engine it was ported from.
+
+**The sinkhorn config cache.** `hcPreBatch` rebuilt an `mlx_fast_metal_kernel_config` per
+call — 86 per batched forward — which is textbook "a config rebuilt per call is a CPU-side
+tax that reads as kernel cost". Caching it by token count (`sinkhornCfgFor`, the house
+ShapeKey discipline: cache small repeating widths + the prefill sub-chunk, never one-off
+remainders) measured as a wash. Kept because it is strictly less work and the table is
+bounded, but it is NOT where the fixed cost was — the barrier was.
+
+**Also fixed in passing**: `extendState` cleared the MLX allocator cache after every
+sub-chunk, correct for prefill (shapes never repeat across prompt lengths) and exactly
+wrong for spec widths (≤ block+1, repeating every round) — each clear made the next verify
+re-allocate its transients from the OS. `extendChunkShouldClearCache` keys on the house's
+"a multi-token forward is not a prefill" line (seq ≥ 32). Worth ~3%.
+
+### Result
+
+Same box, paired boots, engagement proven per arm (`[spec-stats] mode=dspark`,
+`sub/round=5.00`): serial **22.6/22.7**, DSpark **35.2/35.3 tok/s** = **1.56x** serial and
+1.32x the ds4 GGUF engine's 26.68. Prefill unchanged (135.9 / 143.2 / 127.8 tok/s at
+488 / 1970 / 7823 tokens). Quality gates: `test_dsv4.sh` 14/14 + template A/B 17/17; the
+5-task set 5/5 native (serial AND dspark) vs 5/5 ds4.
+
+**DSpark ON is not token-identical to serial** — the documented near-tie kernel-choice class
+(batched [C] verify vs [1] decode) — and the task set makes that concrete: serial answers
+"17 * 23?" with a bare `391`, DSpark with a correct but rambling paragraph. Also honest:
+on the code task BOTH our arms answer `sum(range(1, 11))**2` (wrong — square of the sum)
+where the ds4 GGUF answers `sum(i*i for i in range(1, 11))`. That is identical in serial, so
+it is our quant mix (2-bit gate/up, 3-bit down, no imatrix) against antirez's imatrix-
+calibrated IQ2XXS/Q2_K, not the engine and not DSpark.

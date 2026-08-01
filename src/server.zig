@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const drafter_mod = @import("drafter.zig");
@@ -354,6 +355,54 @@ const spec_gate_threshold: f32 = 0.01;
 /// defaults that handlers might consult. Populated once by `serve()` from
 /// its CLI args; read-only afterwards (no synchronization required, the
 /// values don't change for the server's lifetime).
+pub const KvAttnMode = enum { dense, fused, auto };
+
+/// docs/kv-quant-perf.md Phase 2 — auto-mode crossover. µbench (Phase 0
+/// table in the doc): the decode kernel is ~break-even with dense-mode reads
+/// at 8K context and wins from ~16K on every measured geometry (48/8 and
+/// 32/8 at hd 128, 16/8 at hd 256), so `auto` engages fused reads from 8K
+/// prompt tokens. One constant to start (per the plan); the per-request
+/// `kv_attn_mode` field and an explicit --kv-attn-mode outrank it.
+pub const KV_ATTN_AUTO_CROSSOVER_TOKENS: usize = 8192;
+
+/// Pure resolution core (unit-tested): explicit per-request choice >
+/// server mode; `auto` = fused iff the request's EFFECTIVE cache scheme is
+/// .affine and the prompt clears the crossover.
+pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usize, scheme: kv_quant_mod.Scheme) bool {
+    if (explicit) |e| return e;
+    return switch (mode) {
+        .dense => false,
+        .fused => true,
+        .auto => scheme == .affine and prompt_len >= KV_ATTN_AUTO_CROSSOVER_TOKENS,
+    };
+}
+
+/// Wrapper reading the live server config + scheduler default scheme.
+fn resolveKvAttnFused(explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
+    const scheme: kv_quant_mod.Scheme = if (kv_override) |o|
+        o.scheme
+    else if (global_scheduler) |sch|
+        sch.kv_quant_config.scheme
+    else
+        .off;
+    return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
+}
+
+/// Per-request `kv_attn_mode` body field: "fused" | "dense" force the read
+/// path; "auto" or an absent/unrecognized value falls back to the server
+/// mode (the kv_quant field's tolerant precedent).
+fn parseKvAttnExplicit(root: std.json.ObjectMap) ?bool {
+    const v = root.get("kv_attn_mode") orelse return null;
+    switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "fused")) return true;
+            if (std.mem.eql(u8, s, "dense")) return false;
+            return null;
+        },
+        else => return null,
+    }
+}
+
 pub const ServerConfig = struct {
     /// Maximum context size (0 = unlimited). `--ctx-size N`.
     max_context_size: u32 = 0,
@@ -368,11 +417,13 @@ pub const ServerConfig = struct {
     default_pld_draft_len: u32 = 5,
     /// N-gram match key length for PLD.
     default_pld_key_len: u32 = 3,
-    /// Phase 2 (Plan ricky): default `kv_attn_fused` for new requests.
-    /// Set by `--kv-attn-mode fused`. Per-request `kv_attn_mode` body
-    /// field overrides. Only takes effect at `--kv-quant 4|8` (.affine
-    /// cache scheme); other schemes ignore it.
-    default_kv_attn_fused: bool = false,
+    /// docs/kv-quant-perf.md Phase 2: how quantized-KV requests READ the
+    /// cache at decode. `--kv-attn-mode dense|fused|auto`; per-request
+    /// `kv_attn_mode` body field ("dense"/"fused") outranks it. Only takes
+    /// effect at `--kv-quant 4|8` (.affine cache scheme); other schemes
+    /// always read dense. `auto` (the default) engages fused reads when the
+    /// prompt is at/above the measured crossover — see `resolveKvAttnFused`.
+    kv_attn_mode: KvAttnMode = .auto,
     /// Defaults for sampling fields the request OMITS, set by `--temp` /
     /// `--top-p` / `--top-k` in serve mode (the macOS app passes its Settings
     /// values so external clients like Claude Code — which send no sampling
@@ -406,9 +457,34 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// MoE targets default OFF because the verify forward pays the expert-routing
 /// penalty; `--mtp` (`default_force_mtp`) overrides that for operators who
 /// measured otherwise — the 35B-A3B sidecar holds ~73% per-draft.
-pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool) bool {
+///
+/// `dsv4_stages`: DeepSeek-V4 DSpark — the checkpoint's OWN draft stages,
+/// designed for exactly this MoE trunk. `dsv4_stages` is true only when the
+/// stages were LOADED (opt-in `--dspark` + memory fit-gate, so `n_mtp > 0`);
+/// then requests default ON outright (the qwen MoE-verify caution is about
+/// a bolted-on sidecar, not a native design). Like qwen MTP it is never
+/// subject to the n-gram prompt gate; explicit `enable_mtp:false` opts out
+/// per request.
+pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool) bool {
+    if (dsv4_stages) return true;
     if (!mtp_loaded) return false;
     return !is_moe or force;
+}
+
+/// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
+fn dsv4DraftStages(lm: *LoadedModel) bool {
+    const x = lm.transformer orelse return false;
+    const d = x.dsv4 orelse return false;
+    return d.n_mtp > 0;
+}
+
+/// Can this model run an MTP-flagged request speculatively? Either a qwen
+/// sidecar/in-checkpoint head (lm.mtp) or dsv4's native DSpark stages. Every
+/// per-surface `enable_mtp` conjunct must use THIS, not `lm.mtp != null` —
+/// the bare conjunct silently killed the flag for dsv4 at submit while the
+/// default/dispatch layers were correct (the per-surface wiring class).
+fn mtpCapable(lm: *LoadedModel) bool {
+    return lm.mtp != null or dsv4DraftStages(lm);
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
@@ -809,6 +885,21 @@ fn decodeTokens(
         return chat_mod.decodeViaLlama(allocator, engine, ids);
     }
     return tok.decode(allocator, ids, strip_leading_space);
+}
+
+/// Assistant-history reasoning field on an incoming chat message:
+/// `reasoning_content` (our own SSE/vLLM field, what pi rounds-trips) with
+/// `reasoning` (the vLLM request spelling laguna's template reads first) as
+/// the fallback. Non-empty strings only — an empty string would render an
+/// empty <think></think> block, which is exactly the nothink signature this
+/// field exists to avoid.
+fn messageReasoningFromObj(obj: std.json.ObjectMap) ?[]const u8 {
+    inline for (.{ "reasoning_content", "reasoning" }) |key| {
+        if (obj.get(key)) |v| {
+            if (v == .string and v.string.len > 0) return v.string;
+        }
+    }
+    return null;
 }
 
 /// True when the rendered generation prompt ends inside a template-opened
@@ -1565,7 +1656,19 @@ fn handleConnection(
     // names like "gpt-4" or "claude-opus-4-x" expecting the local server to
     // just respond with whatever it has loaded; the multi-model registry's
     // strict-id semantics are opt-in by sending an id we registered.
-    var requested_model_id = parseModelFromRequest(request_body, request_content_type) orelse "";
+    // Swift's JSON writers escape '/' as '\\/' (Foundation does this
+    // unconditionally, both JSONSerialization and JSONEncoder). That is legal
+    // JSON, but the id is read out of the RAW body, so an HF-style `org/repo`
+    // id arrived as `Runpod\\/FLUX.2-…`, matched nothing in the registry, and
+    // silently fell through to the default model — a 400 "does not support
+    // this media modality" on the gen endpoints, and a wrong-model answer on
+    // chat (live from the iPhone app, 2026-07-25). Canonicalise once, here,
+    // so every consumer below (proxy, peek, ensureLoaded) sees the real id.
+    var model_id_buf: [512]u8 = undefined;
+    var requested_model_id = lan_mod.unescapeJsonSlashes(
+        &model_id_buf,
+        parseModelFromRequest(request_body, request_content_type) orelse "",
+    );
     // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
     //    its host byte-for-byte, model field rewritten to the bare id.
     //    Any DIRECT client may initiate the hop (loopback app, the
@@ -1899,6 +2002,19 @@ fn ollamaQuantOf(id: []const u8) []const u8 {
     if (std.ascii.findIgnoreCase(id, "q4") != null) return "Q4";
     if (std.ascii.findIgnoreCase(id, "q8") != null) return "Q8";
     return "";
+}
+
+/// Which backend serves this entry — surfaced as `meta.engine` in /v1/models
+/// so the app's engine-aware Settings UI never has to INFER it from
+/// `architecture`: a NATIVE deepseek_v4 safetensors dir and a DeepSeek GGUF
+/// on the embedded ds4 engine report the SAME model_type. "gguf" = an
+/// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
+/// header is read at load time.
+fn modelEngineName(has_ds4: bool, has_llama: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+    if (has_ds4) return "ds4";
+    if (has_llama) return "llama";
+    if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
+    return "mlx";
 }
 
 /// Snapshot one registry entry into the pure TagEntry shape. Caller holds
@@ -2321,6 +2437,63 @@ fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system
     return @min(working_set_limit, mlx_footprint +| free_system);
 }
 
+/// PURE (unit-testable): the cap to put on MLX's reclaimable buffer pool for a
+/// machine with `total_ram` bytes of physical memory. 0 when the RAM query
+/// failed — never clamp on bad data.
+///
+/// MLX's own default is `min(1.5 x working_set, 0.95 x RAM)` with a GC limit at
+/// `0.95 x working_set` (`backend/metal/allocator.cpp`) — ~121 GB / ~91 GB on a
+/// 128 GB Mac, i.e. it does not trim until the machine is already dead. Freed
+/// buffers are parked in that pool instead of going back to the OS, so anything
+/// that frees never-repeating sizes in a loop (KV growth, decode transients)
+/// grows the process footprint without moving `active_bytes` at all. Issue #110:
+/// 81.4 GB in Activity Monitor against 19.6 GB in the panel.
+///
+/// RAM/16 is big enough for the step-to-step buffer reuse the pool exists for
+/// (8 GB on a 128 GB Mac) and small enough that it can never be the footprint.
+/// The 2 GB floor keeps 8/16 GB machines from thrashing the allocator.
+pub fn mlxCacheLimitBytes(total_ram: u64) u64 {
+    if (total_ram == 0) return 0;
+    const GB: u64 = 1 << 30;
+    return @max(2 * GB, @min(8 * GB, total_ram / 16));
+}
+
+/// PURE: resolve the cap from `MLX_SERVE_CACHE_LIMIT` (bytes) over the
+/// RAM-proportional default. `0` means "leave MLX's default alone" — the
+/// same-boot A/B off-switch. Anything unparseable falls through to the default
+/// rather than silently disabling the cap.
+pub fn mlxCacheLimitFromEnv(raw: ?[]const u8, total_ram: u64) u64 {
+    if (raw) |v| {
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (std.fmt.parseInt(u64, trimmed, 10) catch null) |n| return n;
+    }
+    return mlxCacheLimitBytes(total_ram);
+}
+
+/// Impure wrapper: apply the cap to the live MLX allocator. Called ONCE from
+/// `main()`, above every subcommand branch — not per serve path, because a
+/// hand-rolled per-path config is exactly how `runHeadlessServe` (the mode the
+/// app always launches) came to silently eat the `--pld*` flags.
+///
+/// Never RAISES a tighter existing cap: `scheduler.runGenRequest` drops the pool
+/// to 1 GB on small-RAM machines during media gen, and iOS boots at 384 MB.
+pub fn applyMlxCacheLimit() void {
+    const env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_CACHE_LIMIT")) |p|
+        std.mem.span(p)
+    else
+        null;
+    const cap = mlxCacheLimitFromEnv(env, metrics.getTotalMemBytes());
+    if (cap == 0) return;
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, @intCast(cap));
+    if (prev < cap) {
+        var tmp: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&tmp, prev);
+        return;
+    }
+    log.info("[mem] MLX buffer-pool cap {d} MB (was {d} MB)\n", .{ cap >> 20, prev >> 20 });
+}
+
 /// Impure wrapper: current GPU allocation ceiling from live MLX + system
 /// counters. `mlx_footprint` = active (in-use) + cache (reclaimable) so an
 /// idle machine's ceiling stays ≈ the static device max (no auto-context
@@ -2504,7 +2677,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
         (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(config.head_dim, config.num_attention_heads, prompt_len, config.has_sliding_window));
+    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(config.head_dim, config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe()));
     const needed: u64 = prefillMemoryNeeded(seq, heads, kv_heads, layers, hdim, hidden, ffn, kv_bits, chunk);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
@@ -2805,7 +2978,7 @@ fn renderModelEntry(
         defer allocator.free(gen_top_k_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -2814,6 +2987,7 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             config.model_type,
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -2922,6 +3096,13 @@ fn renderModelEntry(
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
+    // Unloaded entries have no engine attached yet — "gguf" (undetermined
+    // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
+    const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
+        modelEngineName(false, false, entry.path, entry.arch_hint),
+    });
+    defer allocator.free(engine_part);
+
     // Dimensions/context/quant/MoE — emitted only when config.json was readable.
     const dims_part: []const u8 = if (sm.found) blk: {
         break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":\"{d}-bit\",\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},", .{
@@ -2937,8 +3118,8 @@ fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s},"meta":{{{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, mods_part, arch_part, dims_part, bytes_on_disk_str });
+        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 fn handleModels(
@@ -3295,13 +3476,19 @@ fn renderPropsBody(
     peak_mem: usize,
     available_mem: u64,
     safe_ctx: u32,
+    cache_mem: usize,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
     // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
     // "Free RAM" line can never drift from the number that gates a load. Distinct
     // axis from `active_bytes` (the MLX GPU-allocator footprint).
+    //
+    // `cache_bytes` is MLX's reclaimable buffer pool — memory the process HOLDS
+    // but is not using. It is a third axis again, and its absence is why #110
+    // was invisible: the panel read 19.6 GB of `active_bytes` while the process
+    // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d}}}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}}}
     , .{
         config.model_type,        ctx_str,
         config.vocab_size,        config.hidden_size,
@@ -3311,6 +3498,7 @@ fn renderPropsBody(
         config.max_position_embeddings,
         active_mem,               peak_mem,
         available_mem,            safe_ctx,
+        cache_mem,
     });
 }
 
@@ -3331,6 +3519,11 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // 0/0 indeterminate state for the entire DSV4 session.
     var active_mem: usize = 0;
     var peak_mem: usize = 0;
+    // MLX's reclaimable buffer pool. Always read from MLX — the embedded
+    // engines don't feed it, so it correctly reads ~0 on a ds4/llama session
+    // rather than needing a per-engine branch.
+    var cache_mem: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cache_mem);
     if (lm.ds4_engine != null) {
         // Static estimate: GGUF mmap size (set on the entry at registry-stub
         // time in `runDs4Serve`) plus ds4's reported KV/scratch for the
@@ -3358,7 +3551,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // "Free RAM" line stays in lockstep with what gates a load.
     const available_mem = metrics.getAvailableMemBytes();
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx);
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -3811,7 +4004,11 @@ fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) EscapedText
     return .{ .slice = s, .owned = true };
 }
 
-const ReasoningEffort = struct { enable: bool, budget: i32 };
+/// `effort` is the client's raw string, borrowed from the parsed request JSON
+/// (which outlives the handler) — dsv4-family templates map it into the
+/// render via `chat.dsv4EffortFor`; every other consumer only reads
+/// enable/budget.
+const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null };
 
 /// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
 /// low | medium | high | xhigh — values are model-dependent, so unknown
@@ -3821,8 +4018,8 @@ const ReasoningEffort = struct { enable: bool, budget: i32 };
 fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32) ?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
-    if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget };
-    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget) };
+    if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget, .effort = v.string };
+    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget), .effort = v.string };
 }
 
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
@@ -4000,8 +4197,17 @@ fn handleChatCompletions(
         else
             null;
 
+        // Reasoning the client round-trips on assistant history. Dropping it
+        // starves templates that persist reasoning across turns (laguna): every
+        // prior turn renders the empty <think></think> nothink signature and
+        // the model stops thinking from turn 2 of a session.
+        const msg_reasoning: ?[]const u8 = if (std.mem.eql(u8, role_val.string, "assistant"))
+            messageReasoningFromObj(obj)
+        else
+            null;
+
         // Skip messages with no content, no tool_calls, and no images/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_audio == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -4010,6 +4216,7 @@ fn handleChatCompletions(
             .tool_call_id = tool_call_id,
             .images = msg_images,
             .audio = msg_audio,
+            .reasoning_content = msg_reasoning,
         });
     }
 
@@ -4239,6 +4446,7 @@ fn handleChatCompletions(
             .turboquant_2, .turboquant_4 => log.info("  kv-quant override: turboquant {d}-bit (per-request)\n", .{kq.bits}),
         }
     }
+    const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Parse enable_pld: per-request override of the --pld default.
     //
@@ -4302,8 +4510,8 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
         enable_mtp = false;
@@ -4349,7 +4557,7 @@ fn handleChatCompletions(
     // step. The cache is engine-agnostic — same hit even when the
     // underlying call is ds4 / llama / MLX formatChat.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null);
     const tokenize_ns = tokenize_sw.read();
 
     // Run vision encoder if any messages contain images. Phase A8: each
@@ -4385,7 +4593,8 @@ fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
 
@@ -4477,7 +4686,7 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -4488,7 +4697,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -4618,8 +4827,8 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
@@ -4648,7 +4857,8 @@ fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
 
@@ -4718,11 +4928,11 @@ fn handleNonStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     // Spec dispatch (priority MTP > drafter > PLD; mirrors handleNonStreamingGeneration).
-    const use_mtp = enable_mtp and lm.mtp != null and sampling.constraint == null;
+    const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
     const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, 0, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, 0, null, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -4797,7 +5007,7 @@ fn handleStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -4825,7 +5035,7 @@ fn handleStreamingCompletion(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(null, prompt_ids.len, null),
         .logprobs_n = 0,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -5000,6 +5210,7 @@ fn nonStreamingViaScheduler(
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -5019,12 +5230,12 @@ fn nonStreamingViaScheduler(
         .enable_drafter = enable_drafter and lm.drafter != null,
         .drafter = if (enable_drafter) lm.drafter else null,
         .drafter_block_size = lm.drafter_block_size,
-        .enable_mtp = enable_mtp and lm.mtp != null,
+        .enable_mtp = enable_mtp and mtpCapable(lm),
         .mtp = if (enable_mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
@@ -5119,6 +5330,7 @@ fn handleNonStreamingGeneration(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
@@ -5137,7 +5349,7 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const use_mtp = enable_mtp and logprobs_n == 0 and lm.mtp != null and sampling.constraint == null;
+    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and lm.drafter != null and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
@@ -5147,7 +5359,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -5679,6 +5891,7 @@ fn handleStreamingGeneration(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns measured by the request handler before
     /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
     /// usage SSE chunk so streaming clients see the same metric as
@@ -5703,7 +5916,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -5738,7 +5951,7 @@ fn handleStreamingGeneration(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
         .mrope_pos = mrope.pos,
@@ -5928,9 +6141,7 @@ fn handleStreamingGeneration(
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
                             // Skip bare channel/think tags that leak without a full block
-                            if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
-                                std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
-                            {
+                            if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null, null);
@@ -5955,6 +6166,17 @@ fn handleStreamingGeneration(
                     // Remove the opener (<think> or the Hy3-suffixed form) and
                     // any leading newline.
                     var skip: usize = olen;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
+                    // Inkling thinking message (opener is ONE special token) —
+                    // the message closes with <|end_message|>.
+                    think_close_tag = "<|end_message|>";
+                    var skip: usize = "<|content_thinking|>".len;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                     think_buf.clearAndFree(allocator);
@@ -6004,7 +6226,21 @@ fn handleStreamingGeneration(
             // families (indexOfThinkCloseTag covers bare AND suffixed </think…>).
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
+            // Inkling: an Inkling thinking message closes at <|end_message|>
+            // (gated on the opener having switched think_close_tag so prose
+            // that MENTIONS the literal in another family never matches), and
+            // a leading <|content_text|> means the model answered DIRECTLY —
+            // close immediately with empty reasoning.
+            const inkling_pos: ?usize = blk_i: {
+                if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk_i 0;
+                if (std.mem.eql(u8, think_close_tag, "<|end_message|>")) {
+                    if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk_i p;
+                }
+                break :blk_i null;
+            };
+            const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -6024,6 +6260,11 @@ fn handleStreamingGeneration(
                 } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                     content_after = content_after[10..];
                 }
+                // Strip Inkling content-message markers after the close; the
+                // content message ends at its own <|end_message|>.
+                if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
+                if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null, null);
@@ -6051,7 +6292,7 @@ fn handleStreamingGeneration(
         } else {
             defer allocator.free(token_text);
             // Skip Gemma 4 channel tags that leak after thinking blocks
-            if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) {
+            if (chat_mod.isChannelMarkerToken(token_text)) {
                 continue;
             }
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = token_text }, null, null, null);
@@ -6441,6 +6682,13 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // System gauges (non-blocking syscalls).
     ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
     ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
+    // The two halves of the MLX allocator, so `memory_mb`'s gap has a name.
+    var mlx_active: usize = 0;
+    var mlx_cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&mlx_active);
+    _ = mlx.mlx_get_cache_memory(&mlx_cache);
+    ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
+    ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -6578,7 +6826,11 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         .denied => return "This endpoint is host-local; LAN sharing exposes inference on shared models only",
         .model_gated => {},
     }
-    const mid = parseModelFromRequest(body, content_type) orelse "";
+    var mid_buf: [512]u8 = undefined;
+    const mid = lan_mod.unescapeJsonSlashes(
+        &mid_buf,
+        parseModelFromRequest(body, content_type) orelse "",
+    );
     if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model
@@ -7005,6 +7257,27 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Body text for a context-overflow 400, in a caller-owned buffer.
+///
+/// The COUNTS are the point. "Prompt exceeds maximum context length" tells a
+/// client only that it failed; with both numbers the client can say how far
+/// over it went and offer the one action that fixes it (raise the context to
+/// N). Our own app renders exactly that, and the numbers are only knowable
+/// here — the request is rejected before any usage is reported.
+///
+/// The legacy sentence stays the PREFIX: `APIError.looksLikeContextOverflow`
+/// and third-party clients key on it, so appending must not move it. Output is
+/// digits and spaces, so it carries no escaping hazard into the JSON sink, and
+/// a bufPrint failure falls back to the bare sentence rather than sending no
+/// body at all (the media-gen fixed-buffer class).
+fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "Prompt exceeds maximum context length: {d} tokens requested, {d} available",
+        .{ prompt_tokens, ctx },
+    ) catch "Prompt exceeds maximum context length";
+}
+
 fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
@@ -7076,21 +7349,24 @@ fn cachedFormatChat(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    reasoning_effort: ?[]const u8,
 ) ![]u32 {
     const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
     const key_opt: ?u64 = if (cache_ptr != null)
-        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking)
+        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort)
     else
         null;
     if (cache_ptr) |cache| if (key_opt) |key| {
         if (try cache.get(io, key, allocator)) |cached| return cached;
     };
+    // ds4 renders through the GGUF engine's own template, which never reads
+    // the effort string — only the Jinja paths thread it.
     const ids = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking)
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort)
     else
-        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort);
     if (cache_ptr) |cache| if (key_opt) |key| {
         // Insert is best-effort; an OOM in the cache shouldn't fail the
         // request — the user already has their tokenized prompt.
@@ -8265,9 +8541,11 @@ fn handleAnthropicMessages(
                     try messages.append(allocator, .{ .role = "assistant", .content = s, .tool_calls = null, .tool_call_id = null });
                 },
                 .array => |arr| {
-                    // Extract text and tool_use blocks
+                    // Extract text, tool_use and thinking blocks
                     var text_content = std.ArrayList(u8).empty;
                     defer text_content.deinit(allocator);
+                    var think_content = std.ArrayList(u8).empty;
+                    defer think_content.deinit(allocator);
                     var tcs = std.ArrayList(chat_mod.ToolCall).empty;
 
                     for (arr.items) |block| {
@@ -8290,8 +8568,18 @@ fn handleAnthropicMessages(
                             const args_str = try args_buf.toOwnedSlice(allocator);
                             try arg_allocs.append(allocator, args_str);
                             try tcs.append(allocator, .{ .id = tc_id, .name = tc_name, .arguments = args_str });
+                        } else if (std.mem.eql(u8, btype, "thinking")) {
+                            // History reasoning → Message.reasoning_content, same
+                            // round-trip as chat completions' reasoning_content:
+                            // templates that persist reasoning across turns
+                            // (laguna) starve into nothink without it.
+                            // "redacted_thinking" stays skipped (opaque payload).
+                            const t = if (block.object.get("thinking")) |v| (if (v == .string) v.string else "") else "";
+                            if (t.len > 0) {
+                                if (think_content.items.len > 0) try think_content.append(allocator, '\n');
+                                try think_content.appendSlice(allocator, t);
+                            }
                         }
-                        // Skip "thinking" and "redacted_thinking" — model generates its own
                     }
 
                     var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
@@ -8308,7 +8596,12 @@ fn handleAnthropicMessages(
                         try content_allocs.append(allocator, duped);
                         break :blk duped;
                     } else "";
-                    try messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .tool_call_id = null });
+                    const msg_reasoning: ?[]const u8 = if (think_content.items.len > 0) blk: {
+                        const duped = try allocator.dupe(u8, think_content.items);
+                        try content_allocs.append(allocator, duped);
+                        break :blk duped;
+                    } else null;
+                    try messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .tool_call_id = null, .reasoning_content = msg_reasoning });
                 },
                 else => {},
             };
@@ -8408,6 +8701,7 @@ fn handleAnthropicMessages(
 
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
     const kv_quant_override = parseKvQuantOverride(root);
+    const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Per-request PLD override (mirror chat-completions behavior: tools and
     // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
@@ -8430,8 +8724,8 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
@@ -8451,7 +8745,9 @@ fn handleAnthropicMessages(
     // the cache key consistent with what the encoder actually sees.
     const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking);
+    // Anthropic's thinking opt-in is a budget object — it carries no
+    // OpenAI-style effort string, so dsv4 templates get their default.
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, null);
     const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
@@ -8496,7 +8792,8 @@ fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
 
@@ -8520,7 +8817,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -8529,7 +8826,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -8563,6 +8860,7 @@ fn handleAnthropicNonStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
@@ -8578,7 +8876,7 @@ fn handleAnthropicNonStreaming(
     // Speculative decoding dispatch — same priority as chat-completions
     // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
-    const use_mtp = enable_mtp and lm.mtp != null and sampling.constraint == null;
+    const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
     const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
@@ -8593,7 +8891,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -8787,6 +9085,7 @@ fn handleAnthropicStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
     /// doesn't currently emit `timings` over SSE (spec doesn't model it),
     /// but plumbing the value through keeps the signature consistent with
@@ -8803,7 +9102,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -8834,7 +9133,7 @@ fn handleAnthropicStreaming(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .kv_quant_config = kv_quant_override,
@@ -8973,13 +9272,15 @@ fn handleAnthropicStreaming(
         }
 
         if (has_tools) {
-            // Buffer for tool detection
+            // Buffer for tool detection. Detection rules live in
+            // `chat.streamShouldBufferForTools` — the SAME predicate as the
+            // chat-completions stream (this path once carried its own inline
+            // subset, which missed the Inkling invoke marker: the 2026-07-30
+            // NAME+JSON content leak, and before that the drift class the
+            // think gate was unified for).
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
-            const maybe_tool = std.mem.indexOf(u8, buf, "<tool_call") != null or
-                std.mem.indexOf(u8, buf, "<|tool_call") != null or
-                (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) or
-                (buf.len >= 1 and buf[buf.len - 1] == '<');
+            const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
                 // Shared gate with the chat-completions stream (the two paths
@@ -9028,9 +9329,7 @@ fn handleAnthropicStreaming(
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
                             // Skip bare think/channel tags that leak without a block
-                            if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
-                                std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
-                            {
+                            if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
                             if (!text_block_open) {
@@ -9056,6 +9355,24 @@ fn handleAnthropicStreaming(
             if (!skipped_think_open and think_buf.items.len >= 7) {
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     var skip: usize = olen;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                    if (!thinking_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        thinking_block_open = true;
+                    }
+                } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
+                    // Inkling thinking message — closes at <|end_message|>.
+                    think_close_tag = "<|end_message|>";
+                    var skip: usize = "<|content_thinking|>".len;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                     think_buf.clearAndFree(allocator);
@@ -9126,7 +9443,19 @@ fn handleAnthropicStreaming(
             // (indexOfThinkCloseTag covers bare AND Hy3-suffixed </think…>).
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
+            // Inkling: <|end_message|> closes the thinking message (gated on
+            // the opener having switched think_close_tag); a leading
+            // <|content_text|> is a DIRECT answer — empty reasoning.
+            const inkling_pos: ?usize = blk_i: {
+                if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk_i 0;
+                if (std.mem.eql(u8, think_close_tag, "<|end_message|>")) {
+                    if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk_i p;
+                }
+                break :blk_i null;
+            };
+            const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -9147,6 +9476,9 @@ fn handleAnthropicStreaming(
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) content_after = content_after[11..];
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
+                if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
+                if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     if (!text_block_open) {
@@ -9179,7 +9511,7 @@ fn handleAnthropicStreaming(
         } else {
             // Regular content token
             defer allocator.free(token_text);
-            if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) continue;
+            if (chat_mod.isChannelMarkerToken(token_text)) continue;
             if (!text_block_open) {
                 const sd = try std.fmt.allocPrint(allocator,
                     \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -9858,7 +10190,7 @@ fn handleResponses(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort);
     const tokenize_ns = tokenize_sw.read();
 
     // ── vision encoder ──
@@ -9885,10 +10217,12 @@ fn handleResponses(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
     const kv_quant_override = parseKvQuantOverride(root);
+    const kv_attn_explicit = parseKvAttnExplicit(root);
     if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm)) return;
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
@@ -10040,8 +10374,8 @@ fn handleResponses(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -10097,7 +10431,7 @@ fn handleResponses(
             .vision_embeddings = slot_ve_resp,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
-            .kv_attn_fused = server_config.default_kv_attn_fused,
+            .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         });
@@ -10117,6 +10451,8 @@ fn handleResponses(
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var skipped_think_open = false;
+        // Inkling thinking message seen — its close is <|end_message|>.
+        var inkling_think = false;
         var live_output_index: u32 = 0;
 
         while (true) {
@@ -10219,6 +10555,16 @@ fn handleResponses(
                         try think_buf.appendSlice(allocator, remaining);
                         allocator.free(remaining);
                         skipped_think_open = true;
+                    } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
+                        // Inkling thinking message — closes at <|end_message|>.
+                        var skip: usize = "<|content_thinking|>".len;
+                        while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                        const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                        think_buf.clearAndFree(allocator);
+                        try think_buf.appendSlice(allocator, remaining);
+                        allocator.free(remaining);
+                        skipped_think_open = true;
+                        inkling_think = true;
                     } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                         var skip: usize = 17;
                         while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -10234,10 +10580,16 @@ fn handleResponses(
                     }
                 }
 
-                // Detect close tag (</think> or <channel|>).
+                // Detect close tag (</think>, <channel|>, or Inkling's
+                // <|end_message|>; a leading <|content_text|> is a DIRECT
+                // Inkling answer — close immediately with empty reasoning).
                 const tp = std.mem.indexOf(u8, think_buf.items, "</think>");
                 const cp = std.mem.indexOf(u8, think_buf.items, "<channel|>");
                 const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
+                    if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk .{ .pos = 0, .tag = "<|content_text|>" };
+                    if (inkling_think) {
+                        if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk .{ .pos = p, .tag = "<|end_message|>" };
+                    }
                     if (tp == null and cp == null) break :blk null;
                     if (tp == null) break :blk .{ .pos = cp.?, .tag = "<channel|>" };
                     if (cp == null) break :blk .{ .pos = tp.?, .tag = "</think>" };
@@ -10265,6 +10617,9 @@ fn handleResponses(
                     } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                         content_after = content_after[10..];
                     }
+                    if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
+                    if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                    if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                     content_after = std.mem.trimStart(u8, content_after, "\n ");
                     if (content_after.len > 0) {
                         if (!streamed_message_started) {
@@ -10298,7 +10653,7 @@ fn handleResponses(
                 }
             } else {
                 // Skip Gemma 4 channel tags that may leak after the thinking block.
-                if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) continue;
+                if (chat_mod.isChannelMarkerToken(token_text)) continue;
                 if (!streamed_message_started) {
                     streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
@@ -10351,7 +10706,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -12394,7 +12749,7 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
@@ -12413,7 +12768,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
@@ -12425,6 +12780,39 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null);     // Swift fetchProps
     try testing.expect(std.mem.indexOf(u8, body, "\"available_bytes\":9000000000") != null); // Swift fetchProps (Free RAM line)
     try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
+    // #110: the panel showed 19.6 GB (active) while the process held 81 GB.
+    // The missing 61 GB was MLX's reclaimable buffer pool, which nothing we
+    // expose reported — so the bug was invisible from every surface.
+    try testing.expect(std.mem.indexOf(u8, body, "\"cache_bytes\":4321") != null); // Swift fetchProps
+}
+
+test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {
+    const GB: u64 = 1 << 30;
+    // MLX's own default is min(1.5 x working_set, 0.95 x RAM) — ~121 GB on a
+    // 128 GB Mac (`backend/metal/allocator.cpp`), i.e. it will not trim until
+    // the machine is already dead. RAM/16 keeps the pool big enough for
+    // step-to-step buffer reuse without letting it become the footprint.
+    try testing.expectEqual(8 * GB, mlxCacheLimitBytes(128 * GB));
+    try testing.expectEqual(4 * GB, mlxCacheLimitBytes(64 * GB));
+    try testing.expectEqual(2 * GB, mlxCacheLimitBytes(32 * GB)); // 2 GB exactly
+    try testing.expectEqual(2 * GB, mlxCacheLimitBytes(16 * GB)); // floor
+    try testing.expectEqual(2 * GB, mlxCacheLimitBytes(8 * GB)); // floor
+    // Ceiling holds above 128 GB (Mac Studio / M3 Ultra 512 GB).
+    try testing.expectEqual(8 * GB, mlxCacheLimitBytes(512 * GB));
+    // A failed `hw.memsize` read is 0 — never clamp on bad data.
+    try testing.expectEqual(@as(u64, 0), mlxCacheLimitBytes(0));
+}
+
+test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls through" {
+    const GB: u64 = 1 << 30;
+    // The A/B off-switch: MLX_SERVE_CACHE_LIMIT=0 leaves MLX's default in
+    // place so the pre-#110 behavior stays reachable in a same-boot A/B.
+    try testing.expectEqual(@as(u64, 0), mlxCacheLimitFromEnv("0", 128 * GB));
+    try testing.expectEqual(@as(u64, 3 * GB), mlxCacheLimitFromEnv("3221225472", 128 * GB));
+    // Unset or unparseable → the RAM-proportional default.
+    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv(null, 128 * GB));
+    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("lots", 128 * GB));
+    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
 }
 
 
@@ -12823,7 +13211,17 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        try std.testing.expectEqual(case.expect, parseReasoningEffort(parsed.value.object, -1));
+        const got = parseReasoningEffort(parsed.value.object, -1);
+        if (case.expect) |want| {
+            try std.testing.expectEqual(want.enable, got.?.enable);
+            try std.testing.expectEqual(want.budget, got.?.budget);
+            // The raw client string always rides along (dsv4 templates map it
+            // into the render); it is the request body's own bytes.
+            const v = parsed.value.object.get("reasoning_effort").?;
+            try std.testing.expectEqualStrings(v.string, got.?.effort.?);
+        } else {
+            try std.testing.expect(got == null);
+        }
     }
 }
 
@@ -13098,20 +13496,43 @@ test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormal
     for (zt) |x| try t.expect(!std.math.isNan(x));
 }
 
+test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" {
+    const t = std.testing;
+    // Explicit per-request choice outranks every mode.
+    try t.expect(resolveKvAttnFusedPure(.dense, true, 0, .off));
+    try t.expect(!resolveKvAttnFusedPure(.fused, false, 1 << 20, .affine));
+    // Fixed modes.
+    try t.expect(!resolveKvAttnFusedPure(.dense, null, 1 << 20, .affine));
+    try t.expect(resolveKvAttnFusedPure(.fused, null, 0, .affine));
+    // Auto: affine + prompt at/above the crossover.
+    try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS, .affine));
+    try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS + 1, .affine));
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS - 1, .affine));
+    // Auto never engages on non-affine schemes (TurboQuant needs the
+    // rotation undo the fused path doesn't implement; off has no triples).
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_2));
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_4));
+}
+
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
     const t = std.testing;
     // No sidecar loaded → never on, whatever the operator asked for.
-    try t.expect(!defaultEnableMtp(false, false, false));
-    try t.expect(!defaultEnableMtp(false, true, true));
+    try t.expect(!defaultEnableMtp(false, false, false, false));
+    try t.expect(!defaultEnableMtp(false, true, true, false));
     // Dense target with a sidecar → on by default (unchanged behavior).
-    try t.expect(defaultEnableMtp(true, false, false));
-    try t.expect(defaultEnableMtp(true, false, true));
+    try t.expect(defaultEnableMtp(true, false, false, false));
+    try t.expect(defaultEnableMtp(true, false, true, false));
     // MoE target → OFF by default (the verify-forward routing caution) ...
-    try t.expect(!defaultEnableMtp(true, true, false));
+    try t.expect(!defaultEnableMtp(true, true, false, false));
     // ... but ON when the operator passed --mtp. Without this, a MoE MTP
     // checkpoint is unreachable from any client that doesn't send
     // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
-    try t.expect(defaultEnableMtp(true, true, true));
+    try t.expect(defaultEnableMtp(true, true, true, false));
+    // DSpark: dsv4's own stages default ON outright — MoE-ness and --mtp
+    // never gate the checkpoint's native draft design.
+    try t.expect(defaultEnableMtp(false, true, false, true));
+    try t.expect(defaultEnableMtp(false, false, false, true));
 }
 
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
@@ -13139,4 +13560,75 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
     try t.expectEqualStrings(
         \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
     , with_details);
+}
+
+test "contextOverflowMessage: the 400 names both counts so a client can act on it" {
+    const t = std.testing;
+    var buf: [160]u8 = undefined;
+
+    // The counts ARE the feature: without them a client can only say "too
+    // long", and our own app can't offer "raise the context to N" — which is
+    // the one action that fixes it.
+    const msg = contextOverflowMessage(&buf, 4108, 4096);
+    try t.expectEqualStrings(
+        "Prompt exceeds maximum context length: 4108 tokens requested, 4096 available", msg);
+
+    // Legacy prefix preserved verbatim — APIError.looksLikeContextOverflow and
+    // every third-party client key on this exact phrase.
+    try t.expect(std.mem.startsWith(u8, msg, "Prompt exceeds maximum context length"));
+
+    // No quotes or control bytes, so the message is safe to drop into a JSON
+    // error body without escaping (the appendJsonString class).
+    for (msg) |c| try t.expect(c >= 0x20 and c != '"' and c != '\\');
+}
+
+test "contextOverflowMessage: a buffer too small falls back rather than sending nothing" {
+    const t = std.testing;
+    // bufPrint failing must not propagate — the media-gen 400 that sent NO body
+    // at all when its fixed buffer overflowed is the class this guards.
+    var tiny: [8]u8 = undefined;
+    try t.expectEqualStrings("Prompt exceeds maximum context length",
+        contextOverflowMessage(&tiny, 999999, 1));
+}
+
+test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
+        // pi/vLLM SSE spelling — the live laguna case (2026-07-29).
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"two plus two\"}", .want = "two plus two" },
+        // vLLM request spelling.
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning\":\"twice two\"}", .want = "twice two" },
+        // reasoning_content wins when both are present.
+        .{ .body = "{\"role\":\"assistant\",\"reasoning_content\":\"a\",\"reasoning\":\"b\"}", .want = "a" },
+        // Empty string is NOT reasoning — it would render the empty
+        // <think></think> nothink signature the field exists to avoid.
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"\"}", .want = null },
+        // Non-string shapes are ignored, never crash.
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":{\"x\":1}}", .want = null },
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\"}", .want = null },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = messageReasoningFromObj(parsed.value.object);
+        if (case.want) |w| {
+            try t.expectEqualStrings(w, got.?);
+        } else {
+            try t.expect(got == null);
+        }
+    }
+}
+
+test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
+    // Loaded entries: the attached engine pointer decides.
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, "/m/qwen.gguf", ""));
+    // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
+    // distinguish it from the ds4 GGUF — meta.engine must.
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    // Unloaded GGUF stubs: engine undetermined until the header is read.
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/gemma-4-12b", "gemma4"));
 }

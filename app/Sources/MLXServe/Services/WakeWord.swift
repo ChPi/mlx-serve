@@ -25,6 +25,22 @@ enum WakeWord {
         return toks.isEmpty ? nil : toks.joined(separator: " ")
     }
 
+    /// The phrase hands-free mode should listen for right now.
+    ///
+    /// An agent's own phrase wins over the Settings one: voice launched from a
+    /// chat adopts that chat's agent — persona, voice, tools — and the phrase
+    /// has to come along, or an agent that introduces itself by name still only
+    /// answers to "hey loki" and the "Say “…”" hint tells the user to say the
+    /// wrong thing. Both sides go through `normalizePhrase`, so a half-saved or
+    /// whitespace-only agent field defers to the global setting instead of
+    /// producing a gate that never matches, and an empty global still yields
+    /// `defaultPhrase` rather than "" (which `strip` would match on everything).
+    static func activePhrase(agentPhrase: String?, global: String) -> String {
+        agentPhrase.flatMap(normalizePhrase)
+            ?? normalizePhrase(global)
+            ?? defaultPhrase
+    }
+
     /// Title-cased phrase for UI labels and prompts ("hey jarvis" → "Hey Jarvis").
     static func display(_ phrase: String) -> String {
         phrase.split(separator: " ")
@@ -60,6 +76,43 @@ enum WakeWord {
             return String(transcript[start...]).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return nil
+    }
+
+    /// Multi-agent detection: which of several phrases opened the utterance, and
+    /// the remaining query. Every agent with a wake phrase is listening at once
+    /// (plus the app's own phrase), so the ordering matters — LONGEST phrase
+    /// first, or "hey loki" eats "hey loki coder" and the specific agent can
+    /// never be reached by voice. Blank phrases are ignored rather than matching
+    /// everything.
+    static func match(_ transcript: String,
+                      phrases: [(id: UUID, phrase: String)]) -> (id: UUID, query: String)? {
+        let candidates = phrases
+            .compactMap { entry -> (id: UUID, phrase: String, length: Int)? in
+                guard let norm = normalizePhrase(entry.phrase) else { return nil }
+                return (entry.id, norm, tokenize(norm).count)
+            }
+            .sorted { $0.length > $1.length }
+
+        for candidate in candidates {
+            if let query = strip(transcript, phrase: candidate.phrase) {
+                return (candidate.id, query)
+            }
+        }
+        return nil
+    }
+
+    /// True when `phrase` can't be told apart from one of `others` — checked when
+    /// the user saves an agent, because a colliding phrase makes BOTH agents
+    /// unreachable by voice and there's nothing to see until you try talking.
+    ///
+    /// The test is the phrase's NAME (its last word), not the whole phrase:
+    /// greetings are universal ("hey X", "ok X" and a bare "X" all open the same
+    /// gate), so two phrases ending in the same word are one gate.
+    static func collides(_ phrase: String, with others: [String]) -> Bool {
+        guard let name = normalizePhrase(phrase)?.split(separator: " ").last else { return false }
+        return others.contains { other in
+            normalizePhrase(other)?.split(separator: " ").last == name
+        }
     }
 
     // MARK: - internals

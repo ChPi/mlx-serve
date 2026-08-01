@@ -31,7 +31,7 @@ enum APIError: LocalizedError {
                 Your prompt + tool definitions are larger than the model's context window. Try one of:
                   • Increase context size: menu bar → Settings → bump Context (needs more RAM)
                   • Use a model with a larger context window
-                  • Disable some MCP servers (gear icon on the MCP pill) or turn off Agent mode
+                  • Disable some MCP servers (gear icon on the MCP pill) or turn Tools off
                 """
             }
             if detail.isEmpty {
@@ -145,6 +145,7 @@ class APIClient {
             contextLength: meta["context_length"] as? Int ?? 0,
             modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
             architecture: meta["architecture"] as? String ?? "",
+            engineName: meta["engine"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
             supportsVision: supportsVision,

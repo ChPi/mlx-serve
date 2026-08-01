@@ -191,6 +191,77 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(AudioModelPreset.qwen3TTS17B8bit.repo, "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit")
     }
 
+    /// Kokoro's bundle is NOT the TTS bundle. Reusing `tts(...)` demanded a
+    /// `speech_tokenizer/` Kokoro does not have, so a fully downloaded Kokoro
+    /// read as permanently incomplete — the pane would offer Download forever
+    /// and the voice would never enable. The dictionaries live in `g2p/`, so
+    /// the pull has to be recursive too.
+    func testKokoroBundleIsNotTheTtsBundle() {
+        let b = AudioModelPreset.kokoro82M.bundle
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertTrue(b.components[0].selection.recursive, "g2p/ is a subdir — a shallow pull misses the phonemizer")
+        let m = b.components[0].readyMarkers
+        for marker in ["config.json", "model.safetensors", "voices.safetensors", "g2p"] {
+            XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
+        }
+        XCTAssertFalse(m.contains("speech_tokenizer"),
+                       "Kokoro has no speech_tokenizer — requiring it makes a complete download read as incomplete forever")
+        XCTAssertEqual(b.primaryRepo, "ddalcu/Kokoro-82M-MLX-Serve")
+    }
+
+    /// Class guard: the `.audio` slot hosts two architectures with different
+    /// repo shapes, and `supportsCloning` is the discriminator. A third audio
+    /// backend must not silently inherit the wrong bundle.
+    func testAudioBundleDispatchFollowsTheDeclaredCapability() {
+        for p in AudioModelPreset.allIncludingVoiceOnly {
+            let m = p.bundle.components[0].readyMarkers
+            if p.supportsCloning {
+                XCTAssertTrue(m.contains("speech_tokenizer"), "\(p.id) clones — it needs the codec tokenizer")
+            } else {
+                XCTAssertTrue(m.contains("g2p"), "\(p.id) can't clone — it needs the phonemizer dictionaries")
+            }
+        }
+    }
+
+    /// Kokoro is voice-mode only. `.all` is what the MEDIA panes offer, and
+    /// both AudioGenView's reference-clip control and VideoGenView's "Speak
+    /// text" composer send `ref_audio` — which Kokoro answers with a named 400.
+    /// Keeping it out of `.all` makes that unreachable by construction; a
+    /// future "tidy up the catalog" that re-adds it would only show up as a
+    /// runtime 400 in the Video pane.
+    func testKokoroIsAbsentFromTheMediaGenCatalog() {
+        XCTAssertFalse(AudioModelPreset.all.contains { $0.id == AudioModelPreset.kokoro82M.id })
+        XCTAssertTrue(AudioModelPreset.all.allSatisfy(\.supportsCloning),
+                      "every preset a media pane can pick must accept ref_audio")
+        XCTAssertTrue(AudioModelPreset.allIncludingVoiceOnly.contains { $0.id == AudioModelPreset.kokoro82M.id },
+                      "still downloadable from the model browser")
+    }
+
+    /// The readiness contract the download bar reads, against a real temp dir:
+    /// the complete Kokoro layout is ready, and dropping `g2p/` is not.
+    func testKokoroReadinessNeedsTheG2pDictionaries() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "kokorotest-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("ddalcu/Kokoro-82M-MLX-Serve")
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        let comp = AudioModelPreset.kokoro82M.bundle.components[0]
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+
+        func file(_ name: String) -> String { (modelDir as NSString).appendingPathComponent(name) }
+        fm.createFile(atPath: file("config.json"), contents: Data("{}".utf8))
+        fm.createFile(atPath: file("model.safetensors"), contents: Data([0, 1, 2]))
+        fm.createFile(atPath: file("voices.safetensors"), contents: Data([0, 1, 2]))
+        try fm.createDirectory(atPath: file("g2p"), withIntermediateDirectories: true)
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+
+        // The phonemizer dictionaries are load-bearing — without them the
+        // engine has no text→IPA path, so a g2p-less dir is NOT ready.
+        try fm.removeItem(atPath: file("g2p"))
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
     func testKreaBundleIsSinglePublicRecursiveComponent() {
         let k = ImageModelPreset.krea2Turbo.bundle
         // One public component, no gated dependency, recursive (pulls the weight subdirs).
@@ -355,6 +426,97 @@ final class MediaBundleTests: XCTestCase {
         }
     }
 
+    /// The only MLX build of FLUX.2-klein 9B (`mlx-community/flux2-klein-9b-4bit`)
+    /// ships NO root config.json — same repo layout as the 4B minus that one
+    /// file. Requiring it as a ready marker is the Kokoro-vs-tts bug exactly:
+    /// a fully downloaded model that reads as permanently incomplete, so the
+    /// pane offers Download forever and Generate never enables.
+    func testKlein9BBundleDoesNotRequireARootConfigItNeverShips() {
+        let nine = ImageModelPreset.flux2Klein9B_Q4.bundle
+        XCTAssertEqual(nine.components.count, 1)
+        XCTAssertEqual(nine.primaryRepo, "mlx-community/flux2-klein-9b-4bit")
+        XCTAssertTrue(nine.components[0].selection.recursive)
+        XCTAssertFalse(nine.components[0].readyMarkers.contains("config.json"))
+        // The weight subdirs still have to be there — readiness stays real.
+        for marker in ["transformer", "vae", "text_encoder", "tokenizer"] {
+            XCTAssertTrue(nine.components[0].readyMarkers.contains(marker), "missing marker \(marker)")
+        }
+        // The 4B DOES ship one, and keeps checking for it.
+        XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.bundle.components[0].readyMarkers.contains("config.json"))
+    }
+
+    /// Third bite of the configless-repo class, and the one the marker test
+    /// above CANNOT see: dropping `config.json` from the ready markers isn't
+    /// enough, because `existingModelDir` never resolves the directory in the
+    /// first place — it counted a dir as holding a model on `config.json`,
+    /// `model_index.json` or a `.gguf`, and klein 9B ships NONE of the three.
+    /// So a complete 8.9 GB download still read as absent: the pane offered
+    /// "Download (~10 GB)" forever and a click flickered and reverted (files
+    /// present → size-matched skip → instant finish → re-check still false).
+    /// Readiness has to accept the weight-subdir shape itself.
+    func testKlein9BOnDiskWithNoRootJsonAtAllReadsAsReady() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "klein9b-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("mlx-community/flux2-klein-9b-4bit")
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        let comp = ImageModelPreset.flux2Klein9B_Q4.bundle.components[0]
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+
+        // The real on-disk shape: four weight subdirs, weights inside them, and
+        // no root marker file of any kind.
+        for sub in ["transformer", "vae", "text_encoder", "tokenizer"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        for w in ["transformer/0.safetensors", "vae/0.safetensors", "text_encoder/0.safetensors"] {
+            fm.createFile(atPath: (modelDir as NSString).appendingPathComponent(w), contents: Data([0, 1, 2]))
+        }
+        for absent in ["config.json", "model_index.json"] {
+            XCTAssertFalse(fm.fileExists(atPath: (modelDir as NSString).appendingPathComponent(absent)),
+                           "the fixture must ship NO \(absent) — that's the whole point")
+        }
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
+    /// The flip side: the weight-subdir shape must not make a HALF-downloaded
+    /// repo read as present. A bare `transformer/` with nothing in it is a
+    /// download that got as far as creating the folder.
+    func testEmptyWeightSubdirsAreNotAModel() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "klein9bpartial-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("mlx-community/flux2-klein-9b-4bit")
+        defer { try? fm.removeItem(atPath: root) }
+        for sub in ["transformer", "vae"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        XCTAssertNil(DownloadManager.existingModelDir(rootDir: root, repoId: "mlx-community/flux2-klein-9b-4bit"))
+        // An in-flight transfer writes `.partial`, which is not a weight either.
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("transformer/0.safetensors.partial"), contents: Data([0]))
+        XCTAssertNil(DownloadManager.existingModelDir(rootDir: root, repoId: "mlx-community/flux2-klein-9b-4bit"))
+    }
+
+    /// 9B is a bigger klein, not a different backend: it goes through the same
+    /// FLUX engine, so it inherits the same capabilities — including reference
+    /// editing, which is what a klein is for.
+    func testKlein9BIsInTheCatalogWithFluxCapabilities() {
+        let nine = ImageModelPreset.flux2Klein9B_Q4
+        XCTAssertTrue(ImageModelPreset.all.contains(nine))
+        XCTAssertEqual(nine.variant, .flux2Klein9B)
+        XCTAssertTrue(nine.supportsReferenceEdit)
+        XCTAssertTrue(nine.supportsImg2Img)
+        XCTAssertTrue(nine.supportsLoRA)
+        XCTAssertFalse(nine.stepsAreFixed)
+        XCTAssertEqual(nine.condWeightCount, 3)   // FLUX concatenates 3 tapped encoder layers
+        // Catalog order is cheapest → heaviest; 9B is heavier than the 4B and
+        // lighter than Krea.
+        let ids = ImageModelPreset.all.map(\.id)
+        XCTAssertLessThan(ids.firstIndex(of: ImageModelPreset.flux2Klein4B_Q4.id)!,
+                          ids.firstIndex(of: nine.id)!)
+        XCTAssertLessThan(ids.firstIndex(of: nine.id)!,
+                          ids.firstIndex(of: ImageModelPreset.krea2Turbo.id)!)
+    }
+
     // MARK: - approxSizeLabel
 
     func testApproxSizeLabelRoundsWholeAtOneGBAndAbove() {
@@ -383,7 +545,7 @@ final class MediaBundleTests: XCTestCase {
             XCTAssertEqual(ids.count, Set(ids).count, "\(label) has a duplicate id")
         }
         assertUnique(ImageModelPreset.all, "image")
-        assertUnique(AudioModelPreset.all, "audio")
+        assertUnique(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertUnique(VideoModelPreset.all, "video")
         assertUnique(MusicModelPreset.all, "music")
     }
@@ -398,7 +560,7 @@ final class MediaBundleTests: XCTestCase {
             }
         }
         assertDisplayable(ImageModelPreset.all, "image")
-        assertDisplayable(AudioModelPreset.all, "audio")
+        assertDisplayable(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDisplayable(VideoModelPreset.all, "video")
         assertDisplayable(MusicModelPreset.all, "music")
     }
@@ -413,7 +575,7 @@ final class MediaBundleTests: XCTestCase {
             }
         }
         assertDescribed(ImageModelPreset.all, "image")
-        assertDescribed(AudioModelPreset.all, "audio")
+        assertDescribed(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDescribed(VideoModelPreset.all, "video")
         assertDescribed(MusicModelPreset.all, "music")
     }

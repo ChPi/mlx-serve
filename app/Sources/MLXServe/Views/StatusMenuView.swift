@@ -169,6 +169,7 @@ struct StatusMenuView: View {
     let openSettings: () -> Void
     let openServerLog: () -> Void
     let openTasks: () -> Void
+    var openAgents: () -> Void = {}
     var openSandboxTerminal: () -> Void = {}
 
     /// Observes the shared sandbox so the tray badge appears/updates live when
@@ -398,7 +399,7 @@ struct StatusMenuView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            Text(mem.activeFormatted)
+                            Text(mem.gpuMemoryLabel)
                                 .font(.caption.monospaced())
                         }
                         ProgressView(value: mem.gpuFraction(ofTotal: totalRAM))
@@ -526,7 +527,7 @@ struct StatusMenuView: View {
 
             // Persistent, window-independent voice assistant — its own row, not
             // a button. Toggle it on and talk hands-free with no chat window.
-            VoiceTrayPanel(voice: appState.voice)
+            VoiceTrayPanel(voice: appState.voice, openAgents: openAgents)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
 
@@ -688,15 +689,20 @@ struct StatusMenuView: View {
     /// ("lan:<id>@<peer>" tags — recorded on the ServerManager and carried by
     /// every chat request; the local server proxies it to the hosting Mac).
     /// Picking a local model always clears the LAN choice.
+    /// Tag semantics live in `ChatModelSelection`, shared with the chat window's
+    /// toolbar picker — two copies is how one surface silently stops honouring a
+    /// LAN selection.
     private var trayModelSelection: Binding<String> {
         Binding(
-            get: { server.lanChatModelId.map { "lan:" + $0 } ?? appState.selectedModelPath },
+            get: { ChatModelSelection.tag(localPath: appState.selectedModelPath,
+                                          lanChatModelId: server.lanChatModelId) },
             set: { picked in
-                if picked.hasPrefix("lan:") {
-                    appState.selectLanModel(String(picked.dropFirst(4)))
-                } else {
+                switch ChatModelSelection.action(for: picked) {
+                case .selectLan(let id):
+                    appState.selectLanModel(id)
+                case .selectLocal(let path):
                     server.lanChatModelId = nil
-                    appState.selectedModelPath = picked
+                    appState.selectedModelPath = path
                 }
             }
         )

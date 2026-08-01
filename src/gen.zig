@@ -22,6 +22,7 @@ const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
+const kokoro = @import("kokoro.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const hy3d = @import("hunyuan3d.zig");
@@ -37,6 +38,7 @@ const metrics = @import("status.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
 const multipart = @import("multipart.zig");
+const discovery = @import("model_discovery.zig");
 const stb = @import("stb");
 
 const Conn = server_mod.Conn;
@@ -83,6 +85,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
+    if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     return null;
@@ -110,9 +113,18 @@ pub const GenRoute = enum {
 
 /// Which audio backend a `model_type` selects (pure; pins the dispatch the
 /// `AudioEngine.load` re-peek performs).
-pub fn audioBackendKindForType(model_type: []const u8) enum { tts, music } {
-    return if (std.mem.eql(u8, model_type, "acestep")) .music else .tts;
+pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
+    if (std.mem.eql(u8, model_type, "acestep")) return .music;
+    if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
+    return .tts;
 }
+
+/// Which arm of `AudioBackend` a checkpoint loads into. `.tts` (Qwen3-TTS) and
+/// `.kokoro` both serve `/v1/audio/speech` but have DISJOINT controls: Qwen3-TTS
+/// clones from `ref_audio` and has no voice list, Kokoro has 54 named blendable
+/// voices and no cloning. The handler refuses the wrong control rather than
+/// ignoring it.
+pub const AudioBackendKind = enum { tts, music, kokoro };
 
 /// Peek `model_dir/config.json` for its `model_type` string (owned dupe, caller
 /// frees) or null on any read/parse error. Cheap — used both to route to a media
@@ -125,7 +137,20 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
     // the "mage_flow" marker so routing + the backend dispatch light up.
     if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    // Same for an mflux FLUX.2 conversion with no config.json at all (the only
+    // MLX build of klein 9B). Identified by the DiT's own weight names, through
+    // the SAME predicate discovery uses — a private copy here is how `list` and
+    // the loader end up disagreeing about whether a dir is a model.
+    if (isMfluxFlux2Repo(io, allocator, model_dir)) return allocator.dupe(u8, "flux2-klein") catch null;
     return null;
+}
+
+/// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
+/// Thin path→Dir wrapper over `model_discovery.peekMfluxFlux2`.
+fn isMfluxFlux2Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekMfluxFlux2(io, allocator, dir);
 }
 
 /// Read `model_dir/config.json`'s `model_type` (owned dupe) or null on any
@@ -672,6 +697,7 @@ fn bodyDisablesSafety(body: []const u8) bool {
 pub const AudioBackend = union(enum) {
     tts: tts.Synthesizer,
     music: *acestep.Engine,
+    kokoro: *kokoro.Engine,
 };
 
 /// Audio engine — a tagged-union owner, dispatched on `config.json`'s
@@ -692,6 +718,12 @@ pub const AudioEngine = struct {
             log.info("[audio] ACE-Step music engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .kokoro) {
+            const ks = mlx.mlx_default_gpu_stream_new();
+            self.backend = .{ .kokoro = try kokoro.Engine.load(io, allocator, model_dir, ks) };
+            log.info("[audio] Kokoro TTS ready (sample_rate={d})\n", .{self.backend.kokoro.sampleRate()});
+            return self;
+        }
         const s = mlx.mlx_default_gpu_stream_new();
         self.backend = .{ .tts = try tts.Synthesizer.load(io, allocator, s, model_dir) };
         log.info("[audio] TTS synthesizer ready (sample_rate={d})\n", .{self.backend.tts.model.cfg.sample_rate});
@@ -702,6 +734,7 @@ pub const AudioEngine = struct {
         switch (self.backend) {
             .tts => |*synth| synth.deinit(),
             .music => |e| e.deinit(),
+            .kokoro => |e| e.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -1736,7 +1769,33 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const synth = switch (engine.backend) {
         .tts => |*t| t,
         .music => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+        .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
+    // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
+    // embeds + caches the clone voice WITHOUT synthesizing, so the FIRST
+    // sentence of a voice session skips the cold ECAPA forward. Misuse is a
+    // named 400, never a silent no-op (the media-gen rule).
+    if (sse.bodyWantsTrue(body, "warm_only")) {
+        if (!synth.supportsCloning()) return sendError(conn, 400, "this model has no speaker encoder; nothing to warm");
+        const raw_ref = extractJsonString(body, "ref_audio") orelse return sendError(conn, 400, "warm_only requires ref_audio");
+        const b64 = try jsonUnescape(allocator, raw_ref);
+        defer allocator.free(b64);
+        if (b64.len == 0) return sendError(conn, 400, "warm_only requires ref_audio");
+        const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "ref_audio is not valid base64");
+        defer allocator.free(wav_bytes);
+        const samples = decodeWavToF32(allocator, wav_bytes) catch return sendError(conn, 400, "ref_audio is not a decodable WAV");
+        defer allocator.free(samples);
+        const was_cached = synth.warmSpeaker(samples) catch |err| {
+            log.err("[audio] warm_only failed: {}\n", .{err});
+            return sendError(conn, 500, "speaker embedding failed");
+        };
+        log.info("[audio] warm_only: speaker embedding {s}\n", .{if (was_cached) "already cached" else "cached"});
+        return sendBytesJson(conn, allocator, if (was_cached)
+            "{\"warmed\":true,\"cache\":\"hit\"}"
+        else
+            "{\"warmed\":true,\"cache\":\"miss\"}");
+    }
+
     const input = extractJsonString(body, "input") orelse extractJsonString(body, "text") orelse return sendError(conn, 400, "missing 'input'");
     const text = try jsonUnescape(allocator, input);
     defer allocator.free(text);
@@ -1748,6 +1807,8 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     var ref_samples: ?[]f32 = null;
     defer if (ref_samples) |r| allocator.free(r);
     if (extractJsonString(body, "ref_audio")) |raw_ref| {
+        const io_t = std.Io.Threaded.global_single_threaded.io();
+        const t0 = std.Io.Timestamp.now(io_t, .boot);
         const b64 = try jsonUnescape(allocator, raw_ref); // handles \/ from Swift JSONSerialization
         defer allocator.free(b64);
         if (b64.len > 0) {
@@ -1756,7 +1817,8 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
                 if (decodeWavToF32(allocator, wav_bytes)) |samples| {
                     if (synth.supportsCloning()) {
                         ref_samples = samples;
-                        log.info("[audio] reference voice: {d} samples → cloning\n", .{samples.len});
+                        const dec_ns: u64 = @intCast(t0.untilNow(io_t, .boot).nanoseconds);
+                        log.info("[audio] ref decode {d:.2} ms; reference voice: {d} samples → cloning\n", .{ @as(f64, @floatFromInt(dec_ns)) / 1e6, samples.len });
                     } else {
                         allocator.free(samples);
                         log.warn("[audio] model has no speaker encoder — ignoring ref_audio\n", .{});
@@ -1798,6 +1860,82 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     return sendBytes(conn, allocator, "audio/wav", wav);
 }
 
+/// `POST /v1/audio/speech` on a Kokoro checkpoint.
+///
+/// Shares the endpoint with Qwen3-TTS but NOT its controls, and the difference
+/// is refused rather than ignored (the named-400 rule): `ref_audio` is a
+/// Qwen3-TTS control and Kokoro cannot clone, so asking for it here is an
+/// error, not a silently plain-voiced answer. Conversely `voice` selects one of
+/// the 54 packs, and a comma-separated list BLENDS them
+/// (`"af_bella,af_sky"`) — the reference's own convention.
+fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *kokoro.Engine) !void {
+    if (sse.bodyWantsTrue(body, "warm_only")) {
+        return sendError(conn, 400, "this model does not support voice cloning; nothing to warm");
+    }
+    const input = extractJsonString(body, "input") orelse extractJsonString(body, "text") orelse
+        return sendError(conn, 400, "missing 'input'");
+    const text = try jsonUnescape(allocator, input);
+    defer allocator.free(text);
+    if (text.len == 0) return sendError(conn, 400, "empty 'input'");
+
+    if (extractJsonString(body, "ref_audio")) |raw| {
+        if (raw.len > 0) return sendError(conn, 400, "this model does not support voice cloning; use 'voice' to pick or blend a built-in voice");
+    }
+
+    var voice_buf: ?[]u8 = null;
+    defer if (voice_buf) |v| allocator.free(v);
+    var voice: []const u8 = kokoro.DEFAULT_VOICE;
+    if (extractJsonString(body, "voice")) |raw| {
+        const unescaped = try jsonUnescape(allocator, raw);
+        if (unescaped.len == 0) {
+            allocator.free(unescaped);
+        } else {
+            voice_buf = unescaped;
+            voice = unescaped;
+        }
+    }
+    if (!engine.hasVoice(voice)) {
+        var msg: [256]u8 = undefined;
+        const m = std.fmt.bufPrint(&msg, "unknown voice '{s}'; see /v1/models for the available voices", .{voice}) catch "unknown voice";
+        return sendError(conn, 400, m);
+    }
+
+    const speed: f32 = @floatCast(extractJsonFloat(body, "speed") orelse 1.0);
+    if (!(speed > 0.0) or speed > 5.0) return sendError(conn, 400, "'speed' must be in (0, 5]");
+
+    const seed: u64 = if (extractJsonFloat(body, "seed")) |v| @intFromFloat(@max(0, v)) else 0;
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[kokoro] {d} chars voice={s} speed={d:.2} stream={}\n", .{ text.len, voice, speed, want_stream });
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const out = engine.synthesizeWav(text, voice, speed, seed) catch |err| {
+        log.err("[kokoro] synthesis failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "synthesis failed");
+            return;
+        }
+        return sendError(conn, 500, "synthesis failed");
+    };
+    defer allocator.free(out);
+    log.info("[kokoro] -> {d} WAV bytes\n", .{out.len});
+
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(out.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, out);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try buf.appendSlice(allocator, b64);
+        try buf.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(buf.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", out);
+}
+
 /// `POST /v1/audio/music-generations` — ACE-Step text2music.
 /// `{"model", "prompt" (style/genre/mood, REQUIRED), "lyrics" ("" →
 /// "[Instrumental]"), "vocal_language" ("en"), "bpm", "keyscale",
@@ -1808,7 +1946,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const music = switch (engine.backend) {
         .music => |m| m,
-        .tts => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
+        .tts, .kokoro => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
     };
     const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
     const prompt = try jsonUnescape(allocator, raw_prompt);
@@ -2765,6 +2903,33 @@ test "mage_flow detects from the official diffusers layout (model_index.json, no
     const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
     defer allocator.free(mt);
     try testing.expectEqualStrings("mage_flow", mt);
+    try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
+}
+
+test "flux2 detects from an mflux conversion with no root config.json" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // `mlx-community/flux2-klein-9b-4bit` — the only MLX build of klein 9B —
+    // ships no config.json, so routing has to recognize the DiT itself or the
+    // dir is unloadable. Delegates to the ONE predicate discovery uses, so the
+    // picker and the loader can never disagree about what this dir is.
+    try tmp.dir.createDirPath(io, "k9/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "k9/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"double_stream_modulation_img.linear.weight\":\"0.safetensors\"}}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "k9" });
+    defer allocator.free(model_dir);
+
+    const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
+    defer allocator.free(mt);
+    try testing.expectEqualStrings("flux2-klein", mt);
     try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
 }
 

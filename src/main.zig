@@ -29,6 +29,7 @@ pub const VERSION: []const u8 = build_options.version;
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
 // lib/llama/include/gguf.h. Keep in sync if a llama.cpp bump changes it.
@@ -129,6 +130,24 @@ fn printUsage(io: std.Io) void {
         \\                        a MoE checkpoint that ships a sidecar is
         \\                        otherwise reachable only via `enable_mtp:true`
         \\                        in the request body.
+        \\  --dspark            Enable DeepSeek-V4 DSpark draft stages (OFF by
+        \\                        default: the stages cost ~11 GB resident; the
+        \\                        memory fit-gate still applies at load).
+        \\  --decode-attn-quant / --no-decode-attn-quant
+        \\                      Serve decode from quantized side copies of
+        \\                      DENSE (bf16/f16) attention projection weights:
+        \\                      INT8 group-32 for most layers, NVFP4 for the
+        \\                      last 20% (late layers amplify quantization
+        \\                      error far less). Cuts their per-token weight
+        \\                      read by half or more on models that ship dense
+        \\                      attention (e.g. Laguna, ~-25% decode overall).
+        \\                      LOSSY: a real requantization, applied to
+        \\                      decode/verify steps only; prefill keeps the
+        \\                      dense weights. Default ON; --no-… restores
+        \\                      exact dense decode. Env tuning:
+        \\                      MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
+        \\                      moves the 4-bit boundary, =off keeps the whole
+        \\                      stack INT8.
         \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
@@ -146,12 +165,14 @@ fn printUsage(io: std.Io) void {
         \\                          affine at 2/4 bits; lower distortion at
         \\                          comparable storage. Per-request override
         \\                          via the `kv_quant` body field.
-        \\  --kv-attn-mode {{dense|fused}}
-        \\                      Attention path for quantized KV. `dense`
-        \\                        (default) dequantizes K/V before SDPA;
-        \\                        `fused` consumes the quant triples directly
-        \\                        via mlx_quantized_matmul (opt-in; only
-        \\                        effective at --kv-quant 4 or 8).
+        \\  --kv-attn-mode {{auto|dense|fused}}
+        \\                      Decode read path for quantized KV. `dense`
+        \\                        dequantizes K/V before SDPA; `fused` reads
+        \\                        the packed cache in place (custom kernel at
+        \\                        decode width, composed qmm at verify widths);
+        \\                        `auto` (default) picks fused from 8K prompt
+        \\                        tokens. Only effective at --kv-quant 4 or 8;
+        \\                        per-request `kv_attn_mode` field overrides.
         \\  --prefill-chunk <n> Max tokens forwarded per prefill chunk
         \\                        (default: 8192). Auto-capped further per model
         \\                        so one layer's attention scores stay within
@@ -277,6 +298,13 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
+    // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
+    // above every subcommand branch — a per-serve-path call is how
+    // `runHeadlessServe` (the mode the app always launches) silently ate the
+    // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
+    // (~121 GB on a 128 GB Mac) is no defense.
+    server_mod.applyMlxCacheLimit();
+
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
@@ -393,7 +421,7 @@ pub fn main(init: std.process.Init) !void {
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
     // Off by default — only `.affine` cache scheme is supported by the
     // v1 fused path; TurboQuant + dense schemes ignore it.
-    var kv_attn_fused_default: bool = false;
+    var kv_attn_mode: server_mod.KvAttnMode = .auto;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -518,6 +546,15 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--dspark")) {
+            // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
+            // ~11 GB resident, so the default leaves them lazy and serves
+            // serial. deepseek_v4.initModel reads the env at model load.
+            _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+        } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
+            transformer_mod.decode_attn_quant_flag = true;
+        } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
+            transformer_mod.decode_attn_quant_flag = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
@@ -678,11 +715,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
-                kv_attn_fused_default = false;
+                kv_attn_mode = .dense;
             } else if (std.mem.eql(u8, args[i], "fused")) {
-                kv_attn_fused_default = true;
+                kv_attn_mode = .fused;
+            } else if (std.mem.eql(u8, args[i], "auto")) {
+                kv_attn_mode = .auto;
             } else {
-                log.err("--kv-attn-mode: expected 'dense' or 'fused'; got '{s}'\n", .{args[i]});
+                log.err("--kv-attn-mode: expected 'dense', 'fused' or 'auto'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
         } else {
@@ -886,7 +925,7 @@ pub fn main(init: std.process.Init) !void {
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
         .turboquant_2, .turboquant_4 => log.info("[args] kv-quant: turboquant {d}-bit (group={d}, Hadamard rotation)\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
-    log.info("[args] kv-attn-mode: {s}\n", .{if (kv_attn_fused_default) "fused" else "dense"});
+    log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
 
     // Set GPU as default
     var metal_avail: bool = false;
@@ -1139,7 +1178,7 @@ pub fn main(init: std.process.Init) !void {
             .default_enable_pld = cli_pld.enable,
             .default_pld_draft_len = cli_pld.draft_len,
             .default_pld_key_len = cli_pld.key_len,
-            .default_kv_attn_fused = kv_attn_fused_default,
+            .kv_attn_mode = kv_attn_mode,
             .default_force_mtp = force_mtp,
         });
     } else {
@@ -1163,20 +1202,10 @@ pub fn main(init: std.process.Init) !void {
             xfm.cache = try transformer_mod.KVCache.initWithConfigAndHeadDim(allocator, config.num_hidden_layers, kv_quant_config, config.head_dim);
         }
 
-        // JIT-compile + wire memory limits.
+        // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {
-            var dev = mlx.mlx_device{ .ctx = null };
-            _ = mlx.mlx_get_default_device(&dev);
-            var info = mlx.mlx_device_info_new();
-            if (mlx.mlx_device_info_get(&info, dev) == 0) {
-                var max_rec: usize = 0;
-                if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-                    var old_limit: usize = 0;
-                    _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
-                    log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
-                }
-                _ = mlx.mlx_device_info_free(info);
-            }
+            const wired = mlx.applyWiredPolicy();
+            if (wired.target) |t| log.debug("[wired] mode={s} limit={d} MB\n", .{ @tagName(wired.mode), t / (1024 * 1024) });
         }
         if (config.hidden_act == .gelu_approx) {
             xfm.compileGelu();
@@ -1217,7 +1246,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .role = "user", .content = user_prompt },
         };
 
-        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false);
+        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null);
         defer allocator.free(prompt_ids);
 
         // Reset peak memory before generation
@@ -1551,7 +1580,7 @@ fn runGenServe(
         .default_enable_pld = server_mod.PldDefaults.off.enable,
         .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
     });
 }
 
@@ -1675,7 +1704,7 @@ fn runHeadlessServe(
         .default_enable_pld = pld.enable,
         .default_pld_draft_len = pld.draft_len,
         .default_pld_key_len = pld.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
         // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
         // defaults true), so the MoE force flag has to reach this path too.
         .default_force_mtp = force_mtp,
@@ -1884,7 +1913,7 @@ fn runDs4Serve(
         .default_enable_pld = server_mod.PldDefaults.off.enable,
         .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
     });
 }
 
@@ -2156,7 +2185,7 @@ fn runLlamaServe(
         .default_enable_pld = server_mod.PldDefaults.off.enable,
         .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
     });
 }
 

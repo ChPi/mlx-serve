@@ -25,6 +25,9 @@ test {
     _ = @import("drafter.zig");
     _ = @import("mtp.zig");
     _ = @import("diffusion.zig");
+    _ = @import("deepseek_v4.zig");
+    _ = @import("kokoro.zig");
+    _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
     _ = @import("metrics.zig");
@@ -63,4 +66,5 @@ test {
     _ = @import("ollama.zig");
     _ = @import("cli.zig");
     _ = @import("lan.zig");
+    _ = @import("mlx.zig");
 }

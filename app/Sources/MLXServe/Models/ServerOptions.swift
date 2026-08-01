@@ -12,6 +12,24 @@ import Foundation
 /// `requestDefaultFields` metadata to render labels, captions and the
 /// "needs restart" badge automatically — every option carries its own
 /// human-readable explainer.
+/// The voice backend for hands-free mode.
+enum VoiceEngine: String, Codable, CaseIterable, Sendable {
+    /// macOS `AVSpeechSynthesizer`. No download, no GPU, but robotic.
+    case system
+    /// Qwen3-TTS with the global clone clip (`voiceClonePath`).
+    case clone
+    /// Kokoro-82M with a built-in or blended voice.
+    case kokoro
+
+    var label: String {
+        switch self {
+        case .system: return "System voice"
+        case .clone: return "My cloned voice"
+        case .kokoro: return "Kokoro (fast, built-in voices)"
+        }
+    }
+}
+
 struct ServerOptions: Codable, Equatable {
     // MARK: Server-launch flags (require restart)
     var host: String = "0.0.0.0"
@@ -19,6 +37,12 @@ struct ServerOptions: Codable, Equatable {
     var ctxSize: Int = 0                // 0 = Auto (memory-bounded safe ceiling, capped at model max)
     var noVision: Bool = false
     var logLevel: LogLevel = .info
+    /// Write the server log to `~/.mlx-serve/logs/mlx-serve-<port>.log` (32 MB
+    /// rotation, per port) — THE post-mortem file; the in-app log viewer's
+    /// buffer dies with the app. Default ON, mirroring the server (the file
+    /// sink is on for all serving paths); `toCLIArgs` emits `--log-file off`
+    /// ONLY when disabled, so a default launch stays flag-free.
+    var logToFile: Bool = true
     var requestTimeout: Int = 300       // seconds; 0 = unlimited
 
     // Observability (server-launch flag). When true, launches with `--metrics`,
@@ -65,6 +89,12 @@ struct ServerOptions: Codable, Equatable {
     var pldDraftLen: Int = 5
     var pldKeyLen: Int = 3
     var drafterPath: String = ""        // empty = no drafter
+    /// The user turned the drafter OFF. Not a launch flag — it's the bit that
+    /// `drafterPath` can't carry: an empty path means both "nothing paired yet"
+    /// and "switched off", and the app auto-pairs a dense Gemma 4 with the
+    /// drafter that came down with it (`DrafterPairing.decide`), so without
+    /// this the off would undo itself at the next model switch.
+    var drafterOptOut: Bool = false
     var draftBlockSize: Int = 4
 
     /// Native multi-token prediction (Qwen 3.5/3.6 checkpoints that ship a
@@ -77,6 +107,14 @@ struct ServerOptions: Codable, Equatable {
     /// depth live from the measured acceptance rate). A fixed value is a
     /// benchmarking lever; emitted only when non-zero.
     var mtpDepth: Int = 0
+    /// Decode attention requant: the server serves decode steps from INT8
+    /// group-32 side copies of DENSE (bf16/f16) attention projection weights —
+    /// ~23% faster decode on models that ship dense attention (Laguna; most
+    /// quantized checkpoints are unaffected). Lossy by design (a real
+    /// requantization, decode/verify only; prefill keeps the dense weights).
+    /// Default ON, mirroring transformer.zig DECODE_ATTN_QUANT_DEFAULT —
+    /// `toCLIArgs` emits `--no-decode-attn-quant` ONLY when turned off.
+    var decodeAttnQuant: Bool = true
     /// `--mtp`. A MoE checkpoint that ships an MTP head keeps it OFF for every
     /// request that omits `enable_mtp` (the server's `defaultEnableMtp`: the
     /// verify forward pays the expert-routing penalty, the same caution the
@@ -85,6 +123,11 @@ struct ServerOptions: Codable, Equatable {
     /// on flips the default for MoE targets; dense targets are unaffected
     /// (they already default ON). Off, matching the server.
     var forceMTPOnMoE: Bool = false
+    /// `--dspark`. DeepSeek-V4's DSpark draft stages are OPT-IN server-side:
+    /// enabling them materializes ~11 GB of stage weights at load (the memory
+    /// fit-gate still applies and disables with a log when the box can't hold
+    /// trunk + stages + headroom). Off, matching the server default.
+    var enableDSpark: Bool = false
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -209,6 +252,21 @@ struct ServerOptions: Codable, Equatable {
     /// file's name, or "Recorded clip") — the stored clip itself is always
     /// normalized to `voice-clone.wav`, which is useless as a display name.
     var voiceCloneLabel: String = ""
+
+    /// Which engine hands-free voice mode speaks with. App-side only, like the
+    /// other voice fields — never a server-launch flag, so changing it must not
+    /// prompt a restart.
+    ///
+    /// `.clone` and `.kokoro` are BOTH `/v1/audio/speech`, but on different
+    /// backends with disjoint controls: the clone path sends `ref_audio` and
+    /// has no voice list, Kokoro sends `voice` and cannot clone. Sending the
+    /// wrong one is a named 400 server-side, so the engine choice decides which
+    /// field is sent rather than both being attempted.
+    var voiceEngine: VoiceEngine = .system
+    /// Which Kokoro voice to speak with. A comma-separated list BLENDS voices
+    /// (`"af_bella,af_sky"`) — the reference's own convention, passed through
+    /// verbatim.
+    var kokoroVoice: String = "af_heart"
     /// Wake phrase for hands-free voice mode ("hey loki" by default). Stored
     /// as the user typed it in Settings ▸ Voice; consumers normalize through
     /// `WakeWord.normalizePhrase` (blank → default). App-side like the other
@@ -307,6 +365,9 @@ struct ServerOptions: Codable, Equatable {
         /// creates). Opt-in; works alongside or independently of `agentMode`.
         var useMCP: Bool = false
         var enableThinking: Bool = false
+        /// The agent (persona) the bot answers as; nil = none, i.e. the app's own
+        /// settings and the three flags above verbatim.
+        var agentId: UUID?
         /// Telegram chat IDs allowed to use the bot. Empty = adopt the first
         /// chat that messages (TOFU); the bridge appends the adopted id here.
         var allowedChatIds: [Int64] = []
@@ -376,6 +437,7 @@ struct ServerOptions: Codable, Equatable {
         ctxSize == other.ctxSize &&
         noVision == other.noVision &&
         logLevel == other.logLevel &&
+        logToFile == other.logToFile &&
         requestTimeout == other.requestTimeout &&
         enableMetrics == other.enableMetrics &&
         apiKey == other.apiKey &&
@@ -393,6 +455,7 @@ struct ServerOptions: Codable, Equatable {
         enableMTP == other.enableMTP &&
         mtpDepth == other.mtpDepth &&
         forceMTPOnMoE == other.forceMTPOnMoE &&
+        enableDSpark == other.enableDSpark &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -451,6 +514,10 @@ struct ServerOptions: Codable, Equatable {
             "--host", trimmedHost.isEmpty ? "0.0.0.0" : trimmedHost,
             "--log-level", logLevel.rawValue,
         ]
+        // File logging is ON by default server-side — emit only the opt-out.
+        if !logToFile {
+            args += ["--log-file", "off"]
+        }
         if let dir = modelDirOverride, !dir.isEmpty {
             args += ["--model-dir", dir]
         }
@@ -513,6 +580,15 @@ struct ServerOptions: Codable, Equatable {
         }
         if mtpDepth > 0 {
             args += ["--mtp-depth", "\(mtpDepth)"]
+        }
+        // DSpark (DeepSeek-V4 draft stages): server default is OFF (opt-in —
+        // the stages cost ~11 GB resident), so only ON emits.
+        if enableDSpark {
+            args += ["--dspark"]
+        }
+        // Decode attention requant: server default is ON, so only OFF emits.
+        if !decodeAttnQuant {
+            args += ["--no-decode-attn-quant"]
         }
         // Performance: only emit non-default flags so the CLI tail stays
         // readable in log lines and `ps`. Server defaults are 1 / off / 2GB.
@@ -640,6 +716,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .ctxSize) { ctxSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .noVision) { noVision = v }
         if let v = try c.decodeIfPresent(LogLevel.self, forKey: .logLevel) { logLevel = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .logToFile) { logToFile = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .apiKey) { apiKey = v }
@@ -648,6 +725,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .drafterPath) { drafterPath = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .drafterOptOut) { drafterOptOut = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .draftBlockSize) { draftBlockSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareEnabled) { lanShareEnabled = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareAll) { lanShareAll = v }
@@ -655,8 +733,10 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanDiscoverEnabled) { lanDiscoverEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lanName) { lanName = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuant) { decodeAttnQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -683,6 +763,15 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }
+        if let v = try c.decodeIfPresent(VoiceEngine.self, forKey: .voiceEngine) { voiceEngine = v }
+        else if let legacy = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) {
+            // Configs written before the engine picker existed only carried the
+            // clone toggle. Changing a persisted DEFAULT does nothing for
+            // existing users, so migrate the old field explicitly rather than
+            // stranding them on `.system` with a clip they already recorded.
+            voiceEngine = (legacy && !voiceClonePath.isEmpty) ? .clone : .system
+        }
+        if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
     }
 }
@@ -700,6 +789,7 @@ extension ServerOptions.TelegramConfig {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .agentMode) { agentMode = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useMCP) { useMCP = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) { enableThinking = v }
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
         if let v = try c.decodeIfPresent([Int64].self, forKey: .allowedChatIds) { allowedChatIds = v }
     }
 }
@@ -772,6 +862,10 @@ extension ServerOptions {
             title: "Log level",
             explainer: "Server log verbosity. Use 'debug' to capture Jinja errors, KV cache hits and per-request token counts.",
             needsRestart: true),
+        "logToFile": .init(
+            title: "Log to file",
+            explainer: "Write the server log to ~/.mlx-serve/logs/mlx-serve-<port>.log (32 MB rotation, one file per port). This is the file to check after a crash — the in-app log viewer only holds what arrived while the app was running.",
+            needsRestart: true),
         "requestTimeout": .init(
             title: "Request timeout (s)",
             explainer: "Max seconds a single HTTP request is allowed to take. 0 = unlimited. Long agent loops may need 600+.",
@@ -816,6 +910,10 @@ extension ServerOptions {
             title: "Also use MTP on mixture-of-experts models",
             explainer: "Mixture-of-experts models (e.g. Qwen3.6 35B-A3B) leave their MTP head switched off by default, because checking several guessed tokens at once makes them re-route every expert and that can cost more than it saves. Some MoE heads are good enough to win anyway. Turn this on to use it — and measure: if replies get slower, turn it back off. Models without an MoE layout are unaffected.",
             needsRestart: true),
+        "enableDSpark": .init(
+            title: "DSpark draft stages (DeepSeek‑V4)",
+            explainer: "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only.",
+            needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",
@@ -839,6 +937,10 @@ extension ServerOptions {
         "maxConcurrent": .init(
             title: "Concurrent requests",
             explainer: "Continuous batching: how many chat requests share one forward pass. 1 = serial. 2 is a good default for dense models (~1.5× throughput, ~33% per-request latency cost). MoE and hybrid SSM models stay serial regardless.",
+            needsRestart: true),
+        "decodeAttnQuant": .init(
+            title: "Fast decode for bf16-attention models (recommended)",
+            explainer: "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding.",
             needsRestart: true),
         "kvQuant": .init(
             title: "KV cache quantization",

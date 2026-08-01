@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const dsv4_mod = @import("deepseek_v4.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -91,18 +92,21 @@ pub const PREFILL_CHUNK_FLOOR: usize = 512;
 /// additionally cap the auto chunk at 2048 — composed-causal prefill
 /// measured strictly faster and ~9 GB lighter there (see the inline
 /// comment). Gemma keeps the formula-only policy for its fused band layers.
-pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool) usize {
+pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool) usize {
     if (head_dim <= 128 or n_heads == 0 or total_ctx == 0) return base_chunk;
     // Non-sliding hd-256 archs under FUSED causal (the default since the
     // budgeted-dispatch flip): no score tensor exists, so the scores-budget
     // formula below is moot — and its old shrink (1024 at 64K on 24 heads)
     // starved the dequant+GEMM qmm route, which needs M >= 2048 to engage
     // (the 64K rung was the ladder's weakest for exactly this reason).
-    // Chunk 4096 measured faster than 2048 same-session on the 27B even
-    // before the dq route (+1.2% 8K / +0.6% 32K) and halves the per-chunk
-    // dequant overhead on top. Never raises a caller-lowered base.
+    // MoE keeps the 4096 cap: expert-gather transients scale with the chunk
+    // (the gemma-26B@99K lesson: +3% speed for +22 GB peak is a bad trade).
+    // DENSE hybrids have no gather transients and a full-size chunk halves
+    // the per-chunk dequant sweeps: chunk 8192 measured +1.4% over 4096 at
+    // the 8K rung on Qwen3.6-27B dense (M4 Max, 2026-07-30), flat at 32K.
+    // Never raises a caller-lowered base.
     if (!sliding_band_arch and transformer_mod.fused256CausalMode() == .all) {
-        return @min(base_chunk, 4096);
+        return @min(base_chunk, if (is_moe) @as(usize, 4096) else @as(usize, 8192));
     }
     // Composed-causal fallback (MLX_SERVE_FUSED_256_CAUSAL=0): SMALL chunks
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
@@ -129,10 +133,10 @@ pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total
 /// boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
-pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool) usize {
+pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool) usize {
     const env_chunk = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
     if (env_chunk > 0) return env_chunk;
-    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx, sliding_band_arch);
+    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe);
 }
 
 /// Read an unsigned integer from an environment variable, falling back to
@@ -330,33 +334,74 @@ pub fn nextChunkEnd(
         const abs_end = end + ssm_cp_offset;
         const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
         if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
-            end = next_boundary_abs - ssm_cp_offset;
+            // A stride boundary lands inside this chunk — end exactly on it
+            // (never tail-merge past it; the boundary IS the snapshot point).
+            return next_boundary_abs - ssm_cp_offset;
         }
-    } else if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) {
-        // No checkpoint alignment to respect — absorb a tiny tail.
+    }
+    if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) {
+        // Absorb a tiny tail instead of paying a full graph build + eval
+        // barrier for a few tokens. With checkpointing active this can only
+        // extend within a boundary-free span (the boundary case returned
+        // above), so at most a snapshot < TAIL_MERGE_MAX tokens before the
+        // end is skipped — and the always-on end-of-prompt snapshot lands
+        // right there anyway.
         end = prefix_len;
     }
     return end;
 }
 
-/// Effective SSM-checkpoint stride for a model, given the base (configured)
-/// stride and whether the model is MoE.
+/// Tokens held back from the chunked-prefill loop and forwarded together with
+/// the final (logits) forward when SSM checkpointing is active, so the
+/// always-on snapshot lands SSM_SNAPSHOT_BACKOFF tokens BEFORE the prompt end.
 ///
-/// On dense / non-MoE-hybrid models (dense Gemma sliding-window, LFM2, Nemotron-H)
-/// prefill is compute-bound, so a fine stride is ~free and buys finer warm
-/// mid-prompt reuse — keep the base stride. On MoE models prefill is
-/// memory-bound on the per-expert weights: every checkpoint-induced chunk
-/// re-streams ~all expert weights from HBM (the dominant cold-prefill cost), so
-/// a fine stride silently taxes prefill ~25% on 26B/35B-class MoE. For MoE we
-/// coarsen the stride to at least `prefill_chunk`, so checkpointing never
-/// sub-divides the memory-bound chunk — MoE prefill is then never over-chunked
-/// at any prompt length, while the always-on end-of-prompt snapshot still
-/// provides the dominant append-growth multi-turn reuse. `base == 0`
-/// (checkpointing disabled) is preserved.
-pub fn effectiveSsmCheckpointStride(base: usize, is_moe: bool, prefill_chunk: usize) usize {
+/// A snapshot exactly at the prompt end is unreachable for the next turn's
+/// prefix match: the template's generation-prompt suffix
+/// ("<|im_start|>assistant\n" + think opener) renders differently once the
+/// turn enters history, so the match always falls a few tokens short of the
+/// full prompt — "[hot-cache] hybrid miss (no checkpoint ≤ 870 of 897)" was
+/// llmprobe's prompt-cache-prefix cell failing (the 2026-06-10 class; fine
+/// strides used to mask it by laying boundaries underneath). 30 covers every
+/// template suffix in the fleet with margin (ChatML+think ≈ 7 tokens, laguna
+/// pre-opened think ≈ 10) while keeping the tail forward UNDER the
+/// prefill-eval-cadence threshold (seq >= 32): a 65-token tail was treated as
+/// a prefill and paid ~450ms of mid-loop eval bubbles on the 27B, where the
+/// 31-token tail rides the verify-shaped fast path. Cold cost is then ~zero
+/// (the final forward pays its full weight sweep for ONE token anyway).
+/// Warm restores re-forward ≤ backoff+1 tokens.
+pub const SSM_SNAPSHOT_BACKOFF: usize = 30;
+
+/// How many trailing prompt tokens the final (logits) forward covers: the
+/// held-back snapshot window plus the last token itself. Pure so the
+/// backoff/loop-bound interaction is unit-testable.
+pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize) usize {
+    if (!want_ssm_cp) return 0;
+    if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return 0;
+    return SSM_SNAPSHOT_BACKOFF;
+}
+
+/// Effective SSM-checkpoint stride for a model, given the base (configured)
+/// stride: checkpointing never sub-divides the prefill chunk, on ANY arch.
+///
+/// The old policy kept the fine base stride on dense (non-MoE) hybrids on the
+/// theory that their prefill is compute-bound so extra chunks are ~free. That
+/// was true before `prefillDqGemm`: since the dq route only engages at
+/// M >= 2048, a fine stride pushes EVERY projection of EVERY chunk onto the
+/// slow small-M qmm path, and the per-chunk fixed costs (graph build, eval
+/// barrier, MTP history capture) multiply on top. Measured on Qwen3.6-27B
+/// dense GDN (M4 Max, 2026-07-30): stride 256 chunked an 8K prompt into 33
+/// pieces at 211 tok/s vs 254 at coarse chunks — a 17-20% cold-prefill tax at
+/// every context length, which is how llm_context_benchmarks read us 19%
+/// behind oMLX. MoE pays even more (expert re-streaming, ~25%).
+///
+/// Warm mid-prompt reuse granularity drops to the chunk size, but the
+/// always-on end-of-prompt snapshot still covers the dominant append-growth
+/// multi-turn case (llmprobe's cache-hit tests restore from it at any
+/// stride). `base == 0` (checkpointing disabled) is preserved, and a larger
+/// explicit stride is never shrunk.
+pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     if (base == 0) return 0;
-    if (is_moe) return @max(base, prefill_chunk);
-    return base;
+    return @max(base, prefill_chunk);
 }
 
 /// Vision embeddings are scattered from the beginning of their source tensor
@@ -391,6 +436,22 @@ pub fn prefillChunkCount(
     return n;
 }
 
+/// Generated tokens between two returns of the decode loop's transients to
+/// MLX's allocator. 256 is what the non-speculative paths have always used.
+pub const CACHE_CLEAR_INTERVAL: u32 = 256;
+
+/// PURE: has `interval` tokens passed since the last clear?
+///
+/// Interval arithmetic, not `step % interval == 0`: a spec-decode round emits
+/// `1 + accepted` tokens, so a modulo test can step clean over every multiple
+/// and never fire (issue #110 — at stride 5 it fires zero times in the first
+/// 1024 steps). For the stride-1 paths this is byte-identical to the modulo
+/// form it replaces.
+pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool {
+    if (interval == 0) return false;
+    return step -| last_clear >= interval;
+}
+
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
@@ -409,6 +470,9 @@ pub const Generator = struct {
     tok: *const Tokenizer,
     next_token_id: u32,
     step: u32,
+    /// `step` at the last `mlx_clear_cache()`. Advanced only by `advanceStep`,
+    /// which is the ONE place `step` may move.
+    last_cache_clear_step: u32 = 0,
     max_tokens: u32,
     sampling: SamplingParams,
     prompt_tokens: u32,
@@ -454,12 +518,27 @@ pub const Generator = struct {
     /// owned slices are freed via the `allocator` argument to `deinit` for
     /// historical reasons; this one is set during `initWithOptions`.)
     prompt_ids_alloc: ?std.mem.Allocator = null,
+    /// Did init actually arm PLD for this generator (`InitOptions.pld_enabled`
+    /// AFTER the deepseek_v4 chokepoint guard)? `nextPld` declines to the
+    /// plain serial step when false, and the scheduler's tick dispatch
+    /// (`specTickMode`) requires it alongside `slot.enable_pld` — the caller's
+    /// flag alone must never put a verify forward through the trunk. This is
+    /// PLD's counterpart of the `gen.mtp != null` / `gen.drafter != null`
+    /// conjuncts; PLD has no model handle, so the bit has to be explicit.
+    pld_enabled: bool = false,
     /// Stats for PLD benchmark logging. `pld_attempted` counts every step
     /// where lookup found a candidate (so a verify forward ran);
     /// `pld_accepted_tokens` is the cumulative number of *drafted* tokens
     /// (not including the always-accepted t1) that were successfully verified.
     pld_attempted: u64 = 0,
     pld_accepted_tokens: u64 = 0,
+    /// DeepSeek-V4 DSpark: init armed the native block-parallel draft mode
+    /// (dsv4 checkpoint shipping mtp.* stages + a clean-greedy request).
+    /// Mutually exclusive with pld/drafter/mtp by the chokepoint's
+    /// construction; `nextDspark` declines to the serial step when false.
+    dspark_enabled: bool = false,
+    dspark_attempted: u64 = 0,
+    dspark_accepted_tokens: u64 = 0,
 
     // ── Gemma 4 assistant drafter state ──
     // External drafter model (cross-attends into target's KV). When
@@ -654,11 +733,30 @@ pub const Generator = struct {
     // Warmup 32 (not higher): the re-enable check bounds the cost of a
     // premature trip to ≤SPEC_REENABLE_INTERVAL pipelined-fallback steps,
     // so we can gate early and recover the pipeline sooner on novel content.
-    pub const YIELD_GATE_WARMUP: u64 = 32;
+    /// Steps of enabled-mode PLD before the yield gate may trip. See the
+    /// `yield-gate warmup is 8` test for the sweep this was picked from and
+    /// why it moved from 32.
+    pub const YIELD_GATE_WARMUP: u64 = 8;
     pub const YIELD_GATE_MIN_YIELD: f32 = 0.25;
 
+    /// Read the yield-gate warmup for this call. Env-overridable
+    /// (`SPEC_YIELD_WARMUP`) so the threshold can be swept without a rebuild,
+    /// exactly like `runtimeGateWarmup`. Outside `[1, 256]` falls back.
+    ///
+    /// This number is pure economics, and the economics moved: every warmup
+    /// step pays PLD's UNPIPELINED cold forward (plus a synchronous host read
+    /// of the sampled token) against `next()`'s async-pipelined step, so the
+    /// tax is a fraction of the AR step cost — and the AR step got ~3x cheaper
+    /// when the Laguna mscale promotion was fixed, which makes the same
+    /// absolute tax a ~3x larger share. 32 was calibrated before that.
+    pub fn yieldGateWarmup() u64 {
+        const n = readEnvUsize("SPEC_YIELD_WARMUP", @intCast(YIELD_GATE_WARMUP));
+        if (n < 1 or n > 256) return YIELD_GATE_WARMUP;
+        return @intCast(n);
+    }
+
     pub fn yieldGateShouldDisable(steps_total: u64, accepted: u64) bool {
-        if (steps_total < YIELD_GATE_WARMUP) return false;
+        if (steps_total < yieldGateWarmup()) return false;
         const yield_rate = @as(f32, @floatFromInt(accepted)) /
             @as(f32, @floatFromInt(steps_total));
         return yield_rate < YIELD_GATE_MIN_YIELD;
@@ -704,6 +802,15 @@ pub const Generator = struct {
     ///   the per-draft acceptance probability comparable to vLLM's reported
     ///   "62% acceptance rate" metric.
     pub fn logSpecStats(self: *const Generator) void {
+        if (self.dspark_enabled and self.dspark_attempted > 0) {
+            const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
+                @as(f64, @floatFromInt(self.dspark_attempted));
+            log.info(
+                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
+                .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
+            );
+            return;
+        }
         if (self.mtp != null and self.mtp_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.mtp_attempted));
@@ -873,6 +980,13 @@ pub const Generator = struct {
         /// `initWithOptions` returns `error.Cancelled` instead of grinding
         /// out the rest of a multi-minute ghost prefill.
         cancel_flag: ?*const std.atomic.Value(bool) = null,
+        /// Per-token logprobs count for this request (0 = disabled). Callers
+        /// that set `Generator.logprobs_n` after init must ALSO pass it here:
+        /// init's split-prefill final-token forward is a single-row dispatch,
+        /// and the certified lm_head prune may only engage when the request
+        /// consumes nothing but the argmax — a logprobs request reads the
+        /// full logit row, which the pruned head does not produce.
+        logprobs_n: u32 = 0,
         /// LIVE prefill progress, in tokens actually forwarded so far by THIS
         /// prefill. Bumped once per chunk (not per token), read off-thread by
         /// the metrics gauge sampler.
@@ -902,8 +1016,46 @@ pub const Generator = struct {
         max_tokens: u32,
         sampling: SamplingParams,
         eos_token_ids: []const u32,
-        options: InitOptions,
+        options_in: InitOptions,
     ) !Generator {
+        // DeepSeek-V4 hard-off, at the ONE chokepoint every init site
+        // funnels through: dsv4's per-request state lives on the module
+        // (rings + compressed caches) and a spec VERIFY forward appends
+        // draft tokens to it with NO rollback — two rejected PLD drafts
+        // permanently corrupted a live generation (mangled DSML with dropped
+        // token runs, 2026-07-31; the per-site `is_dsv4` wiring guard in
+        // scheduler.runPrefill demonstrably did not cover the engaged path,
+        // and per-site wiring is the class the spec-dispatch rule warns
+        // about).
+        var options = options_in;
+        var dspark_active = false;
+        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled)) {
+            // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
+            // snapshot rollback inside deepseek_v4.zig) may engage when the
+            // checkpoint ships stages and the request is clean greedy — the
+            // accept rule is raw argmax equality, so any logit-modifying
+            // sampling (penalties, grammar, logprobs) stays serial. PLD /
+            // drafter / qwen-MTP remain hard-off regardless: their verify
+            // forwards go through machinery this arch cannot roll back.
+            const mdl_ds = xfm.dsv4.?;
+            const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
+            const greedy_clean = (sampling.temperature < 0.01 or sampling.top_k == 1) and
+                sampling.repeat_penalty == 1.0 and
+                sampling.presence_penalty == 0.0 and
+                sampling.constraint == null and
+                options.logprobs_n == 0;
+            if (mdl_ds.n_mtp > 0 and !dspark_env_off and greedy_clean) {
+                dspark_active = true;
+                log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+            } else {
+                log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+            }
+            options.pld_enabled = false;
+            options.drafter_enabled = false;
+            options.drafter = null;
+            options.mtp_enabled = false;
+            options.mtp = null;
+        }
         const s = xfm.s;
         // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
         // callers either supply one (scheduler) or fall through to
@@ -911,6 +1063,18 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/ssm fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+
+        // Certified lm_head prune gate: the pruned projection proves the
+        // ARGMAX, not the tail distribution, so it may engage only when this
+        // request consumes nothing else — greedy (or top-1) sampling with no
+        // logit-modifying penalties, no per-token logprobs and no grammar
+        // mask. Mirrors the `logprobs>0 + grammar disable spec` precedent:
+        // no request gets slower, some get faster.
+        ctx.argmax_only = (sampling.temperature < 0.01 or sampling.top_k == 1) and
+            sampling.repeat_penalty == 1.0 and
+            sampling.presence_penalty == 0.0 and
+            sampling.constraint == null and
+            options.logprobs_n == 0;
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -960,6 +1124,7 @@ pub const Generator = struct {
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
             xfm.config.has_sliding_window,
+            xfm.config.isMoe(),
         );
         // Phase-level prefill instrumentation. Enabled at debug level OR via
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
@@ -991,19 +1156,19 @@ pub const Generator = struct {
             ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0,
             has_vision,
         );
-        // Coarsen the checkpoint stride for MoE so memory-bound expert-weight
-        // re-streaming doesn't tax cold prefill (see effectiveSsmCheckpointStride).
-        // The predicate is config.isMoe() (real experts), NOT moe_layers != null:
-        // dense qwen3_5 (GDN hybrid) rides the MoE forward path structurally, and
-        // coarsening it to PREFILL_CHUNK silently disabled every prefix-cache hit
-        // under 8K-token prompts (caught live by llmprobe cache-hit-reported on
-        // Qwen3.6-27B dense, 2026-06-10).
+        // Coarsen the checkpoint stride so checkpointing never sub-divides the
+        // prefill chunk, on ANY arch (see effectiveSsmCheckpointStride: fine
+        // strides push every projection under prefillDqGemm's M>=2048 floor and
+        // multiply per-chunk fixed costs — 17-25% cold-prefill tax measured on
+        // dense AND MoE hybrids). Warm reuse keeps chunk-granularity snapshots
+        // plus the always-on end-of-prompt snapshot (the append-growth case
+        // llmprobe's cache-hit tests pin — verified green at coarse strides).
         // Coarsen against the UNCAPPED base chunk: the head_dim safety cap
-        // above must not densify MoE checkpoint spacing (16× more captures at
+        // above must not densify checkpoint spacing (16× more captures at
         // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
         // on stride boundaries, so a capped chunk stays compatible.
         const ssm_cp_stride: usize = if (want_ssm_cp)
-            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), xfm.config.isMoe(), @max(PREFILL_CHUNK, prefill_chunk_override))
+            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))
         else
             0;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
@@ -1024,16 +1189,28 @@ pub const Generator = struct {
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
 
+        // Start of the final (logits) forward's token span. Without SSM
+        // checkpointing this is the last prompt token (the classic 1-token
+        // logits forward); with checkpointing the chunk loop stops
+        // SSM_SNAPSHOT_BACKOFF tokens early so the always-on snapshot lands
+        // where the next turn's prefix match can actually reach it (see
+        // ssmSnapshotBackoff), and the final forward covers the held-back
+        // tail + the last token in the same weight sweep.
+        var final_start: usize = prompt_ids.len - 1;
+
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const default_chunk = if (has_vision) prefix_len else PREFILL_CHUNK;
+            const snapshot_backoff = ssmSnapshotBackoff(want_ssm_cp, prefix_len);
+            const loop_end = prefix_len - snapshot_backoff;
+            final_start = loop_end;
+            const default_chunk = if (has_vision) loop_end else PREFILL_CHUNK;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
             // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
             const mtp_hist_window = effectiveMtpHistoryWindow(prefix_len, mtp_history_window_override);
 
             var pos: usize = 0;
-            while (pos < prefix_len) {
+            while (pos < loop_end) {
                 // Abandoned-request abort: the client disconnected and the
                 // conn thread flagged the slot. Bail before the next chunk —
                 // the KV built so far is freed with the slot.
@@ -1050,7 +1227,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -1143,13 +1320,18 @@ pub const Generator = struct {
                             _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
                         }
                     }
-                    // Phase 1: also force SSM state to materialize so the
-                    // snapshot we take below holds a concrete tensor, not a
-                    // lazy node that would re-execute the prefill graph if
-                    // anyone reads from it later.
-                    const abs_end_for_cp = end + ssm_cp_offset;
-                    const should_capture = want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp % ssm_cp_stride == 0;
-                    if (should_capture) {
+                    // Phase 1: also force SSM state to materialize so any
+                    // snapshot below holds a concrete tensor, not a lazy node
+                    // that would re-execute the prefill graph if anyone reads
+                    // from it later. Unconditional on EVERY chunk (not just
+                    // stride-aligned ones): a tail-merged final chunk ends
+                    // off-boundary, and the always-on end-of-prompt snapshot
+                    // then hits exactly that re-execution — capturing an
+                    // un-evaluated state re-ran the whole last chunk's GDN
+                    // scan (measured −4% on an 8K Qwen3.6-27B prefill). The
+                    // states are ~KB-to-MB scale; evaluating them alongside
+                    // the KV costs nothing measurable.
+                    if (want_ssm_cp) {
                         for (ctx.ssm_entries.?) |*ssm| {
                             if (!ssm.initialized) continue;
                             if (ssm.conv_state.ctx != null) {
@@ -1205,10 +1387,15 @@ pub const Generator = struct {
             // With it, the cache restores to position 749 (~99% of the
             // prompt) and only the last token + new tail re-forwards.
             // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
-            if (want_ssm_cp and prefix_len > 0) {
-                const final_abs = prefix_len + ssm_cp_offset;
+            if (want_ssm_cp and loop_end > 0) {
+                // The snapshot sits at the chunk loop's end — snapshot_backoff
+                // tokens BEFORE the prompt end, where the next turn's prefix
+                // match can actually reach it (the template's generation
+                // suffix renders differently in history, so a match always
+                // falls a few tokens short of the full prompt).
+                const final_abs = loop_end + ssm_cp_offset;
                 // Skip if we already captured at this exact position (the
-                // chunked loop would have done so when prefix_len happens
+                // chunked loop would have done so when loop_end happens
                 // to be a stride multiple).
                 const already_have = ssm_checkpoints.items.len > 0 and
                     ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
@@ -1230,26 +1417,83 @@ pub const Generator = struct {
             }
         }
 
-        // Process last token (or single token for len=1) — this applies lm_head
-        // on just 1 token, producing the logits we need for sampling.
-        const last_shape = [_]c_int{ 1, 1 };
-        const last_idx = prompt_ids.len - 1;
-        const last_input = mlx.mlx_array_new_data(&ids_i32[last_idx], &last_shape, 2, .int32);
+        // Process the final span — the last token, plus (under SSM
+        // checkpointing) the snapshot-backoff tail held back from the chunk
+        // loop. One forward, one weight sweep, logits sliced to the last
+        // position so every consumer sees the classic [1, 1, V] shape.
+        const tail_len: usize = prompt_ids.len - final_start;
+        const last_shape = [_]c_int{ 1, @as(c_int, @intCast(tail_len)) };
+        const last_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[final_start]), &last_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(last_input);
 
         // Drafter (Gemma 4 assistant) needs the post-final-norm hidden as
         // its first-step h_prev — captured here so we don't need a second
-        // forward at the start of `nextDrafter`.
+        // forward at the start of `nextDrafter`. `forwardWithCapture`
+        // captures the LAST position regardless of span length. When the
+        // span holds backed-off tokens AND MTP is active, the head's history
+        // must also cover them (a hole right before the generation point is
+        // acceptance-critical), so capture ALL positions and append.
         const drafter_active = options.drafter_enabled and options.drafter != null;
         const pld_active = options.pld_enabled;
         const need_capture = drafter_active or mtp_active;
         var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
         var has_captured_hidden = false;
         const last_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-        const logits = if (need_capture) blk: {
+        const tail_mtp_capture = mtp_active and tail_len > 1;
+        var tail_hidden_all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tail_hidden_all);
+        const raw_logits = if (tail_mtp_capture) blk: {
+            has_captured_hidden = true;
+            break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
+        } else if (need_capture) blk: {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
+        // History entries for the held-back span: (hidden[j], token[j+1]) for
+        // j in [final_start, prefix_len) — same pairing as the chunk loop.
+        // The last row's pair (hidden[last], t1) is appended by the first
+        // nextMtp round, exactly as before.
+        if (tail_mtp_capture) {
+            if (!mtp_history_started) {
+                std.debug.assert(mtp_cache.?.step == 0);
+                mtp_position_base = ssm_cp_offset + final_start;
+                mtp_history_started = true;
+            }
+            var tail_hist_hidden = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tail_hist_hidden);
+            const all_shape = mlx.getShape(tail_hidden_all);
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ all_shape[0], @intCast(tail_len - 1), all_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&tail_hist_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+                .pos = positions,
+                .total = ctx.mrope_total,
+                .delta = ctx.mrope_delta,
+                .base = mtp_position_base,
+            } else null;
+            try mtp_mod.appendHistoryWithMrope(
+                options.mtp.?,
+                xfm,
+                &mtp_cache.?,
+                prompt_ids[final_start + 1 .. prompt_ids.len],
+                tail_hist_hidden,
+                @intCast(mtp_cache.?.step),
+                tail_mrope_ctx,
+            );
+        }
+        // Slice to the last position when the span is longer than one token,
+        // so downstream sampling/grammar paths see the classic shape.
+        const logits = if (tail_len == 1) raw_logits else blk: {
+            defer _ = mlx.mlx_array_free(raw_logits);
+            const lshape = mlx.getShape(raw_logits);
+            var sliced = mlx.mlx_array_new();
+            const start = [_]c_int{ 0, lshape[1] - 1, 0 };
+            const stop = [_]c_int{ lshape[0], lshape[1], lshape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&sliced, raw_logits, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            break :blk sliced;
+        };
         if (trace_enabled) {
             const last_ns = prefill_sw.read() - last_start_ns;
             const total_ns = prefill_sw.read();
@@ -1328,7 +1572,7 @@ pub const Generator = struct {
         // token forwarded; first sampled token deferred). The lazy
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
-        if (drafter_active or pld_active or mtp_active) {
+        if (drafter_active or pld_active or mtp_active or dspark_active) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -1361,6 +1605,8 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
+                .pld_enabled = pld_active,
+                .dspark_enabled = dspark_active,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .mtp = if (mtp_active) options.mtp else null,
@@ -1471,6 +1717,26 @@ pub const Generator = struct {
         return gen;
     }
 
+    /// The ONE place `step` and `completion_tokens` advance — every decode path
+    /// (plain, constrained, PLD, drafter, MTP, batched) routes through here.
+    ///
+    /// Advancing them by hand is how three paths — `nextDrafter`, `nextMtp` and
+    /// `scheduler.runBatchedDecodeTick` — ended up never calling
+    /// `mlx_clear_cache()` at all (issue #110). MLX parks freed buffers in a
+    /// size-keyed pool instead of returning them to the OS, so a decode path
+    /// with no clear ratchets the process footprint while `active_bytes` stays
+    /// flat: the reporter's process reached 81 GB with the panel reading 19.6.
+    /// A `-mtp` checkpoint on a dense trunk defaults straight onto one of them.
+    /// A source-scan test pins that no new path can reintroduce the hole.
+    pub fn advanceStep(self: *Generator, n: u32) void {
+        self.completion_tokens += n;
+        self.step += n;
+        if (shouldClearAllocatorCache(self.step, self.last_cache_clear_step, CACHE_CLEAR_INTERVAL)) {
+            _ = mlx.mlx_clear_cache();
+            self.last_cache_clear_step = self.step;
+        }
+    }
+
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -1579,10 +1845,8 @@ pub const Generator = struct {
         if (!self.has_pending_logits) return error.MissingPendingLogits;
 
         const token = self.next_token_id;
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
@@ -1637,10 +1901,8 @@ pub const Generator = struct {
         try self.resolvePendingToken();
         if (try self.checkStop()) return .stopped;
         const token = self.next_token_id;
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
@@ -1681,6 +1943,44 @@ pub const Generator = struct {
     /// Returns `null` only when generation is already done. When no n-gram
     /// match exists (cold start, novel output), falls back to the regular
     /// `next()` path and returns a single-token result with `used_lookup=false`.
+    /// DeepSeek-V4 DSpark step (the arch's OWN block-parallel spec decode).
+    /// Entry/exit share the v2 spec invariant: module state = prompt +
+    /// emitted positions, t1 = `next_token_id` NOT in state, pending empty
+    /// (init's spec branch establishes it; every exit restores it). The
+    /// heavy lifting — draft, batched verify, snapshot rollback — lives in
+    /// `deepseek_v4.dsparkRound`; this wrapper only keeps the Generator's
+    /// bookkeeping (generated_ids, step accounting, the shell cache.step
+    /// that forwardDsv4WithImpl keys fresh-vs-decode on) in sync.
+    pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.done) return null;
+        if (!self.dspark_enabled) {
+            // Same defensive fallback as nextPld's disarmed arm: the
+            // dispatching caller's flag alone must never run a draft.
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        }
+        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        const mdl = self.xfm.dsv4.?;
+        const t1 = self.next_token_id;
+        var round = try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1);
+        errdefer round.deinit(allocator);
+        // dsparkRound advanced the module state — mirror it on the shell
+        // cache verbatim so a later serial fallback (or the fresh-request
+        // check keying on step==0) sees a consistent position. Generator.step
+        // itself moves through advanceStep below (the clear-cadence clock).
+        self.ctx.cache.step = mdl.dec_state.?.n;
+        self.dspark_attempted += 1;
+        self.dspark_accepted_tokens += round.accepted;
+        try self.generated_ids.appendSlice(allocator, round.tokens);
+        self.advanceStep(@intCast(round.tokens.len));
+        self.next_token_id = round.next_token;
+        // tokens ownership transfers to the caller (scheduler frees).
+        return DrafterStepResult{ .tokens = round.tokens, .accepted_tokens = round.accepted };
+    }
+
     pub fn nextPld(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -1688,6 +1988,24 @@ pub const Generator = struct {
         key_len: u32,
     ) !?PldStepResult {
         if (self.done) return null;
+        // Init never armed PLD for this generator (the deepseek_v4 chokepoint
+        // guard, or a caller that simply didn't ask). The dispatching caller's
+        // flag alone must never put a verify forward through the trunk — on
+        // dsv4 the verify appends draft tokens into module-owned state that
+        // the KV snapshot rollback cannot restore (the 2026-07-31 mangled-DSML
+        // corruption). Unlike `spec_disabled_runtime` below this is permanent:
+        // no re-enable check can ever resurrect it.
+        if (!self.pld_enabled) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return PldStepResult{
+                .tokens = tokens,
+                .accepted_tokens = 0,
+                .used_lookup = false,
+            };
+        }
         // Release-enforced guard (issue #97): PLD cannot honor a grammar
         // constraint or logprobs. These were std.debug.asserts, compiled out in
         // ReleaseFast; fail loud instead of streaming off-schema output if a
@@ -1832,9 +2150,7 @@ pub const Generator = struct {
             const new_t1: u32 = @intCast(lv);
 
             try self.generated_ids.append(allocator, t1);
-            self.completion_tokens += 1;
-            self.step += 1;
-            if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+            self.advanceStep(1);
             self.next_token_id = new_t1;
 
             // Yield gate: cold steps pay the unpipelined forward; if the
@@ -2082,9 +2398,7 @@ pub const Generator = struct {
         for (draft[0..accepted]) |d| try self.generated_ids.append(allocator, d);
 
         self.pld_accepted_tokens += accepted;
-        self.completion_tokens += num_emit;
-        self.step += num_emit;
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+        self.advanceStep(num_emit);
 
         // No post-step forward — `next_token_id = new_t1` and exit. The next
         // nextPld call sees t1 NOT in cache (new invariant).
@@ -2487,8 +2801,7 @@ pub const Generator = struct {
 
             self.drafter_accepted_tokens += m;
             self.next_token_id = next_pending;
-            self.step += 1 + m;
-            self.completion_tokens += 1 + m;
+            self.advanceStep(1 + m);
 
             // drafts buffer transferred into tokens copy; free original.
             allocator.free(drafts);
@@ -2539,8 +2852,7 @@ pub const Generator = struct {
 
         self.drafter_accepted_tokens += accepted;
         self.next_token_id = next_pending;
-        self.step += 1 + accepted;
-        self.completion_tokens += 1 + accepted;
+        self.advanceStep(1 + accepted);
 
         allocator.free(drafts);
         self.checkDrafterRuntimeGate();
@@ -3532,8 +3844,7 @@ pub const Generator = struct {
 
             self.mtp_accepted_tokens += m;
             self.next_token_id = next_pending;
-            self.step += 1 + m;
-            self.completion_tokens += 1 + m;
+            self.advanceStep(1 + m);
 
             if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, m) else self.updateMtpDepth(m, m);
             if (tracing) {
@@ -3626,8 +3937,7 @@ pub const Generator = struct {
 
         self.mtp_accepted_tokens += accepted;
         self.next_token_id = next_pending;
-        self.step += 1 + accepted;
-        self.completion_tokens += 1 + accepted;
+        self.advanceStep(1 + accepted);
 
         if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, accepted) else self.updateMtpDepth(m, accepted);
         if (tracing) {
@@ -4585,11 +4895,8 @@ pub const Generator = struct {
                 if (try self.checkStop()) return null;
 
                 const token = self.next_token_id;
-                self.completion_tokens += 1;
-                self.step += 1;
+                self.advanceStep(1);
                 try self.generated_ids.append(allocator, token);
-
-                if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
                 // Store new pending state
                 self.pending_token = lazy_token;
@@ -4615,11 +4922,8 @@ pub const Generator = struct {
         if (try self.checkStop()) return null;
 
         const token = self.next_token_id;
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         const step_logits = if (self.has_pending_logits) blk: {
             const logits = self.pending_logits;
@@ -4767,10 +5071,8 @@ pub const Generator = struct {
             }
         }
 
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);
@@ -5192,7 +5494,10 @@ pub fn generate(
     logprobs_n: u32,
 ) !GenerationResult {
     var timer = io_util.Stopwatch.init(io);
-    var gen = try Generator.init(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
+    // logprobs_n rides InitOptions so init's argmax-only gate sees it (a
+    // post-init field write would let the split-prefill final-token forward
+    // engage the pruned lm_head on a logprobs request).
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .logprobs_n = logprobs_n });
     gen.timeout_ns = timeout_ns;
     gen.logprobs_n = logprobs_n;
     defer gen.deinit(allocator);
@@ -6709,6 +7014,39 @@ test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
     try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP, Generator.YIELD_GATE_WARMUP));
 }
 
+test "yield-gate warmup is 8 — the cold-path tax tripled when the AR step got 3x cheaper" {
+    // This constant is pure economics and the economics MOVED. Every warmup
+    // step pays PLD's unpipelined cold forward plus a synchronous host read of
+    // the sampled token, against `next()`'s async-pipelined step — an
+    // ~absolute tax measured as a share of the AR step. Fixing the Laguna
+    // mscale promotion made that AR step ~3x cheaper, so the same tax became a
+    // ~3x larger share and 32 steps of it stopped being affordable.
+    //
+    // Swept on Laguna XS (one boot, serial vs unconstrained alternating per
+    // request, server-reported timings, 5 runs median), against a matrix that
+    // deliberately contains PLD's WIN case as well as its loss cases —
+    // tuning on loss cases alone drives the warmup to zero and throws the win
+    // away:
+    //
+    //   warmup   echo-edit   code-edit  free-form   explain      qa
+    //       32     +76.9%       -4.3%      -1.2%     -1.4%     -7.2%
+    //       16     +70.1%       -3.4%      -0.4%     -0.3%     -0.8%
+    //        8     +77.4%       +0.3%      -0.2%     -0.3%     -1.5%
+    //        4     +76.6%       +3.9%      -0.2%     -0.1%     -1.7%
+    //
+    // 8 recovers essentially the whole loss while leaving the +77% untouched.
+    // 4 measured no worse, but a gate that decides on four observations is
+    // fitting noise, and a short preamble before a file echo is the NORMAL
+    // agent shape — exactly what a too-eager trip would punish. A premature
+    // trip is bounded anyway: `specShouldReenable` re-checks every
+    // SPEC_REENABLE_INTERVAL steps.
+    try testing.expectEqual(@as(u64, 8), Generator.YIELD_GATE_WARMUP);
+
+    // Sweepable without a rebuild, same contract as `runtimeGateWarmup`:
+    // out-of-range values fall back rather than silently disabling the gate.
+    try testing.expectEqual(Generator.YIELD_GATE_WARMUP, Generator.yieldGateWarmup());
+}
+
 test "Generator.specShouldReenable gates mid-request PLD re-activation" {
     // Disabled-mode periodic check on the COMMITTED sequence (prompt +
     // generated). The decisive case: the model echoes PROMPT content (file
@@ -6850,9 +7188,12 @@ test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // Mid-prompt chunks are untouched.
     try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0));
     try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0));
-    // With SSM-checkpoint alignment active, behavior is unchanged (boundaries
-    // must stay stride-aligned for the prefix cache).
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8193, 8192, true, 8192, 0));
+    // With SSM-checkpoint alignment active, a tiny tail STILL merges: the old
+    // 1-token trailing chunk existed only to lay a snapshot one token before
+    // the always-on end-of-prompt snapshot — pure overhead. A boundary strictly
+    // INSIDE the chunk still wins over merging (next case).
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0));
+    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0));
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
@@ -6863,10 +7204,11 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     // Tail merge: one token past a chunk boundary is still ONE chunk.
     try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0));
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0));
-    // The regression: a fine stride splits an 851-token prefill into 4 chunks
-    // (851 spans boundaries 256/512/768). Harmless on compute-bound dense models
-    // but on a memory-bound MoE prefill each chunk re-streams the expert weights
-    // (~25% slower on 35B-class). The non-MoE path keeps this fine stride.
+    // Mechanically, a raw fine stride still splits an 851-token prefill into 4
+    // chunks (851 spans boundaries 256/512/768) — which is why
+    // effectiveSsmCheckpointStride coarsens every stride to the prefill chunk:
+    // per-chunk costs (expert re-streaming on MoE, sub-dq-gemm-floor GEMMs +
+    // fixed overhead everywhere) taxed cold prefill 17-25%.
     try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0));
     // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
     // prefill starting mid-sequence still snaps to global strides. offset=2000,
@@ -6878,16 +7220,16 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
     // head_dim <= 128 rides MLX's fused SDPA — no materialized scores, no cap,
     // at ANY context length.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000, true));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true, false));
     // hd 256 but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
     // = 2 GiB scores, inside the 4 GiB budget -> full chunk kept. This is the
     // fleet-protection property: every Gemma-4 / Qwen3.5/3.6 checkpoint ships
     // head_dim 256, so typical prompts must keep full prefill throughput.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false));
     // Degenerate inputs never cap.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0, true, false));
 }
 
 test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel active" {
@@ -6897,21 +7239,21 @@ test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel a
     // prefillHeadDimFused (see the fn doc); pin that with the override ON.
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false));
 }
 
 test "boundedPrefillChunk: long context shrinks to the scores budget, floored and rounded" {
     // gemma-4-26B geometry (16 heads): budget/(16*ctx*2) …
     // ctx 32768 -> exactly 4096.
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true, false));
     // ctx 100000 -> raw 1342, rounded down to the 512 grain -> 1024.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false));
     // ctx 262144 (the PR-#69 255K case) -> 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true, false));
     // Qwen3.6-27B geometry (24 heads) at 262144: raw 341 -> floor 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true, false));
     // e4b geometry (8 heads) at 131072: exactly 2048.
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true, false));
 }
 
 test "MTP history window: threshold gate and chunk membership" {
@@ -6939,30 +7281,35 @@ test "MTP history window: threshold gate and chunk membership" {
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
     // --prefill-chunk 1024 with headroom for 4096: the explicit lower value wins.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true, false));
     // Even the floor never raises a tiny explicit base.
-    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true));
+    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true, false));
 }
 
-test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 caps at 4096, no score-formula shrink" {
+test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE caps at 4096, dense keeps the full chunk" {
     // With the causal arm FUSED (default since the budgeted-dispatch flip) no
     // score tensor exists, so the scores-budget formula is moot for the
     // qwen3_5/3_6 class — and its old shrink to 1024 at 64K starved the
     // dequant+GEMM qmm route (engages at M >= 2048): the 64K rung was the
-    // ladder's weakest for exactly this reason. Measured on the 27B: chunk
-    // 4096 beats 2048 same-session (+1.2% 8K / +0.6% 32K even before the
-    // dq route; the per-chunk dequant overhead halves on top).
+    // ladder's weakest for exactly this reason.
     std.debug.assert(transformer_mod.fused256_override == null);
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false));
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 65536, false));
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false));
+    // DENSE hybrids (Qwen3.6-27B class): no expert-gather transients, and a
+    // full-size chunk halves per-chunk dequant sweeps — chunk 8192 measured
+    // +1.4% over 4096 at the 8K rung (M4 Max, 2026-07-30), flat at 32K.
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 65536, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false));
+    // MoE keeps the 4096 cap: expert-gather transients scale with the chunk
+    // (gemma-26B@99K: +3% speed for +22 GB peak is a bad trade).
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false, true));
     // Never raises a caller-lowered base.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false, false));
     // Sliding-band archs (gemma: fused band kernel wants big chunks) keep
     // the formula-only policy.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false));
     // Fused head dims never cap regardless of arch.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false, false));
 }
 
 test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
@@ -6973,30 +7320,48 @@ test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + sc
     // the score transient shrinks with it.
     transformer_mod.fused256_override = false;
     defer transformer_mod.fused256_override = null;
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false, false));
     // The scores-budget formula still wins BELOW the cap: 64K on 24 heads
     // yields 1024 (measured better than 2048 there: 186 vs 182.3 tok/s).
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false, false));
 }
 
-test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps fine" {
+test "ssmSnapshotBackoff: engages only under checkpointing and past the backoff length" {
+    // No checkpointing (pure-attention archs, stride 0, vision): zero — the
+    // final forward stays the classic 1-token logits pass.
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotBackoff(false, 8192));
+    // Short prompts: nothing to back off (loop must keep >= 1 token).
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotBackoff(true, SSM_SNAPSHOT_BACKOFF));
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotBackoff(true, 1));
+    // Checkpointing + long prompt: the always-on snapshot lands backoff
+    // tokens before the prompt end, where the next turn's prefix match can
+    // reach it (template generation-suffix divergence class).
+    try testing.expectEqual(SSM_SNAPSHOT_BACKOFF, ssmSnapshotBackoff(true, 8192));
+    try testing.expectEqual(SSM_SNAPSHOT_BACKOFF, ssmSnapshotBackoff(true, SSM_SNAPSHOT_BACKOFF + 1));
+    // The tail forward must stay UNDER the prefill-eval-cadence threshold
+    // (seq >= 32 turns it into a "prefill" costing ~450ms of eval bubbles):
+    // tail = backoff + 1 <= 31.
+    try testing.expect(SSM_SNAPSHOT_BACKOFF + 1 < 32);
+}
+
+test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill chunk (dense AND MoE)" {
     const PREFILL_CHUNK: usize = 8192;
-    // Disabled stays disabled regardless of model type.
-    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, false, PREFILL_CHUNK));
-    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, true, PREFILL_CHUNK));
-    // Non-MoE hybrid keeps the fine base stride (cheap chunking, finer warm reuse).
-    try testing.expectEqual(@as(usize, 256), effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK));
-    // MoE coarsens to at least PREFILL_CHUNK so checkpointing never sub-divides
-    // the memory-bound chunk -> MoE prefill is single-chunk for any prompt the
-    // mem-bound path wouldn't already split.
-    try testing.expectEqual(@as(usize, 8192), effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK));
+    // Disabled stays disabled.
+    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, PREFILL_CHUNK));
+    // Sub-chunk strides coarsen on ALL archs: they push every projection under
+    // prefillDqGemm's M>=2048 floor (slow small-M qmm) and multiply per-chunk
+    // fixed costs. Measured on Qwen3.6-27B dense (M4 Max, 2026-07-30): stride
+    // 256 = 33 chunks at 8K = 211 tok/s vs 254 coarse.
+    try testing.expectEqual(@as(usize, 8192), effectiveSsmCheckpointStride(256, PREFILL_CHUNK));
     // A larger explicit stride is respected (never shrunk).
-    try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, true, PREFILL_CHUNK));
-    // End-to-end: with the effective stride, an 851-tok MoE prefill is 1 chunk
-    // (was 4 at the raw 256), while a dense/non-MoE hybrid stays at 4.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK), 0));
-    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK), 0));
+    try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, PREFILL_CHUNK));
+    // End-to-end: an 851-tok prefill is 1 chunk (was 4 at the raw 256 stride
+    // on dense hybrids — the llm_context_benchmarks small-prompt regression).
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
+    // An 8K prefill splits only at the (memory-bound) chunk size, never
+    // finer: 2 chunks at chunk 4096, not 33.
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
 }
 
 test "vision prefill is not split at SSM checkpoint boundaries" {
@@ -7840,3 +8205,224 @@ test "maskedMeanPoolNormalize excludes padded positions and unit-normalizes" {
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+// ── Allocator-cache clear cadence (issue #110) ───────────────────────────────
+
+test "clear cadence survives variable spec strides" {
+    // A spec-decode round emits `1 + accepted` tokens, so `step` advances by a
+    // VARIABLE amount and `step % 256 == 0` can walk clean over every multiple
+    // — silently, because a decode path that never clears is output-identical
+    // to one that does. Interval arithmetic against the last clear cannot be
+    // stepped over.
+    for ([_]u32{ 1, 3, 5, 9 }) |stride| {
+        var step: u32 = 0;
+        var last_clear: u32 = 0;
+        var clears: usize = 0;
+        var max_gap: u32 = 0;
+        while (step < 4096) {
+            step += stride;
+            if (shouldClearAllocatorCache(step, last_clear, CACHE_CLEAR_INTERVAL)) {
+                const gap = step - last_clear;
+                if (gap > max_gap) max_gap = gap;
+                last_clear = step;
+                clears += 1;
+            }
+        }
+        try testing.expect(clears >= 15);
+        // A stride can overshoot the interval by at most stride-1 tokens.
+        try testing.expect(max_gap <= CACHE_CLEAR_INTERVAL + stride);
+    }
+}
+
+test "no decode path advances `step` outside advanceStep" {
+    // Class guard for #110. `Generator.step` is the clear cadence's clock, so a
+    // path that bumps it by hand is a path that strands its round's transients
+    // in MLX's buffer pool forever — which is exactly what `nextDrafter`,
+    // `nextMtp` and `scheduler.runBatchedDecodeTick` did, and the `-mtp`
+    // checkpoints default onto one of those. A new decode path added later must
+    // route through `advanceStep` or fail here.
+    //
+    // The needles are concatenated so this test's OWN source doesn't match them.
+    const needle = ".step" ++ " +=";
+    const allowed = "self.step" ++ " += n";
+    const sources = [_]struct { name: []const u8, src: []const u8 }{
+        .{ .name = "generate.zig", .src = @embedFile("generate.zig") },
+        .{ .name = "scheduler.zig", .src = @embedFile("scheduler.zig") },
+    };
+    var total: usize = 0;
+    for (sources) |file| {
+        var it = std.mem.splitScalar(u8, file.src, '\n');
+        var lineno: usize = 0;
+        while (it.next()) |raw| {
+            lineno += 1;
+            // Strip trailing line comments: several of them spell out
+            // `cache.step += 1` while describing the KV cache's own counter.
+            const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
+            if (std.mem.indexOf(u8, line, needle) == null) continue;
+            total += 1;
+            if (std.mem.indexOf(u8, line, allowed) == null) {
+                std.debug.print("{s}:{d}: raw step advance outside advanceStep: {s}\n", .{
+                    file.name, lineno, std.mem.trim(u8, line, " "),
+                });
+                return error.RawStepAdvance;
+            }
+        }
+    }
+    // Exactly one: the assignment inside `advanceStep`. Zero means the field was
+    // renamed and this guard went vacuous — update it with the rename.
+    try testing.expectEqual(@as(usize, 1), total);
+}
+
+test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {
+    // DSpark is opt-in at load; the nextDspark arm below needs it armed.
+    _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+    // The live corruption path (2026-07-31, log 166348-166361): the scheduler
+    // decode tick dispatched on `slot.enable_pld` alone, so it called
+    // `nextPld` on a generator whose init the dsv4 guard had already flipped
+    // to pld_enabled=false — and nextPld trusted its caller, ran lookup +
+    // verify forwards, and the rejected drafts left dsv4's module-owned
+    // state (rings + kv/comp caches) permanently ahead of the rolled-back
+    // KVCache shell. This test reproduces the bypassing caller directly:
+    // nextPld on such a generator must (a) report the chokepoint flip via
+    // `gen.pld_enabled == false`, (b) never run a verify forward
+    // (`pld_attempted == 0`), and (c) emit the exact serial-decode tokens.
+    //
+    // Fabricate the mini with:
+    //   python3 tests/dsv4_mlx_ref.py --fabricate /tmp/dsv4-mini
+    //   DSV4_MINI=/tmp/dsv4-mini zig build test -Dtest-filter=DSV4_MINI
+    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    if (mlx.noGpuBackend()) return;
+    const path = std.mem.span(path_z);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
+    defer allocator.free(cfg_path);
+    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    file.close(io);
+    defer allocator.free(cfg_json);
+    const cfg = try model_mod.parseConfigFromJson(allocator, cfg_json);
+    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
+    defer allocator.free(shard_path);
+    var weights = try model_mod.loadWeightsSingleFile(allocator, shard_path);
+    defer weights.deinit();
+
+    // Never read by the Generator (stored only) — see the field comment.
+    var tok_dummy: Tokenizer = undefined;
+
+    // Prompt = every vocab id once. With key_len=1 any sampled t1 < V has an
+    // earlier occurrence, so PLD's lookup ALWAYS proposes a draft — on the
+    // pre-fix code that guarantees a verify forward (and the corruption);
+    // random-content prompts can idle in the cold path and mask the bug
+    // (exactly how the first two live requests read as "guards held").
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*v, i| v.* = @intCast(i);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const want: usize = 10;
+
+    // Serial baseline: the regular scheduler shape (skip_lazy_preforward).
+    var serial: [want]u32 = undefined;
+    {
+        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
+            .skip_lazy_preforward = true,
+        });
+        defer gen.deinit(allocator);
+        var n: usize = 0;
+        while (n < want) {
+            const t = (try gen.next(allocator)) orelse break;
+            serial[n] = t;
+            n += 1;
+        }
+        try testing.expectEqual(want, n);
+    }
+
+    // Bypass arm: init asks for PLD (the app's always-on flags), the dsv4
+    // chokepoint flips it off, and the caller drives nextPld anyway — the
+    // scheduler tick's exact live behavior before specTickMode grew the
+    // generator-state conjunct.
+    {
+        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
+            .pld_enabled = true,
+            .skip_lazy_preforward = true,
+            .lookup_prompt = &prompt,
+        });
+        defer gen.deinit(allocator);
+        try testing.expect(!gen.pld_enabled);
+
+        var pld_toks: [want]u32 = undefined;
+        var n: usize = 0;
+        while (n < want) {
+            const r = (try gen.nextPld(allocator, 4, 1)) orelse break;
+            defer allocator.free(r.tokens);
+            for (r.tokens) |t| {
+                if (n < want) {
+                    pld_toks[n] = t;
+                    n += 1;
+                }
+            }
+        }
+        try testing.expectEqual(want, n);
+        try testing.expectEqual(@as(u64, 0), gen.pld_attempted);
+        try testing.expectEqualSlices(u32, serial[0..], pld_toks[0..]);
+    }
+
+    // DSpark arm: the SAME app-shaped init (spec flags on, greedy) now arms
+    // dsv4's own draft mode on a stage-bearing checkpoint. The tick driver
+    // is nextDspark; the sequence must match serial (the batch-verify vs
+    // single-token kernel-choice class allows a late near-tie flip on the
+    // random mini — the module-level dsparkRound gate pins the loop itself,
+    // this pins the GENERATOR wiring: engagement, step accounting, and the
+    // shell-cache mirror).
+    {
+        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
+            .pld_enabled = true,
+            .mtp_enabled = true,
+            .skip_lazy_preforward = true,
+            .lookup_prompt = &prompt,
+        });
+        defer gen.deinit(allocator);
+        try testing.expect(!gen.pld_enabled);
+        try testing.expect(gen.mtp == null);
+        try testing.expect(gen.dspark_enabled);
+
+        var ds_toks: [want]u32 = undefined;
+        var n: usize = 0;
+        while (n < want) {
+            const r = (try gen.nextDspark(allocator)) orelse break;
+            defer allocator.free(r.tokens);
+            for (r.tokens) |t| {
+                if (n < want) {
+                    ds_toks[n] = t;
+                    n += 1;
+                }
+            }
+        }
+        try testing.expectEqual(want, n);
+        // ENGAGEMENT: silent serial fallback is output-identical — count rounds.
+        try testing.expect(gen.dspark_attempted >= 1);
+        // Shell cache mirrors the module state exactly.
+        try testing.expectEqual(xfm.dsv4.?.dec_state.?.n, gen.ctx.cache.step);
+        // Sequence agreement: exact up to the sanctioned near-tie window.
+        var first_div: usize = want;
+        for (0..want) |k| {
+            if (serial[k] != ds_toks[k]) {
+                first_div = k;
+                break;
+            }
+        }
+        if (first_div < 4) {
+            std.debug.print("nextDspark serial={any} dspark={any}\n", .{ serial, ds_toks });
+            try testing.expect(false);
+        }
+        std.debug.print("dsv4 nextDspark (generator): first_div={d}/{d}, rounds={d}, accepts={d}\n", .{ first_div, want, gen.dspark_attempted, gen.dspark_accepted_tokens });
+    }
+}

@@ -426,26 +426,26 @@ final class MCPTests: XCTestCase {
         let mcp = #"[{"type":"function","function":{"name":"github__list_repos"}}]"#
 
         // Both modes on: arrays should be concatenated.
-        let merged = ChatTurnEngine.combinedToolsJSON(agentMode: true, mcpToolsJSON: mcp)
+        let merged = ChatTurnEngine.combinedToolsJSON(tools: Set(AgentToolKind.allCases), mcpToolsJSON: mcp)
         XCTAssertNotNil(merged)
         let mergedData = merged!.data(using: .utf8)!
         let arr = try? JSONSerialization.jsonObject(with: mergedData) as? [[String: Any]]
-        XCTAssertEqual(arr?.count, 18, "Expected 17 agent tools (incl. createTask, killProcess/readProcessOutput/listProcesses, generate_image/audio/video) + 1 MCP tool, got \(arr?.count ?? 0)")
+        XCTAssertEqual(arr?.count, 19, "Expected 18 agent tools (incl. createTask, killProcess/readProcessOutput/listProcesses, generate_image/speech/music/video) + 1 MCP tool, got \(arr?.count ?? 0)")
         XCTAssertTrue(merged!.contains("github__list_repos"))
         XCTAssertTrue(merged!.contains("shell"))
 
         // MCP only.
-        let mcpOnly = ChatTurnEngine.combinedToolsJSON(agentMode: false, mcpToolsJSON: mcp)
+        let mcpOnly = ChatTurnEngine.combinedToolsJSON(tools: [], mcpToolsJSON: mcp)
         XCTAssertEqual(mcpOnly, mcp)
 
         // Agent only.
-        let agentOnly = ChatTurnEngine.combinedToolsJSON(agentMode: true, mcpToolsJSON: nil)
+        let agentOnly = ChatTurnEngine.combinedToolsJSON(tools: Set(AgentToolKind.allCases), mcpToolsJSON: nil)
         XCTAssertNotNil(agentOnly)
         XCTAssertTrue(agentOnly!.contains("shell"))
         _ = agent  // silence unused warning if the agent fixture isn't compared
 
         // Neither.
-        XCTAssertNil(ChatTurnEngine.combinedToolsJSON(agentMode: false, mcpToolsJSON: nil))
+        XCTAssertNil(ChatTurnEngine.combinedToolsJSON(tools: [], mcpToolsJSON: nil))
     }
 
     // MARK: - Tool result rendering (swift-sdk 0.12 content shapes)

@@ -17,21 +17,35 @@ import AVFoundation
 /// routing decisions are unit-testable without audio hardware or a server
 /// (`ClonedVoiceSynthesizerTests`).
 @MainActor
+/// Which neural voice an utterance should use, or nil for the system voice.
+///
+/// The two arms are DIFFERENT BACKENDS with disjoint controls, which is why
+/// this is a sum type and not a pair of optional strings: Qwen3-TTS clones from
+/// a clip and has no voice list, Kokoro names a built-in voice (or a
+/// comma-separated blend) and cannot clone. Sending the wrong field is a named
+/// 400 server-side.
+enum NeuralVoice: Equatable, Sendable {
+    case clone(clipPath: String)
+    case kokoro(voice: String)
+}
+
 final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     /// One sentence + the clip path → WAV bytes; nil = synthesis failed and
     /// the utterance falls back to the system voice.
-    typealias CloneSynth = (_ text: String, _ clipPath: String) async -> Data?
+    typealias CloneSynth = (_ text: String, _ voice: NeuralVoice) async -> Data?
     /// Play one WAV clip to completion.
     typealias ClonePlay = (_ audio: Data) async -> Void
 
     private let system: any SpeechSynthesizing
-    private let clipPath: () -> String?
+    private let voice: () -> NeuralVoice?
     private let synthesizeClone: CloneSynth
     private let playClone: ClonePlay
     /// Silence the in-flight clone clip immediately (barge-in).
     private let stopClonePlayback: () -> Void
     /// Release the resident TTS model (voice mode closed). nil in tests.
     private let unloadClone: (() async -> Void)?
+    /// Pre-embed the clone reference clip (voice mode opened). nil = no-op.
+    private let prewarmClone: ((NeuralVoice) async -> Void)?
 
     /// Sentences awaiting clone synthesis (pipeline stage 1).
     private var texts: [String] = []
@@ -60,17 +74,19 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     }
 
     init(system: any SpeechSynthesizing,
-         clipPath: @escaping () -> String?,
+         voice: @escaping () -> NeuralVoice?,
          synthesizeClone: @escaping CloneSynth,
          playClone: @escaping ClonePlay,
          stopClonePlayback: @escaping () -> Void = {},
-         unloadClone: (() async -> Void)? = nil) {
+         unloadClone: (() async -> Void)? = nil,
+         prewarmClone: ((NeuralVoice) async -> Void)? = nil) {
         self.system = system
-        self.clipPath = clipPath
+        self.voice = voice
         self.synthesizeClone = synthesizeClone
         self.playClone = playClone
         self.stopClonePlayback = stopClonePlayback
         self.unloadClone = unloadClone
+        self.prewarmClone = prewarmClone
         system.onQueueDrained = { [weak self] in self?.systemFinished() }
     }
 
@@ -83,17 +99,29 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
         let player = VoiceClonePlayer()
         self.init(
             system: SystemSpeechSynthesizer(),
-            clipPath: {
-                // The voice picker can switch back to a system voice without
-                // deleting the clip — honor that toggle here.
-                let o = ServerOptions.load()
-                return (o.voiceCloneEnabled && !o.voiceClonePath.isEmpty) ? o.voiceClonePath : nil
+            voice: {
+                // Re-read per utterance so a Settings change — or the active
+                // agent's own voice, which is preferred here — applies to the
+                // very next sentence, with no restart.
+                ActiveAgentVoice.currentNeuralVoice(options: ServerOptions.load())
             },
-            synthesizeClone: { text, clip in await tts.synthesize(text: text, refClipPath: clip) },
+            synthesizeClone: { text, sel in await tts.synthesize(text: text, voice: sel) },
             playClone: { data in await player.play(data) },
             stopClonePlayback: { player.stop() },
-            unloadClone: { await tts.unload() }
+            unloadClone: { await tts.unload() },
+            prewarmClone: { sel in await tts.prewarm(voice: sel) }
         )
+    }
+
+    /// Voice mode opened: pre-embed the clone reference clip so the FIRST
+    /// sentence skips the cold speaker-encoder forward (the only per-session
+    /// cost the content-keyed server cache cannot hide). Only the clone arm
+    /// has anything to warm — Kokoro voices are a table lookup, the system
+    /// voice needs nothing — and failure is fine: the first sentence simply
+    /// pays what it always paid.
+    func prewarm() {
+        guard let prewarmClone, case let sel? = voice(), case .clone = sel else { return }
+        Task { await prewarmClone(sel) }
     }
 
     // MARK: - SpeechSynthesizing
@@ -101,12 +129,12 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     func enqueue(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let clip = clipPath(), !clip.isEmpty else {
-            system.enqueue(trimmed)     // no clone configured → system voice
+        guard let sel = voice() else {
+            system.enqueue(trimmed)     // no neural voice configured → system
             return
         }
         texts.append(trimmed)
-        pumpSynth(clip: clip)
+        pumpSynth(voice: sel)
     }
 
     func stop() {
@@ -133,14 +161,14 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
 
     /// Stage 1: synthesize queued sentences in order, handing each result to
     /// the play queue as soon as it's ready (playback overlaps synthesis).
-    private func pumpSynth(clip: String) {
+    private func pumpSynth(voice sel: NeuralVoice) {
         guard !synthPumping else { return }
         synthPumping = true
         let gen = generation
         Task { [weak self] in
             while let self, self.generation == gen, !self.texts.isEmpty {
                 let text = self.texts.removeFirst()
-                let audio = await self.synthesizeClone(text, clip)
+                let audio = await self.synthesizeClone(text, sel)
                 guard self.generation == gen else { return }
                 self.playQueue.append(audio.map { .clone($0) } ?? .fallback(text))
                 self.pumpPlay()
@@ -244,11 +272,20 @@ final class VoiceCloneTTS {
 
     init(server: ServerManager) { self.server = server }
 
-    func synthesize(text: String, refClipPath: String?) async -> Data? {
+    func synthesize(text: String, voice sel: NeuralVoice) async -> Data? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let preset = AudioGenSettings.load().resolvedModel
-        guard let dir = ServerManager.resolveModelDir(repo: preset.repo) else { return nil }
+        // The engine choice picks the MODEL too — Kokoro is its own checkpoint,
+        // not a mode of the Qwen3-TTS one.
+        // The clone model is resolved against the DISK, not just read from the
+        // Audio pane: the configured default is the 0.6B repo, so a machine with
+        // only the 1.7B variants used to resolve nothing and fall back silently to
+        // the system voice.
+        let preset: AudioModelPreset? = switch sel {
+        case .kokoro: .kokoro82M
+        case .clone: VoiceCloneMenuModel.resolvedCloneModel()
+        }
+        guard let preset, let dir = ServerManager.resolveModelDir(repo: preset.repo) else { return nil }
         do {
             let port = try await server.ensureRunning(forGenModelDir: dir)
             if loadedModelId == nil || loadedDir != dir {
@@ -256,10 +293,7 @@ final class VoiceCloneTTS {
                 loadedModelId = info.name
                 loadedDir = dir
             }
-            var json: [String: Any] = ["model": loadedModelId ?? dir, "input": trimmed]
-            if let refClipPath, let data = try? Data(contentsOf: URL(fileURLWithPath: refClipPath)) {
-                json["ref_audio"] = data.base64EncodedString()
-            }
+            let json = VoiceCloneTTS.requestBody(model: loadedModelId ?? dir, text: trimmed, voice: sel)
             var wav: Data?
             for try await ev in api.streamGeneration(port: port, path: "/v1/audio/speech", json: json) {
                 if ev["type"] as? String == "complete", let b64 = ev["data"] as? String {
@@ -272,10 +306,66 @@ final class VoiceCloneTTS {
         }
     }
 
+    /// Build the `/v1/audio/speech` body. PURE and static so the field choice
+    /// is testable: the fakes in `ClonedVoiceSynthesizerTests` stub out this
+    /// whole class, so swapping `voice` for `ref_audio` here passed every
+    /// routing test while being a guaranteed 400 in production.
+    ///
+    /// Sends ONLY the field the chosen backend accepts — the other one is a
+    /// named 400 server-side, not an ignored extra.
+    static func requestBody(model: String, text: String, voice sel: NeuralVoice) -> [String: Any] {
+        var json: [String: Any] = ["model": model, "input": text]
+        switch sel {
+        case .kokoro(let v):
+            json["voice"] = v
+        case .clone(let clip):
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: clip)) {
+                json["ref_audio"] = data.base64EncodedString()
+            }
+        }
+        return json
+    }
+
     func unload() async {
         if let id = loadedModelId { try? await server.unloadModel(id: id) }
         loadedModelId = nil
         loadedDir = nil
+    }
+
+    /// Pre-warm the server's speaker-embedding cache for the clip
+    /// (docs/qwentts-cache.md): loads the TTS model if needed (voice mode is
+    /// about to speak through it anyway) and POSTs `warm_only` so the first
+    /// sentence's synthesis starts from a cache hit. Best-effort.
+    func prewarm(voice sel: NeuralVoice) async {
+        guard case .clone = sel else { return }
+        let preset: AudioModelPreset? = VoiceCloneMenuModel.resolvedCloneModel()
+        guard let preset, let dir = ServerManager.resolveModelDir(repo: preset.repo) else { return }
+        do {
+            let port = try await server.ensureRunning(forGenModelDir: dir)
+            if loadedModelId == nil || loadedDir != dir {
+                let info = try await server.loadModel(id: dir)
+                loadedModelId = info.name
+                loadedDir = dir
+            }
+            guard let json = VoiceCloneTTS.warmBody(model: loadedModelId ?? dir, voice: sel) else { return }
+            var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/audio/speech")!)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: json)
+            _ = try? await URLSession.shared.data(for: req)
+        } catch {
+            // First sentence pays the cold embed — exactly the pre-warm-less behavior.
+        }
+    }
+
+    /// Build the `warm_only` body. PURE and static (the requestBody pattern)
+    /// so the field choice is testable: `warm_only` + `ref_audio`, never
+    /// `input` — a body with text would synthesize audio nobody asked for.
+    /// nil when the clip can't be read (nothing to warm with).
+    static func warmBody(model: String, voice sel: NeuralVoice) -> [String: Any]? {
+        guard case let .clone(clip) = sel,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: clip)) else { return nil }
+        return ["model": model, "warm_only": true, "ref_audio": data.base64EncodedString()]
     }
 }
 

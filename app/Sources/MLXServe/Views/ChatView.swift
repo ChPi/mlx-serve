@@ -57,7 +57,8 @@ struct ToolApprovalSheet: View {
         case "webSearch":  return "Search the web"
         case "saveMemory": return "Save a memory"
         case "generate_image": return "Generate an image"
-        case "generate_audio": return "Generate audio"
+        case "generate_speech": return "Generate spoken audio"
+        case "generate_music": return "Generate a music track"
         case "generate_video": return "Generate a video"
         default:           return "Run \(request.toolName)"
         }
@@ -375,39 +376,75 @@ enum PasteFileKind: String, Equatable {
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
+    /// Flipped by the gate sheet's Cancel, and by nothing else.
+    ///
+    /// The sheet was first presented on a `.constant(true)` binding, which made
+    /// it properly blocking and made Cancel UNIMPLEMENTABLE: AppKit refuses to
+    /// close a window that has an attached sheet, so the click did nothing and
+    /// the user was stuck (measured through the accessibility API — the sheet
+    /// was still on screen afterwards). The binding's setter still swallows
+    /// SwiftUI's own dismissals, so Esc and click-away can't drop the user onto
+    /// the dead composer underneath; Cancel is the one door, and it ends the
+    /// sheet before closing the window. Window scenes rebuild their content on
+    /// reopen, so this resets itself.
+    @State private var gateCancelled = false
+
+    /// The starter recommendation this Mac gets — same function the welcome
+    /// window and the Model Browser read.
+    private var starterPick: RecommendedModelPick {
+        RecommendedModelPick.starterPick(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+    }
+
+    /// Blocking whenever nothing on this Mac can serve a chat. The progress
+    /// argument is nil here on purpose: this only decides WHETHER to block, and
+    /// `appState.localModels` is what flips it back. The sheet itself observes
+    /// the download manager for the live figure.
+    private var gateIsBlocking: Bool {
+        ChatGateState.resolve(localModels: appState.localModels,
+                              activeDownload: nil,
+                              lanChatModelCount: server.lanModels(capability: "chat").count).isBlocking
+    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
-                // No toolbar band over the SIDEBAR column: scrolled session
-                // rows stay fully visible to the window's top edge instead of
-                // dimming under a material strip — the list reads as sitting
-                // on top of the toolbar. The detail column keeps its own
-                // 0.8-opacity band (set in ChatDetailView); the two sections
-                // are styled independently.
-                .toolbarBackground(.hidden, for: .windowToolbar)
+                // Both columns carry the window's toolbar material, so the bar
+                // reads as one surface across the split rather than appearing
+                // only over the detail side. It is also what the list's
+                // scroll-edge effect attaches to.
+                .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
             if let sessionId = appState.activeChatId,
                appState.chatSessions.contains(where: { $0.id == sessionId }) {
                 ChatDetailView(sessionId: sessionId)
             } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "bubble.left.and.bubble.right")
-                        .font(.system(size: 36))
-                        .foregroundStyle(.quaternary)
-                    Text("Start a conversation")
-                        .foregroundStyle(.secondary)
-                    Button("New Chat") {
-                        _ = appState.newChatSession()
-                    }
-                    .buttonStyle(.bordered)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // No conversation yet — open one immediately rather than showing
+                // a "Start a conversation" wall with a button. The first thing a
+                // chat app should present is somewhere to type: `ChatDetailView`
+                // already renders the greeting above a centered composer while a
+                // session has no messages, so a fresh launch and a fresh chat
+                // look the same. Creating it in `onAppear` (not during the view
+                // update) keeps SwiftUI from seeing state mutate mid-layout; the
+                // branch can only fire once, because it sets `activeChatId`.
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onAppear { _ = appState.newChatSession() }
             }
         }
         .navigationTitle("")
+        // Blocking: the setter drops SwiftUI's own dismissals, so nothing but
+        // Cancel takes this sheet down. The getter is recomputed every update,
+        // so it also clears ITSELF the moment a chat model lands.
+        .sheet(isPresented: Binding(get: { gateIsBlocking && !gateCancelled },
+                                    set: { _ in })) {
+            ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)
+                .environmentObject(appState)
+                .environmentObject(appState.downloads)
+                .environmentObject(server)
+        }
         .onAppear {
             // Menu bar apps need explicit activation for keyboard focus — and
             // the `.regular` flip must come FIRST. (The old comment here claimed
@@ -417,7 +454,19 @@ struct ChatView: View {
             DispatchQueue.main.async {
                 AppActivation.focus()
             }
+            // The gate reads `localModels`; a chat window opened right after a
+            // download landed elsewhere must not show a stale one.
+            appState.refreshModels()
         }
+    }
+
+    /// Cancel on the gate: end the sheet, THEN close the window. Both halves
+    /// are required and the order is load-bearing — a window with an attached
+    /// sheet can't be closed, and dismissing to the composer underneath is the
+    /// dead end this gate exists to replace.
+    private func cancelGate() {
+        gateCancelled = true
+        DispatchQueue.main.async { dismissWindow(id: "chat") }
     }
 }
 
@@ -425,6 +474,7 @@ struct ChatView: View {
 
 struct ChatSidebar: View {
     @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
 
     var body: some View {
@@ -445,9 +495,30 @@ struct ChatSidebar: View {
                                 .lineLimit(1)
                                 .foregroundStyle(isSelected ? .white : .primary)
                         }
-                        Text(relativeTime(session.updatedAt))
-                            .font(.caption2)
-                            .foregroundStyle(isSelected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.5))
+                        // Who this chat is talking to, when it isn't the app
+                        // defaults. Sits on the timestamp line rather than the
+                        // title's so a long agent name can never squeeze the
+                        // title, which is what the row is FOR — and it answers
+                        // "why does this thread behave differently" without
+                        // opening it.
+                        HStack(spacing: 4) {
+                            if let agent = appState.agents.agent(id: session.agentId) {
+                                Image(systemName: agent.symbol)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                                Text(agent.name)
+                                    .font(.caption2)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                                Text("·")
+                                    .font(.caption2)
+                                    .foregroundStyle(isSelected ? Color.white.opacity(0.5) : Color.secondary.opacity(0.4))
+                            }
+                            Text(relativeTime(session.updatedAt))
+                                .font(.caption2)
+                                .foregroundStyle(isSelected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.5))
+                        }
                     }
                     Spacer(minLength: 4)
                     if hoveredSessionId == session.id {
@@ -487,17 +558,79 @@ struct ChatSidebar: View {
             }
         }
         .listStyle(.sidebar)
+        // The platform's own scroll-edge effect at BOTH ends: rows pass under
+        // the window's top edge and under the New Chat row (a `safeAreaInset`,
+        // so content scrolls beneath it), and a soft edge is how macOS frosts
+        // that overlap. Not a hand-drawn band — a custom strip pulled into this
+        // area once looked native and swallowed every click in it.
+        .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+        // No Agents / Models entries here: both windows are reachable from the
+        // chat toolbar now — "Manage Agents…" in the composer's agent chip and
+        // "Manage Models…" in the model picker — and each sat next to the
+        // control it configures. The sidebar is the conversation list, and a
+        // second route to the same two windows only competed with it.
         .safeAreaInset(edge: .bottom) {
-            Button {
-                _ = appState.newChatSession()
-            } label: {
-                Label("New Chat", systemImage: "plus")
-                    .frame(maxWidth: .infinity)
+            HStack(spacing: 8) {
+                Button {
+                    _ = appState.newChatSession()
+                } label: {
+                    Label("New Chat", systemImage: "plus")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Rectangle())
+                }
+                // `.plain` + our own frame and background, NOT `.bordered` —
+                // see `ChatMetrics.sidebarButtonHeight`. It is the only way the
+                // two controls are the same height by construction rather than
+                // by whatever a style style decides their labels are worth.
+                .buttonStyle(.plain)
+                .sidebarActionButton()
+                newAgentChatMenu
             }
-            .buttonStyle(.bordered)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
         }
+    }
+
+    /// Start a chat AS an agent.
+    ///
+    /// Next to New Chat because that is WHEN the choice is made: a session's
+    /// agent is fixed once the session exists (there is no `setAgent` any more),
+    /// so this is the only place it can be picked. It used to be a chip in the
+    /// composer, where it configured the whole conversation from the row that
+    /// configures one message — and a mid-thread switch silently re-pointed the
+    /// prompt, tools, model and voice of a conversation already underway.
+    private var newAgentChatMenu: some View {
+        Menu {
+            if appState.agents.allAgents.isEmpty {
+                Text("No agents yet")
+            }
+            ForEach(appState.agents.allAgents) { agent in
+                let decision = appState.agentModelDecision(for: agent)
+                Button {
+                    appState.startChat(withAgent: agent.id)
+                } label: {
+                    // Same rule as the old chip: an agent whose pinned model
+                    // isn't downloaded says so rather than failing at send.
+                    Label(AgentModelSwitch.isSelectable(decision)
+                          ? agent.name : "\(agent.name) — model not downloaded",
+                          systemImage: agent.symbol)
+                }
+                .disabled(!AgentModelSwitch.isSelectable(decision))
+            }
+            Divider()
+            Button("Manage Agents…") {
+                AppActivation.openWindow(id: "agents", using: openWindow)
+            }
+        } label: {
+            Image(systemName: "person.badge.plus")
+                .frame(width: 34, height: ChatMetrics.sidebarButtonHeight)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .sidebarActionButton()
+        .help("New chat with an agent — its prompt, tools, model and voice")
     }
 
     private func relativeTime(_ date: Date) -> String {
@@ -532,7 +665,6 @@ struct ChatDetailView: View {
     @State private var isAgentMode = false
     @State private var mcpMode = false
     @State private var showMCPMarketplace = false
-    @State private var showVoiceMode = false
     @State private var showThinkingInAgentConfirm = false
     @State private var executingPlanMessageId: UUID?
     @State private var isNearBottom = true
@@ -598,262 +730,467 @@ struct ChatDetailView: View {
     private var isExternalBridgeSession: Bool { session?.isExternalBridge == true }
 
     /// Resolved on/off state for the three mode toggles in the toolbar — sourced
-    /// from `serverOptions.telegram` for a Telegram session, else the in-app state.
+    /// from `serverOptions.telegram` for a Telegram session, else the in-app
+    /// state, and overridden by the tab's agent for whatever it decides.
     private var toolbarToggles: ChatModeToggles {
         let tg = appState.serverOptions.telegram
         return ChatModeToggles.resolve(
             isExternalBridge: isExternalBridgeSession,
             telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
-            inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode)
+            inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode,
+            agentLock: agentModeLock)
     }
 
-    // MARK: Toolbar mode pills (Think / Agent / MCP)
-    //
-    // All three share ChatMetrics' pill geometry — an EXPLICIT height and icon
-    // slot, because SF symbols at the same point size have different intrinsic
-    // sizes (brain vs wrench vs puzzle) and padding-derived capsules came out
-    // subtly unequal. Rendered inside the `headerControls` toolbar item.
+    /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
+    ///
+    /// Built from the SAME `resolvedAgentSettings` the turn runs under, not from
+    /// the agent's `capabilities` directly: a second copy of that rule is exactly
+    /// how the discs ended up disagreeing with what ran (every agent defaults
+    /// `web: true`, so resolution forced the tool loop on while the wrench still
+    /// rendered OFF). Cheap — the resolution is a pure fold.
+    private var agentModeLock: AgentModeLock? {
+        guard let agent = activeAgent else { return nil }
+        let resolved = appState.resolvedAgentSettings(
+            agentId: agent.id,
+            toolsEnabled: isAgentMode,
+            mcpEnabled: mcpMode,
+            thinkingEnabled: enableThinking,
+            workingDirectory: session?.workingDirectory,
+            disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []))
+        return AgentModeLock(name: agent.name,
+                             // The only one an agent may leave to the chat.
+                             thinking: agent.enableThinking,
+                             tools: resolved.toolsEnabled,
+                             mcp: resolved.mcpEnabled)
+    }
 
-    /// The chat pane's top-right control cluster: voice, settings, and the
-    /// mode pills — rides ONE real ToolbarItem so it lives in the window's
-    /// toolbar band, clickable and aligned with the traffic lights. History,
-    /// in order: these were NSToolbar items (mangled by the » eviction bug
-    /// when agent mode grew them), then a custom safeAreaInset strip
-    /// (double-spaced under the empty toolbar band), then the strip pulled
-    /// into the band via ignoresSafeArea (native look, but the titlebar
-    /// layer swallowed every click). Real toolbar items are the only
-    /// clickable residents of that band, and they are safe ONLY because this
-    /// cluster is static-size: the icon-only compact mode is gone, and the
-    /// workspace folder control lives INSIDE the Agent pill as an
-    /// always-present icon (the MCP-gear pattern) instead of a name-sized
-    /// chip. Do not add anything here whose size changes at runtime.
-    private var headerControls: some View {
-        HStack(spacing: 10) {
-            Button {
-                startVoiceMode()
-            } label: {
-                Image(systemName: "waveform")
-                    .font(.system(size: 12))
-                    .foregroundStyle(server.status == .running ? .primary : .tertiary)
-            }
-            .buttonStyle(.borderless)
-            .disabled(server.status != .running)
-            .help("Voice mode — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
+    // MARK: Mode controls (Think / Tools / MCP)
+    //
+    // Icon-only, rendered in the COMPOSER row next to the paperclip — see
+    // `modeIcon` for why state has to read from colour alone once the captions
+    // are gone, and `composerControls` for the row itself.
+
+    /// The chat pane's ONE toolbar resident: model picker, voice, settings, as a
+    /// single floating capsule at the leading edge.
+    ///
+    /// It rides a real `ToolbarItem` because that band's own layer swallows
+    /// clicks from anything else placed in it (a custom strip pulled in via
+    /// ignoresSafeArea looked native and was completely dead). What changed is
+    /// the BACKGROUND: the band no longer paints a 100%-width strip across the
+    /// window, so this cluster carries its own material and reads as floating
+    /// over the transcript. That material is load-bearing — without it, content
+    /// scrolling under the cluster bleeds through the controls, which is exactly
+    /// why the band used to be painted at 0.8 opacity.
+    ///
+    /// The three mode controls that used to sit here are in the COMPOSER row
+    /// now: their captions were most of this cluster's width budget, and they
+    /// configure the message being written, not the window.
+    private var floatingToolbar: some View {
+        // Voice moved OUT to the composer row (`voiceToggle`): it configures
+        // the conversation you're having, not the window — and it freed this
+        // cluster's width budget.
+        HStack(spacing: 4) {
+            ChatModelPill(showsBackground: false)
+            // The server being down is discovered HERE — you type and nothing
+            // answers — so the fix is offered here too, next to the picker,
+            // instead of only in the tray. Transient by construction: it is
+            // gone the moment the server is up, so it costs the cluster's width
+            // budget only while it has something to say.
+            serverStartControl
+            Divider().frame(height: 14)
             Button {
                 AppActivation.openWindow(id: "settings", using: openWindow)
             } label: {
                 Image(systemName: "gear")
                     .font(.system(size: 12))
                     .foregroundStyle(.primary)
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
             .help("Open Settings (⌘,) — server flags, speculative decoding, performance (continuous batching, KV-quant, prefix cache), and per-request defaults.")
-            modePillCluster
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 0.5))
+    }
+
+    /// Start the server from the chat window. Drawn rather than styled
+    /// (`.plain` + explicit padding/fill) — a `.bordered` control keeps its
+    /// intrinsic size and would sit at a different height to the pill beside
+    /// it, which is the sidebar New Chat lesson.
+    @ViewBuilder private var serverStartControl: some View {
+        let control = ChatServerStartControl.resolve(
+            status: server.status,
+            hasStartableModel: !appState.selectedModelPath.isEmpty || server.lanChatModelId != nil
+        )
+        if control != .hidden {
+            Button {
+                // ONE start path, shared with the LAN toggle: it loads the
+                // selected checkpoint, or boots headless when the model
+                // answering is on another Mac. A second `server.start` call
+                // site here is how the two would drift.
+                appState.ensureServerForLan()
+            } label: {
+                HStack(spacing: 4) {
+                    if control == .starting {
+                        ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 10, height: 10)
+                    } else {
+                        Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
+                    }
+                    Text(control.title)
+                        .font(.caption.weight(.semibold))
+                }
+                .foregroundStyle(control.isRed ? Color.white : Color.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(control.isRed ? Color.red : Color.secondary.opacity(0.15), in: Capsule())
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(!control.isEnabled)
+            .help(control == .starting
+                  ? "Loading the model — this can take a while for a large one."
+                  : "The server isn't running, so nothing can answer. Click to start it.")
         }
     }
 
-    /// Sandbox status shield, rendered in the COMPOSER row (never in the
-    /// toolbar band: adding anything there re-triggers the » eviction class —
-    /// live regression 2026-07-19, the extra icon tipped the cluster width and
-    /// small windows overflowed everything into the » menu). Same glyph in both
-    /// states, only the color changes: green = agent tools + MCP servers run
-    /// inside the isolated Linux VM (click opens the sandbox terminal); gray =
-    /// they run on the host (tooltip names Settings, click opens it).
-    private var sandboxShield: some View {
-        let state = SandboxShield.state(
-            requestedEnabled: appState.serverOptions.sandbox.enabled)
-        return Button {
-            AppActivation.openWindow(id: state.windowId, using: openWindow)
+    // The per-tab agent PICKER used to sit here, between the paperclip and the
+    // mode discs. It's next to New Chat now (`ChatSidebar.newAgentChatMenu`):
+    // it configures the whole conversation rather than the message being
+    // written, and a session's agent is fixed once the session exists — a
+    // mid-thread switch left half a conversation running under someone else's
+    // prompt, tools, model and voice, and flipped the three discs beside it
+    // while it did. The chat still SHOWS who it's talking to (the sidebar row,
+    // and the locked discs name the agent on hover).
+
+    /// The agent this tab is talking to (nil = none).
+    private var activeAgent: Agent? { appState.agents.agent(id: session?.agentId) }
+
+    /// Images/PDFs/audio for this message, or a folder to ask questions about.
+    /// Its own property (rather than inline in `composerControls`) so it carries
+    /// a hover card like every other glyph in the row.
+    private var attachmentMenu: some View {
+        Menu {
+            Button {
+                pickAttachment()
+            } label: {
+                Label(audioSupported ? "Attach Image, PDF, or Audio…" : "Attach Image or PDF…",
+                      systemImage: "photo.on.rectangle")
+            }
+            Button {
+                pickDocumentFolder()
+            } label: {
+                Label("Attach Folder for Q&A…", systemImage: "folder.badge.questionmark")
+            }
         } label: {
-            Image(systemName: "checkmark.shield.fill")
+            Image(systemName: "paperclip")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(state.isOn ? Color.green : Color.secondary.opacity(0.6))
+                .foregroundStyle(.secondary)
                 .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
                 .background(Color.secondary.opacity(0.15))
                 .clipShape(Circle())
-                // Full control frame == the pill's resting height (ChatMetrics
-                // contract, same as the paperclip) so the bottom-aligned row
-                // centers the circle against the input pill.
-                .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-                .contentShape(Circle())
         }
+        // .plain button style (not .borderlessButton menu style) — the latter
+        // substitutes its own chrome on macOS, dropping the circle background
+        // and mis-baselining the glyph.
+        .menuStyle(.button)
         .buttonStyle(.plain)
-        .help(state.help)
+        .menuIndicator(.hidden)
+        .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
+        .composerTip(.attachments(audioSupported: audioSupported))
     }
 
-    @ViewBuilder
-    private var modePillCluster: some View {
-        HStack(spacing: ChatMetrics.togglePillSpacing) {
-            thinkToggle
-            agentToggle
-            mcpToggle
-        }
-        .fixedSize()
+    /// Shared look for the composer's icon-only mode controls.
+    ///
+    /// Captioned pills in the toolbar became bare glyphs here, so the state has
+    /// to read from COLOR alone: tinted glyph on a tinted disc when on, secondary
+    /// on the same neutral disc as the paperclip when off. Same circle geometry
+    /// as every other composer control, so the row stays on one baseline.
+    /// `lockedBy` draws an inset ring inside the disc — the control still reads
+    /// its state from colour, and the ring says the state isn't yours to change.
+    /// A dimmed-out glyph was the alternative and it loses the ON/OFF reading,
+    /// which is the one thing the disc has to keep saying.
+    private func modeIcon(_ icon: String, isOn: Bool, onColor: Color,
+                          lockedBy: String? = nil) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(isOn ? onColor : Color.secondary)
+            .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
+            .background(isOn ? onColor.opacity(0.20) : Color.secondary.opacity(0.15))
+            .clipShape(Circle())
+            .overlay {
+                if lockedBy != nil {
+                    Circle()
+                        .inset(by: 1)
+                        .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                        .foregroundStyle((isOn ? onColor : Color.secondary).opacity(0.65))
+                        .frame(width: ChatMetrics.composerIconSize,
+                               height: ChatMetrics.composerIconSize)
+                }
+            }
+            .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
+            // A .plain Button without an explicit content shape only hit-tests
+            // the drawn glyph pixels, not the disc.
+            .contentShape(Circle())
     }
 
-    /// Shared pill label: fixed icon slot + caption inside the pinned height.
+    /// What a locked disc offers instead of its own controls: who decided it, and
+    /// the way to the place where that decision lives. A locked control that does
+    /// nothing at all on click is the dead-control class — this is the same shape
+    /// as the tool menu's "not in <agent>'s capabilities" rows.
     @ViewBuilder
-    private func pillLabel(icon: String, title: String, isOn: Bool, onColor: Color) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .medium))
-                .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
-            Text(title)
-                .font(.caption.weight(.medium))
+    private func lockedModeMenu(_ agentName: String) -> some View {
+        Text("Set by \(agentName)")
+        Button("Edit Agent…") {
+            // ON that agent — the window otherwise opens on whoever sorts
+            // first, which is the wrong one every time you got here from a card
+            // that just named a different name.
+            guard let id = activeAgent?.id else { return }
+            appState.openAgentSettings(id, using: openWindow)
         }
-        .foregroundStyle(isOn ? .white : .secondary)
-        .padding(.horizontal, ChatMetrics.togglePillPaddingH)
-        .frame(height: ChatMetrics.togglePillHeight)
-        .background(isOn ? onColor : Color.secondary.opacity(0.12))
-        .clipShape(Capsule())
-        // Whole capsule is clickable — a .plain Button without an explicit
-        // content shape only hit-tests the drawn pixels.
-        .contentShape(Capsule())
     }
 
     private var thinkToggle: some View {
-        Button {
-            if isExternalBridgeSession {
-                // Telegram session: write the shared config so the toggle
-                // stays in sync with Settings and the bridge reads it live.
-                appState.serverOptions.telegram.enableThinking.toggle()
-            } else if !enableThinking && isAgentMode {
-                showThinkingInAgentConfirm = true
+        Group {
+            if let owner = toolbarToggles.thinkingLockedBy {
+                Menu {
+                    lockedModeMenu(owner)
+                } label: {
+                    modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue, lockedBy: owner)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
             } else {
-                enableThinking.toggle()
+                Button {
+                    if isExternalBridgeSession {
+                        // Telegram session: write the shared config so the toggle
+                        // stays in sync with Settings and the bridge reads it live.
+                        appState.serverOptions.telegram.enableThinking.toggle()
+                    } else if !enableThinking && isAgentMode {
+                        showThinkingInAgentConfirm = true
+                    } else {
+                        enableThinking.toggle()
+                    }
+                } label: {
+                    modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
+                }
+                .buttonStyle(.plain)
             }
-        } label: {
-            pillLabel(icon: "brain", title: "Think", isOn: toolbarToggles.thinking, onColor: .blue)
         }
-        .buttonStyle(.plain)
-        .help("Thinking Mode (\(toolbarToggles.thinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
+        .composerTip(.thinking(isOn: toolbarToggles.thinking,
+                               lockedBy: toolbarToggles.thinkingLockedBy))
     }
 
-    /// Split pill like `mcpToggle`: the wrench+caption half toggles Agent
-    /// mode, the folder half picks the workspace directory. The folder icon
-    /// is ALWAYS present (static pill size — the » toolbar gotcha); the
-    /// current workspace rides both halves' tooltips.
+    /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
+    /// switches and the workspace.
+    ///
+    /// It used to open the menu on click, with on/off as the first row. This is
+    /// the composer's most-flipped control, so the frequent action was paying a
+    /// click plus a scan down a long list every time. A bare glyph meaning two
+    /// things by WHERE you click is still out (that was the split-pill problem);
+    /// meaning two things by WHICH button is the standard macOS split, and
+    /// `primaryAction:` also gives press-and-hold for free — the context menu is
+    /// there because press-and-hold is not something anyone discovers.
+    ///
+    /// While the tab has an agent this is a LOCKED indicator: `AgentResolution`
+    /// takes the loop straight from the agent's capabilities and ignores whatever
+    /// the chat says, so a live toggle here would be a control that changes
+    /// nothing. It shows what the agent decided and points at the editor.
     private var agentToggle: some View {
-        HStack(spacing: 0) {
-            Button {
-                if isExternalBridgeSession {
-                    // Telegram session: flip the shared config (in sync with
-                    // Settings); no per-session approval state applies here.
-                    appState.serverOptions.telegram.agentMode.toggle()
-                } else {
-                    isAgentMode.toggle()
-                    // Re-arm the approval gate every time the user re-enters
-                    // Agent mode. "Always allow this session" decays here —
-                    // for THIS tab only; other tabs keep their decision.
-                    if !isAgentMode { toolAllowList.rearm(sessionId) }
-                    // Thinking + tool-calling loops degrade quality on most
-                    // local models — auto-off when entering Agent mode.
-                    if isAgentMode { enableThinking = false }
+        Group {
+            if let owner = toolbarToggles.toolsLockedBy {
+                Menu {
+                    lockedModeMenu(owner)
+                } label: {
+                    modeIcon("wrench", isOn: toolbarToggles.agent, onColor: .orange, lockedBy: owner)
                 }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "wrench")
-                        .font(.system(size: 11, weight: .medium))
-                        .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
-                    Text("Agent")
-                        .font(.caption.weight(.medium))
+            } else {
+                Menu {
+                    toolMenuContent
+                } label: {
+                    modeIcon("wrench", isOn: toolbarToggles.agent, onColor: .orange)
+                } primaryAction: {
+                    setToolsEnabled(!toolbarToggles.agent)
                 }
-                .foregroundStyle(toolbarToggles.agent ? .white : .secondary)
-                .padding(.leading, ChatMetrics.togglePillPaddingH)
-                .frame(height: ChatMetrics.togglePillHeight)
-                // Capsule background lives on the OUTER HStack — without an
-                // explicit content shape only the drawn pixels hit-test.
-                .contentShape(Rectangle())
+                .contextMenu { toolMenuContent }
             }
-            .buttonStyle(.plain)
-            Button {
-                if let picked = WorkspacePicker.pickDirectory() {
-                    workingDirectoryBinding.wrappedValue = picked
-                }
-            } label: {
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(toolbarToggles.agent ? .white.opacity(0.85) : .secondary)
-                    .padding(.trailing, ChatMetrics.togglePillPaddingH)
-                    .padding(.leading, 4)
-                    .frame(height: ChatMetrics.togglePillHeight)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("""
-            Workspace — the working directory for every Agent tool call.
-            shell, readFile, writeFile, editFile, searchFiles, listFiles, browse all resolve relative paths from here. When the Agent Sandbox is on, this folder is what's mounted at /workspace in the VM.
-            Current: \(session?.workingDirectory ?? "not set")
-            Click to pick a new folder.
-            """)
         }
-        .frame(height: ChatMetrics.togglePillHeight)
-        .background(toolbarToggles.agent ? .orange : Color.secondary.opacity(0.12))
-        .clipShape(Capsule())
-        .help("""
-        Agent Mode (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
-          • shell — run a shell command in the workspace
-          • cwd — change the workspace working directory
-          • readFile — read a file (with line range)
-          • writeFile — create or overwrite a small file
-          • editFile — line- or text-based edit of an existing file
-          • searchFiles — ripgrep-style content search across the workspace
-          • listFiles — list paths with glob + recursive options
-          • browse — navigate + extract text/HTML via WKWebView
-          • webSearch — DuckDuckGo search
-          • saveMemory — persist a fact to ~/.mlx-serve/memory.md
-        Off: a regular chat with no tools.
-        Workspace: \(session?.workingDirectory ?? "not set") — tap the folder icon to change it.
-        """)
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .composerTip(.tools(isOn: toolbarToggles.agent,
+                            workspace: session?.workingDirectory,
+                            lockedBy: toolbarToggles.toolsLockedBy))
     }
 
-    private var mcpToggle: some View {
-        HStack(spacing: 0) {
-            Button {
-                if isExternalBridgeSession {
-                    // Telegram session: flip the shared config (synced with Settings).
-                    appState.serverOptions.telegram.useMCP.toggle()
-                } else {
-                    mcpMode.toggle()
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "puzzlepiece.extension")
-                        .font(.system(size: 11, weight: .medium))
-                        .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
-                    Text("MCP")
-                        .font(.caption.weight(.medium))
-                }
-                .foregroundStyle(toolbarToggles.mcp ? .white : .secondary)
-                .padding(.leading, ChatMetrics.togglePillPaddingH)
-                .frame(height: ChatMetrics.togglePillHeight)
-                // The capsule background lives on the OUTER HStack, so this
-                // button's label is transparent — without an explicit content
-                // shape only the glyph/text pixels hit-test, which is why the
-                // MCP toggle "didn't always click".
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            Button { showMCPMarketplace = true } label: {
-                Image(systemName: "gearshape.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(toolbarToggles.mcp ? .white.opacity(0.85) : .secondary)
-                    .padding(.trailing, ChatMetrics.togglePillPaddingH)
-                    .padding(.leading, 4)
-                    .frame(height: ChatMetrics.togglePillHeight)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
+    /// Flip the tool loop for this chat. Shared by the wrench click and the
+    /// pre-send intent nudge, so the approval re-arm and the thinking auto-off
+    /// can't apply on one path and not the other.
+    private func setToolsEnabled(_ on: Bool) {
+        // The agent decides this one — the disc offers no primary action while
+        // locked, but the pre-send nudge calls in here too.
+        guard toolbarToggles.toolsLockedBy == nil else { return }
+        if isExternalBridgeSession {
+            // Telegram session: flip the shared config (in sync with Settings);
+            // no per-session approval state applies here.
+            appState.serverOptions.telegram.agentMode = on
+            return
         }
-        .frame(height: ChatMetrics.togglePillHeight)
-        .background(toolbarToggles.mcp ? .purple : Color.secondary.opacity(0.12))
-        .clipShape(Capsule())
-        .help("MCP Mode (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the Agent's toolset (alongside the 10 built-ins). Tap the gear to open the Marketplace and toggle servers on/off.")
+        isAgentMode = on
+        // Re-arm the approval gate every time the user re-enters Agent mode.
+        // "Always allow this session" decays here — for THIS tab only; other
+        // tabs keep their decision.
+        if !on { toolAllowList.rearm(sessionId) }
+        // Thinking + tool-calling loops degrade quality on most local models —
+        // auto-off when entering Agent mode.
+        if on { enableThinking = false }
+    }
+
+    // MARK: Per-chat tool switches
+    //
+    // Subtractive by construction: the menu writes to the SESSION's disabled
+    // set, which `AgentResolution` removes from whatever the agent (or the app
+    // defaults) already allowed. A chat tab can therefore never hand an agent a
+    // capability its own settings forbid — those rows render disabled instead of
+    // offering a switch that the resolver would ignore.
+
+    /// What the tab's agent permits at all; everything when there's no agent.
+    private var agentAllowedTools: Set<AgentToolKind> {
+        activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+    }
+
+    private var disabledToolSet: Set<AgentToolKind> {
+        ChatSession.disabledToolKinds(session?.disabledTools ?? [])
+    }
+
+    private func isToolEnabled(_ tool: AgentToolKind) -> Bool {
+        agentAllowedTools.contains(tool) && !disabledToolSet.contains(tool)
+    }
+
+    private func setTool(_ tool: AgentToolKind, enabled: Bool) {
+        guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        var disabled = disabledToolSet
+        if enabled { disabled.remove(tool) } else { disabled.insert(tool) }
+        appState.chatSessions[idx].disabledTools = disabled.map(\.rawValue).sorted()
+        appState.saveChatHistory()
+    }
+
+    /// Per-tool switches + the workspace they apply to. No on/off row: that is
+    /// what a click on the wrench does, and one boolean with two controls is how
+    /// the two end up disagreeing. No bulk "all" rows either — they duplicated
+    /// the switches sitting directly beneath them, and read as a second way to
+    /// turn the loop off.
+    @ViewBuilder
+    private var toolMenuContent: some View {
+        ForEach(AgentToolGroup.allCases, id: \.self) { group in
+            Section(group.title) {
+                ForEach(group.tools, id: \.self) { tool in
+                    let allowed = agentAllowedTools.contains(tool)
+                    Button {
+                        setTool(tool, enabled: !isToolEnabled(tool))
+                    } label: {
+                        if isToolEnabled(tool) {
+                            Label(tool.displayName, systemImage: "checkmark")
+                        } else if allowed {
+                            Text(tool.displayName)
+                        } else {
+                            // The agent forbids it — say so rather than showing
+                            // an off switch the user can't turn on.
+                            Text("\(tool.displayName) — not in \(activeAgent?.name ?? "agent")'s capabilities")
+                        }
+                    }
+                    .disabled(!allowed || isExternalBridgeSession)
+                }
+            }
+        }
+
+        Divider()
+        Button("Workspace…") {
+            if let picked = WorkspacePicker.pickDirectory() {
+                workingDirectoryBinding.wrappedValue = picked
+            }
+        }
+        .disabled(isExternalBridgeSession)
+        Text(session?.workingDirectory ?? "No workspace set")
+    }
+
+    /// Flip MCP for this chat — the Telegram bridge writes the shared config it
+    /// reads live, everyone else the app-level state.
+    private func setMCPEnabled(_ on: Bool) {
+        guard toolbarToggles.mcpLockedBy == nil else { return }
+        if isExternalBridgeSession {
+            appState.serverOptions.telegram.useMCP = on
+        } else {
+            mcpMode = on
+        }
+    }
+
+    /// Same shape as `agentToggle`: click toggles, secondary-click opens the
+    /// Marketplace the gear half used to hold.
+    private var mcpToggle: some View {
+        Group {
+            if let owner = toolbarToggles.mcpLockedBy {
+                Menu {
+                    lockedModeMenu(owner)
+                } label: {
+                    modeIcon("puzzlepiece.extension", isOn: toolbarToggles.mcp,
+                             onColor: .purple, lockedBy: owner)
+                }
+            } else {
+                Menu {
+                    mcpMenuContent
+                } label: {
+                    modeIcon("puzzlepiece.extension", isOn: toolbarToggles.mcp, onColor: .purple)
+                } primaryAction: {
+                    setMCPEnabled(!toolbarToggles.mcp)
+                }
+                .contextMenu { mcpMenuContent }
+            }
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .composerTip(.mcp(isOn: toolbarToggles.mcp, lockedBy: toolbarToggles.mcpLockedBy))
+    }
+
+    @ViewBuilder
+    private var mcpMenuContent: some View {
+        Button("MCP Marketplace…") { showMCPMarketplace = true }
+    }
+
+    /// A conversation with nothing in it yet. Rendered instead of an empty
+    /// scroll view so the composer sits under a greeting in the middle of the
+    /// window rather than pinned to the bottom of a blank page.
+    private var isEmptyConversation: Bool {
+        (session?.messages.isEmpty ?? true) && composerState != .generatingHere
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Spacer()
+            Text("How can I help you today?")
+                .font(.system(size: 26, weight: .semibold, design: .rounded))
+            if server.status != .running {
+                Text("Start the server to begin.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else if let agent = activeAgent {
+                Text("Talking to \(agent.name)")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            if isEmptyConversation {
+                emptyState
+            } else {
             // Messages
             ScrollViewReader { proxy in
                 ScrollView {
@@ -861,10 +1198,31 @@ struct ChatDetailView: View {
                         ForEach(ChatRowBuilder.rows(from: session?.messages ?? [])) { row in
                             switch row {
                             case .message(let m):
-                                MessageBubble(message: m).id(m.id)
+                                MessageBubble(
+                                    message: m,
+                                    sources: sourcesFor(m),
+                                    onIncreaseContext: {
+                                        AppActivation.openWindow(id: "settings", using: openWindow)
+                                    },
+                                    onDelete: {
+                                        appState.deleteMessage(in: sessionId, messageId: m.id)
+                                    })
+                                .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
                             }
+                        }
+                        // Live media generation, under the tool-call row that
+                        // started it. These block chat decode on the one GPU for
+                        // anything from seconds to minutes, so the alternative is
+                        // a window that looks frozen. Only in the chat whose turn
+                        // ASKED for it — with concurrent turns, ownership rides
+                        // `mediaProgressSessionId`, not just "is generating".
+                        if composerState == .generatingHere,
+                           chatEngine.mediaProgressSessionId == sessionId,
+                           let progress = chatEngine.mediaProgress {
+                            MediaProgressCard(progress: progress)
+                                .id("mediaProgress")
                         }
                         // Bottom anchor — its position relative to the scroll viewport
                         // tells us whether the user has scrolled to the bottom.
@@ -881,6 +1239,14 @@ struct ChatDetailView: View {
                     .padding(ChatMetrics.gutter)
                 }
                 .coordinateSpace(name: "chatScroll")
+                // Transcript text used to run straight into the floating model
+                // picker. The toolbar band's own full-width background stays
+                // hidden (the cluster carries its own material — that's what
+                // keeps content from bleeding THROUGH the controls); this is
+                // the other half, frosting the content as it passes UNDER them,
+                // drawn by the scroll view itself so nothing new can intercept
+                // a click.
+                .scrollEdgeEffectStyle(.soft, for: .top)
                 .background(
                     GeometryReader { scrollFrame in
                         Color.clear.preference(
@@ -912,20 +1278,10 @@ struct ChatDetailView: View {
                         .allowsHitTesting(false)
                 }
             }
-
+            // The divider belongs to the transcript — against the empty
+            // state's greeting it would draw a line across mid-window.
             Divider()
-
-            // Context usage monitor — shows once a turn has reported usage, or
-            // live the moment this chat starts generating its first reply.
-            if contextUsage != nil || composerState == .generatingHere {
-                ContextMonitor(promptTokens: contextUsage?.promptTokens ?? 0,
-                               completionTokens: contextUsage?.completionTokens ?? 0,
-                               liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens : 0,
-                               isLive: composerState == .generatingHere,
-                               contextLength: contextUsage?.contextLength
-                                   ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
-                                                                         modelContextLength: server.chatModelInfo?.contextLength))
-            }
+            }   // end else (non-empty conversation)
 
             // Input area — iMessage style
             VStack(spacing: 4) {
@@ -965,105 +1321,43 @@ struct ChatDetailView: View {
                     }
                 }
 
-                HStack(alignment: .bottom, spacing: 8) {
-                    // Sandbox status shield (green = isolated VM, gray = host).
-                    sandboxShield
+                // Voice mode lives INLINE: a talking orb just above the input,
+                // not a sheet over the transcript (the sheet hid the
+                // conversation and duplicated the composer's own toggles).
+                // Renders nothing while voice is off.
+                VoiceOrbView(controller: appState.voice, sessionId: sessionId)
 
-                    // Attachment menu (images/PDFs/audio + document folder)
-                    Menu {
-                        Button {
-                            pickAttachment()
-                        } label: {
-                            Label(audioSupported ? "Attach Image, PDF, or Audio…" : "Attach Image or PDF…",
-                                  systemImage: "photo.on.rectangle")
-                        }
-                        Button {
-                            pickDocumentFolder()
-                        } label: {
-                            Label("Attach Folder for Q&A…", systemImage: "folder.badge.questionmark")
-                        }
-                    } label: {
-                        Image(systemName: "paperclip")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
-                            .background(Color.secondary.opacity(0.15))
-                            .clipShape(Circle())
-                    }
-                    // .plain button style (not .borderlessButton menu style) —
-                    // the latter substitutes its own chrome on macOS, dropping
-                    // the circle background and mis-baselining the glyph next
-                    // to the input pill.
-                    .menuStyle(.button)
-                    .buttonStyle(.plain)
-                    .menuIndicator(.hidden)
-                    // Full control frame == the pill's resting height, so the
-                    // bottom-aligned row centers the circle against the pill
-                    // with no nudge padding (ChatMetrics contract).
-                    .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-                    .help("Attach files, or a document folder to ask questions about")
-
-                    // Mic — only on models that actually understand audio
-                    // (Gemma 4 12B). Tap to record, tap again to attach.
-                    if audioSupported {
-                        MicButton(recorder: recorder) { toggleRecording() }
-                            .disabled(server.status != .running || chatEngine.isGenerating)
-                    }
-
-                    // Dark pill input — NSTextView-backed so a big paste stays
-                    // smooth and the mouse wheel scrolls once it grows past the cap.
-                    GrowingTextEditor(text: $inputText,
-                                      isFocused: $inputFocused,
-                                      measuredHeight: $composerHeight,
-                                      isIdle: composerState == .idle,
-                                      onSend: { sendMessage() })
-                        .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
-                        .padding(.horizontal, 5)
-                        .disabled(server.status != .running)
-                        .background(Color(nsColor: .textBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 20))
-                        .overlay(alignment: .topLeading) {
-                            if inputText.isEmpty {
-                                Text("Message")
-                                    .font(.body)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.leading, 14)
-                                    .padding(.top, 8)
-                                    .allowsHitTesting(false)
-                            }
-                        }
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 20)
-                                .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
-                        )
-
-                    Button {
-                        if composerState == .generatingHere {
-                            chatEngine.stop()
-                        } else {
-                            sendMessage()
-                        }
-                    } label: {
-                        Image(systemName: composerState == .generatingHere ? "stop.circle.fill" : "arrow.up.circle.fill")
-                            .font(.system(size: ChatMetrics.composerIconSize))
-                            .foregroundStyle(composerState == .generatingHere ? .red : .accentColor)
-                            .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-                    }
-                    .buttonStyle(.plain)
-                    // Stop is always tappable for the owning chat. Otherwise: Send,
-                    // disabled when the server is down, when this chat has nothing
-                    // to send, or while ANOTHER chat is mid-turn (the single-turn
-                    // engine can't start a concurrent run — so don't dead-click).
-                    .disabled(server.status != .running
-                              || composerState == .busyElsewhere
-                              || (composerState == .idle
-                                  && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                  && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
+                // One rounded container, two rows: the input on top with the
+                // full width of the column, its controls beneath — inside the
+                // same border, so they read as belonging to it.
+                //
+                // They used to sit BESIDE the input, which cost the field ~200pt
+                // of width (most of a line) on every message, and that cost grew
+                // with each new control. Stacked, the field is as wide as the
+                // transcript it answers.
+                VStack(alignment: .leading, spacing: 6) {
+                    composerField
+                    composerControls
                 }
+                .padding(8)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 18))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
+                )
+                // Hover cards for the row's bare glyphs. Drawn HERE, past the
+                // clip: an overlay on the control itself is cut off at the
+                // container's rounded edge and lands over the text field.
+                .composerTipOverlay()
               }   // end else (non-Telegram composer)
             }
             .padding(.horizontal, ChatMetrics.gutter)
             .padding(.vertical, 8)
+            // Balances the greeting's leading spacer so the greeting and the
+            // composer center as ONE group. Without it the pair sits at the
+            // bottom of an otherwise blank window.
+            if isEmptyConversation { Spacer() }
         }
         .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {
@@ -1103,55 +1397,53 @@ struct ChatDetailView: View {
             }
             return true
         }
-        // ONE static-size toolbar item — see `headerControls` for why this is
-        // safe despite the » eviction gotcha (its content never changes size).
+        // ONE toolbar item — see `floatingToolbar` for why a real ToolbarItem is
+        // the only clickable resident of that band, and why its width stays
+        // bounded (the » eviction gotcha).
         .toolbar {
             if #available(macOS 26.0, *) {
                 // Liquid Glass gives every toolbar item its own capsule
                 // background + border; hide it so the controls float bare on
                 // the content, matching the sidebar's seamless look.
-                ToolbarItem(placement: .primaryAction) {
-                    headerControls
+                //
+                // The model picker rides its OWN item at the LEADING edge, not
+                // the trailing cluster: that cluster is at its width budget and
+                // a model name is runtime-variable, which is exactly what
+                // re-triggers » eviction. Its label is width-capped for the
+                // same reason (`ChatModelPill.maxNameWidth`).
+                ToolbarItem(placement: .navigation) {
+                    floatingToolbar
                 }
                 .sharedBackgroundVisibility(.hidden)
             } else {
-                ToolbarItem(placement: .primaryAction) {
-                    headerControls
+                ToolbarItem(placement: .navigation) {
+                    floatingToolbar
                 }
             }
         }
-        // The bar background is the window background color at 0.8 opacity —
-        // not `.hidden` (transcript bubbles scrolled under the band and bled
-        // through the controls), not the default material (a visibly
-        // different translucent strip), and not fully opaque (too blunt a
-        // cutoff against the transcript). The slight translucency reads as
-        // glass: passing content dims to a hint instead of bleeding through.
-        // The per-item glass capsule is a separate layer, hidden above.
-        .toolbarBackground(Color(nsColor: .windowBackgroundColor).opacity(0.8), for: .windowToolbar)
+        // The window's own toolbar material, full width. This was hidden for a
+        // while — the floating cluster carries its own material, so the band
+        // read as a divider above a mostly empty bar. But hiding it left the
+        // transcript running to the window's top edge with nothing between the
+        // two: text clipped mid-line under the model picker (live 2026-07-30),
+        // and `scrollEdgeEffectStyle` had no bar to attach to, so it drew
+        // nothing. The system material IS the 100%-width surface here — the
+        // hand-drawn strip that predated it is what must not come back.
         .toolbarBackground(.visible, for: .windowToolbar)
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
         }
-        // The in-window orb is just another view of the app-level voice
-        // controller. Closing the sheet (Escape) leaves voice running so it
-        // persists in the tray; the orb's red ✕ (onClose) explicitly ends it.
-        .sheet(isPresented: $showVoiceMode) {
-            VoiceModeView(controller: appState.voice,
-                          onClose: { showVoiceMode = false; appState.voice.end() })
-                .environmentObject(appState)
-        }
-        .alert("Enable thinking in Agent mode?", isPresented: $showThinkingInAgentConfirm) {
+        .alert("Enable thinking with Tools on?", isPresented: $showThinkingInAgentConfirm) {
             Button("Cancel", role: .cancel) { }
             Button("Enable anyway") { enableThinking = true }
         } message: {
-            Text("Thinking is not recommended with Agent mode — most local models tool-call more reliably without it. Do you still want to enable it?")
+            Text("Thinking is not recommended with Tools on — most local models tool-call more reliably without it. Do you still want to enable it?")
         }
-        // Suppressed while Voice mode is open — two sheets can't co-present on
-        // macOS, so the approval would never appear and the agent loop would hang.
-        // Voice mode renders the approval as an overlay inside its own sheet instead.
-        .sheet(item: Binding(get: { showVoiceMode ? nil : pendingApproval },
-                             set: { pendingApproval = $0 })) { req in
+        // Typed-turn approvals only. Voice turns approve through the
+        // controller's own `pendingApproval`, rendered inline next to the orb
+        // (and in the tray) — never through this sheet.
+        .sheet(item: $pendingApproval) { req in
             ToolApprovalSheet(request: req,
                               onAllow: { resolveApproval(.allow) },
                               onDeny: { resolveApproval(.deny) },
@@ -1203,13 +1495,13 @@ struct ChatDetailView: View {
         // Pre-send nudge to enable Agent / MCP mode when the message looks like
         // it needs it. "Send Anyway" suppresses the suggestion for this chat.
         .confirmationDialog(
-            pendingIntentPrompt == .mcp ? "Enable MCP first?" : "Enable Agent Mode first?",
+            pendingIntentPrompt == .mcp ? "Enable MCP first?" : "Turn Tools on first?",
             isPresented: Binding(get: { pendingIntentPrompt != nil },
                                  set: { if !$0 { pendingIntentPrompt = nil } }),
             titleVisibility: .visible,
             presenting: pendingIntentPrompt
         ) { prompt in
-            Button(prompt == .mcp ? "Enable MCP & Send" : "Enable Agent Mode & Send") {
+            Button(prompt == .mcp ? "Enable MCP & Send" : "Turn Tools On & Send") {
                 enableForPrompt(prompt)
                 pendingIntentPrompt = nil
                 proceedSend()
@@ -1223,7 +1515,7 @@ struct ChatDetailView: View {
         } message: { prompt in
             Text(prompt == .mcp
                  ? "This looks like it needs one of your MCP servers, but MCP mode is off. Enable it so those tools are available?"
-                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Agent mode is off. Enable it so the model can use its tools?")
+                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Tools is off. Turn it on so the model can use them?")
         }
         // Persist the toolbar toggles back onto the visible session so each tab
         // remembers its own Think/Agent/MCP choice. Telegram sessions write the
@@ -1243,8 +1535,8 @@ struct ChatDetailView: View {
                   let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
             appState.chatSessions[idx].useMCP = newValue
         }
-        .onChange(of: chatEngine.isGenerating) { _, generating in
-            if !generating { inputFocused = true }
+        .onChange(of: composerState) { _, state in
+            if state == .idle { inputFocused = true }
         }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
@@ -1254,6 +1546,100 @@ struct ChatDetailView: View {
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
         }
+    }
+
+    /// The input field. No background or border of its own — the composer
+    /// container draws those around both rows. NSTextView-backed so a big paste
+    /// stays smooth and the mouse wheel scrolls once it grows past the cap.
+    private var composerField: some View {
+        GrowingTextEditor(text: $inputText,
+                          isFocused: $inputFocused,
+                          measuredHeight: $composerHeight,
+                          isIdle: composerState == .idle,
+                          onSend: { sendMessage() })
+            .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
+            .padding(.horizontal, 5)
+            .disabled(server.status != .running)
+            .overlay(alignment: .topLeading) {
+                if inputText.isEmpty {
+                    Text("Ask me anything…")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 9)
+                        .padding(.top, 8)
+                        .allowsHitTesting(false)
+                }
+            }
+    }
+
+    /// What this turn will run with on the left; what it will cost, and Send,
+    /// on the right. Its own property because the composer container otherwise
+    /// blows the type-checker's budget.
+    @ViewBuilder
+    private var composerControls: some View {
+        HStack(spacing: 6) {
+        attachmentMenu
+
+        // Mic — only on models that actually understand audio
+        // (Gemma 4 12B). Tap to record, tap again to attach.
+        if audioSupported {
+            MicButton(recorder: recorder) { toggleRecording() }
+                .disabled(server.status != .running || composerState == .generatingHere)
+        }
+
+        // Think / Tools / MCP. Icon-only, and here rather than in the window
+        // toolbar: they configure the MESSAGE being written, not the window,
+        // and their captions were most of the toolbar cluster's width budget.
+        thinkToggle
+        agentToggle
+        mcpToggle
+
+        Spacer(minLength: 8)
+
+        // Context gauge, immediately left of Send — the control the
+        // reading is about. Bounded width (a percentage plus a ring)
+        // so it can't push the row around as it changes.
+        if showsContextPill {
+            ContextPill(stats: contextStats,
+                        modelName: server.chatModelInfo?.name,
+                        isLive: composerState == .generatingHere)
+                .frame(height: ChatMetrics.composerControlSize)
+        }
+
+        // Voice mode, between the context gauge and Send. A toggle: on starts
+        // hands-free with this chat's toggles/agent, off ends it. Its own
+        // observing view (see `VoiceComposerToggle`) so the tint follows the
+        // app-level controller when voice starts from the tray.
+        voiceToggle
+
+        Button {
+            if composerState == .generatingHere {
+                chatEngine.stop(sessionId: sessionId)
+            } else {
+                sendMessage()
+            }
+        } label: {
+            Image(systemName: composerState == .generatingHere ? "stop.circle.fill" : "arrow.up.circle.fill")
+                .font(.system(size: ChatMetrics.composerIconSize))
+                .foregroundStyle(composerState == .generatingHere ? .red : .accentColor)
+                .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
+        }
+        .buttonStyle(.plain)
+        // Stop is always tappable for the owning chat. Otherwise: Send,
+        // disabled when the server is down or when this chat has nothing to
+        // send. Another chat's turn blocks nothing — the engine is multi-turn.
+        .disabled(server.status != .running
+                  || (composerState == .idle
+                      && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
+        }
+    }
+
+    /// Composer-row voice toggle — see `VoiceComposerToggle` for why it's an
+    /// observing child view rather than a Button reading `appState.voice` here.
+    private var voiceToggle: some View {
+        VoiceComposerToggle(controller: appState.voice, sessionId: sessionId,
+                            disabled: server.status != .running) { startVoiceMode() }
     }
 
     // MARK: - Document Folder (mini RAG)
@@ -1527,6 +1913,45 @@ struct ChatDetailView: View {
         return nil
     }
 
+    /// Pages a web search backed this reply with. Only computed for a finished
+    /// assistant reply — tool-call summaries and user turns have no provenance
+    /// to show, and the walk is bounded by the previous user message so this
+    /// stays cheap per row.
+    private func sourcesFor(_ message: ChatMessage) -> [WebSource] {
+        guard message.role == .assistant, !message.isAgentSummary, !message.isStreaming,
+              let messages = session?.messages else { return [] }
+        return WebSourceExtractor.sources(forMessageId: message.id, in: messages)
+    }
+
+    /// The context-overflow notice from the turn that just ended, if that's how
+    /// it ended. Scoped to the LAST message on purpose: an overflow the user has
+    /// since worked around (shorter prompt, tools off) must stop colouring the
+    /// pill red, or the gauge keeps reporting a failure that no longer applies.
+    private var lastOverflowNotice: ChatErrorNotice? {
+        guard let notice = session?.messages.last?.errorNotice,
+              notice.kind == .contextOverflow else { return nil }
+        return notice
+    }
+
+    /// Reading behind the composer's context pill.
+    private var contextStats: ContextWindowStats {
+        let usage = contextUsage
+        return ContextWindowStats.make(
+            promptTokens: usage?.promptTokens ?? 0,
+            completionTokens: usage?.completionTokens ?? 0,
+            liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens(for: sessionId) : 0,
+            contextLength: usage?.contextLength
+                ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
+                                                      modelContextLength: server.chatModelInfo?.contextLength),
+            overflow: lastOverflowNotice)
+    }
+
+    /// Hidden until there's something true to report — a pill reading 0.0%
+    /// before the first reply is noise, not information.
+    private var showsContextPill: Bool {
+        contextUsage != nil || composerState == .generatingHere || lastOverflowNotice != nil
+    }
+
     private var workingDirectoryBinding: Binding<String?> {
         Binding(
             get: { appState.chatSessions.first { $0.id == sessionId }?.workingDirectory },
@@ -1566,21 +1991,24 @@ struct ChatDetailView: View {
         pendingApproval = nil
     }
 
-    /// Present the in-window voice orb. The controller is app-level and may
-    /// already be running (started from the tray) — only begin a session if it
-    /// isn't active yet, ensuring a chat session exists first.
+    /// Start hands-free voice from the composer toggle. The controller is
+    /// app-level; the toggle already ended any voice running elsewhere (the
+    /// "move it here" click), so by the time this runs the mic is free. The
+    /// orb renders inline in the BOUND session's tab — nothing to "present".
     private func startVoiceMode() {
-        guard !showVoiceMode else { return }
+        guard !appState.voice.isActive else { return }
         // Sync the voice toggles to the chat session being opened — talking should
-        // start in the same Think/Agent/MCP mode as the chat you launched it from.
+        // start in the same Think/Tools/MCP mode as the chat you launched it from.
         if let s = session {
             appState.voice.enableThinking = s.enableThinking
             appState.voice.agentMode = s.mode == .agent
             appState.voice.mcpMode = s.useMCP
+            // …and to the same AGENT. Voice routes each turn into its agent's own
+            // thread, so without this a tray default of "Chef" would pull the
+            // conversation out of the tab you launched voice from.
+            appState.defaultAgentId = s.agentId
         }
-        showVoiceMode = true
-        guard !appState.voice.isActive else { return }
-        if appState.activeChatId == nil { _ = appState.newChatSession() }
+        appState.sessionForAgent(session?.agentId)
         Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
     }
 
@@ -1602,7 +2030,7 @@ struct ChatDetailView: View {
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !chatEngine.isGenerating, server.status == .running, !trimmed.isEmpty,
+        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -1622,14 +2050,18 @@ struct ChatDetailView: View {
     /// Decide whether to nudge before sending. MCP takes priority over Agent
     /// because a named server is the more specific signal; both are gated on the
     /// matching mode being off and the suggestion not already declined this chat.
+    ///
+    /// A mode the tab's agent decides is never nudged about: accepting would
+    /// change nothing and the message would send exactly as it was.
     private func detectIntentPrompt(for text: String) -> IntentPrompt? {
+        let toggles = toolbarToggles
         let servers = enabledMCPServerNames()
-        if !mcpMode, !servers.isEmpty,
+        if !mcpMode, toggles.mcpLockedBy == nil, !servers.isEmpty,
            !intentSuppress.isSuppressed(.mcp, for: sessionId),
            ComposerIntent.wantsMCP(text, serverNames: servers) {
             return .mcp
         }
-        if !isAgentMode,
+        if !isAgentMode, toggles.toolsLockedBy == nil,
            !intentSuppress.isSuppressed(.agent, for: sessionId),
            ComposerIntent.wantsAgent(text) {
             return .agent
@@ -1657,20 +2089,25 @@ struct ChatDetailView: View {
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
         guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
-              !chatEngine.isGenerating, server.status == .running else { return }
+              composerState != .generatingHere, server.status == .running else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        let config = ChatTurnEngine.TurnConfig(
-            agentMode: isAgentMode,
-            mcpMode: mcpMode,
-            enableThinking: enableThinking,
-            voiceStyle: false,
+        // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
+        // any) overrides what it declared. One builder, so no field is read from
+        // a global here — see ChatTurnEngine.TurnConfig.
+        let resolved = appState.resolvedAgentSettings(
+            agentId: session?.agentId,
+            toolsEnabled: isAgentMode,
+            mcpEnabled: mcpMode,
+            thinkingEnabled: enableThinking,
+            autoApprove: false,
             workingDirectory: session?.workingDirectory,
-            documentIndex: appState.documentIndexes[sessionId]
-        )
+            disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []))
+        let config = ChatTurnEngine.TurnConfig.from(
+            resolved, documentIndex: appState.documentIndexes[sessionId])
         chatEngine.runTurn(sessionId: sessionId, userText: text,
                            images: attachedImages, audio: attachedAudio,
                            config: config,
@@ -1703,76 +2140,18 @@ struct ChatDetailView: View {
 
 // MARK: - Context Monitor
 
-struct ContextMonitor: View {
-    /// Prompt + reply tokens of the last COMPLETED turn (context occupied so far).
-    let promptTokens: Int
-    let completionTokens: Int
-    /// Tokens the in-flight reply has produced so far (0 unless THIS chat is the
-    /// one generating). Counted client-side from the streaming loop, advanced at
-    /// the coalescer's ~20 Hz cadence — so the bar + "gen:" move live.
-    let liveTokens: Int
-    let isLive: Bool
-    let contextLength: Int
-
-    /// Total context occupied right now: last turn (prompt + its reply) plus the
-    /// in-flight reply's running count. Pure → ContextMonitorTests.
+/// What the chat considers "occupied context".
+///
+/// This was a full-width bar above the composer; it is now the composer's
+/// `ContextPill`, which shows the same reading in one control's width and puts
+/// the breakdown in a popover. Only the summing rule stayed here — the bar's
+/// clamped ratio and colour bands moved to `ContextWindowStats`, which needs an
+/// UNCLAMPED figure so it can display 100.3%.
+enum ContextMonitor {
+    /// Total context occupied right now: the last completed turn (prompt + its
+    /// reply) plus the in-flight reply's running count. Pure → ContextMonitorTests.
     static func usedTokens(promptTokens: Int, completionTokens: Int, liveTokens: Int) -> Int {
         promptTokens + completionTokens + liveTokens
-    }
-
-    /// Bar fill / percentage, clamped to [0, 1] (a context overflow can't exceed
-    /// 100%, and there's no context length before the first response). Pure.
-    static func usageRatio(usedTokens: Int, contextLength: Int) -> Double {
-        guard contextLength > 0 else { return 0 }
-        return min(1.0, Double(usedTokens) / Double(contextLength))
-    }
-
-    /// The "gen:" figure: the live running count while this chat streams, else
-    /// the last completed reply's length. Pure → ContextMonitorTests.
-    static func genTokens(isLive: Bool, liveTokens: Int, completionTokens: Int) -> Int {
-        isLive ? liveTokens : completionTokens
-    }
-
-    private var usedTokens: Int {
-        Self.usedTokens(promptTokens: promptTokens, completionTokens: completionTokens, liveTokens: liveTokens)
-    }
-    private var usageRatio: Double { Self.usageRatio(usedTokens: usedTokens, contextLength: contextLength) }
-    private var genTokens: Int { Self.genTokens(isLive: isLive, liveTokens: liveTokens, completionTokens: completionTokens) }
-
-    private var barColor: Color {
-        if usageRatio > 0.80 { return .red }
-        if usageRatio > 0.60 { return .orange }
-        return .green
-    }
-
-    var body: some View {
-        VStack(spacing: 2) {
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.secondary.opacity(0.15))
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(barColor.opacity(0.7))
-                        .frame(width: geo.size.width * usageRatio)
-                        .animation(.linear(duration: 0.1), value: usageRatio)
-                }
-            }
-            .frame(height: 4)
-
-            HStack {
-                Text("\(usedTokens)/\(contextLength) tokens (\(Int(usageRatio * 100))%)")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                // Live count of the current reply's tokens (or the last reply's
-                // length when idle). The bar color, not this, signals context pressure.
-                Text("gen: \(genTokens)\(isLive ? "…" : "")")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(isLive ? Color.accentColor : .secondary)
-            }
-        }
-        .padding(.horizontal, ChatMetrics.gutter)
-        .padding(.top, 6)
     }
 }
 
@@ -1911,29 +2290,67 @@ struct GeneratingIndicator: View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    /// Pages a web search backed this reply with. Empty for every reply that
+    /// didn't search, which is the normal case — the chip only exists when
+    /// there is provenance to show.
+    var sources: [WebSource] = []
+    /// Opens Settings at the context control, for the overflow card's button.
+    /// Defaults to a no-op so surfaces that only DISPLAY a transcript (the task
+    /// run viewer) don't have to route an action they have no window for.
+    var onIncreaseContext: () -> Void = {}
+    /// Removes this message from the conversation. nil on read-only surfaces —
+    /// a task run's transcript is a record, so it has no delete affordance
+    /// rather than one that silently does nothing.
+    var onDelete: (() -> Void)?
+    /// Explicit so the accordion HEADER can drive it, not just the chevron.
+    @State private var thinkingExpanded = false
 
     var body: some View {
+        // A failure notice is not model output: it renders as its own card
+        // across the column, never inside an assistant bubble.
+        if let notice = message.errorNotice {
+            ChatErrorCard(notice: notice, onIncreaseContext: onIncreaseContext)
+        } else {
+            messageBody
+        }
+    }
+
+    /// Reasoning accordion. The WHOLE header toggles, not just the chevron:
+    /// macOS only hit-tests the disclosure triangle on a DisclosureGroup's
+    /// label, so the "Thinking" text was a dead click target — same fix as the
+    /// Agents editor's Advanced row (the label holds no buttons of its own, so
+    /// a tap gesture here can't swallow child clicks).
+    @ViewBuilder
+    private var thinkingBlock: some View {
+        if let reasoning = message.reasoningContent, !reasoning.isEmpty {
+            DisclosureGroup(isExpanded: $thinkingExpanded) {
+                Text(reasoning)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label("Thinking", systemImage: "brain")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
+                    }
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.5))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private var messageBody: some View {
         HStack(alignment: .top, spacing: 10) {
             if message.role == .user { Spacer(minLength: 60) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
                 // Reasoning (collapsible)
-                if let reasoning = message.reasoningContent, !reasoning.isEmpty {
-                    DisclosureGroup {
-                        Text(reasoning)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } label: {
-                        Label("Thinking", systemImage: "brain")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(8)
-                    .background(.quaternary.opacity(0.5))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
+                thinkingBlock
 
                 // Attached images. Double-click opens the full image in Preview.
                 if let images = message.images, !images.isEmpty {
@@ -1952,6 +2369,15 @@ struct MessageBubble: View {
                     }
                 }
 
+                // Generated tracks / clips, attached by path (see ChatMediaRef).
+                if let media = message.media, !media.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(media) { ref in
+                            ChatMediaAttachmentView(ref: ref)
+                        }
+                    }
+                }
+
                 // Attached audio clips
                 if let clips = message.audio, !clips.isEmpty {
                     ForEach(clips) { clip in
@@ -1964,7 +2390,13 @@ struct MessageBubble: View {
                     }
                 }
 
-                // Content
+                // Content.
+                //
+                // Only the USER gets a bubble. An assistant reply is the page's
+                // main content — long, formatted, full of code blocks and
+                // tables — and boxing it wastes the column's width and fights
+                // every block that wants the full measure. A tool-call summary
+                // keeps its card so it still reads as machinery, not prose.
                 if !message.content.isEmpty || message.isStreaming {
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
@@ -1983,37 +2415,107 @@ struct MessageBubble: View {
                             GeneratingIndicator()
                         }
                     }
-                    .padding(.horizontal, ChatMetrics.bubblePaddingH)
-                    .padding(.vertical, ChatMetrics.bubblePaddingV)
-                    .background(message.role == .user ? Color.accentColor : Color(.controlBackgroundColor))
+                    .padding(.horizontal, isBare ? 0 : ChatMetrics.bubblePaddingH)
+                    .padding(.vertical, isBare ? 0 : ChatMetrics.bubblePaddingV)
+                    .background(bubbleBackground)
                     .foregroundStyle(message.role == .user ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
+                    .clipShape(RoundedRectangle(cornerRadius: isBare ? 0 : ChatMetrics.bubbleCornerRadius))
+                    .frame(maxWidth: .infinity, alignment: isBare ? .leading : .trailing)
                 }
 
-                // Token usage stats — indented to the bubble's text column so
-                // the caption reads as part of the reply, not the bubble edge.
-                if message.role == .assistant, !message.isStreaming,
-                   let prompt = message.promptTokens, let completion = message.completionTokens {
-                    HStack(spacing: 8) {
-                        Text("\(prompt)+\(completion) tokens")
-                        if let tps = message.tokensPerSecond, tps > 0 {
-                            Text("~\(Int(tps)) tok/s")
-                        }
-                    }
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-                    .padding(.leading, ChatMetrics.statsIndent)
+                // Where the answer came from, above the footer — the provenance
+                // belongs with the reply, not with its timings.
+                if message.role == .assistant, !message.isStreaming, !sources.isEmpty {
+                    WebSourcesChip(sources: sources)
+                        .padding(.leading, isBare ? 0 : ChatMetrics.statsIndent)
                 }
+
+                if showsFooter { footer }
             }
 
             if message.role == .assistant { Spacer(minLength: 60) }
         }
         .contextMenu {
-            Button("Copy Message") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(message.content, forType: .string)
+            Button("Copy Message") { copyMessage() }
+            if onDelete != nil {
+                Button("Delete Message", role: .destructive) { onDelete?() }
             }
         }
+    }
+
+    // MARK: - Bubble vs bare
+
+    /// Assistant prose renders bare; user turns and tool-call summaries keep a
+    /// bubble.
+    private var isBare: Bool { message.role == .assistant && !message.isAgentSummary }
+
+    private var bubbleBackground: Color {
+        if isBare { return .clear }
+        return message.role == .user ? Color.accentColor : Color(.controlBackgroundColor)
+    }
+
+    // MARK: - Footer (timestamp · actions · stats)
+
+    private var showsFooter: Bool {
+        message.role == .assistant && !message.isStreaming
+            && !message.isAgentSummary && !message.content.isEmpty
+    }
+
+    /// Timestamp and token stats on the left, actions pinned to the right.
+    ///
+    /// The actions are ALWAYS visible. Fading them in on hover meant they moved
+    /// under the pointer as the row re-rendered mid-stream and were awkward to
+    /// hit; two small tertiary glyphs cost nothing to leave on. They sit at the
+    /// trailing edge — past the stats, against the reply's right edge — so the
+    /// eye finds them in the same place on every message instead of at a spot
+    /// that shifts with the length of the stats text.
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Text(message.timestamp.formatted(date: .abbreviated, time: .shortened))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            if let tps = message.tokensPerSecond, tps > 0 {
+                Label("\(Int(tps)) tokens/sec", systemImage: "gauge.with.needle")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            if let completion = message.completionTokens {
+                Text("(\(completion) tokens)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 2) {
+                footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                if let onDelete {
+                    footerButton("trash", help: "Delete this message from the conversation",
+                                 action: onDelete)
+                }
+            }
+        }
+        .padding(.leading, isBare ? 0 : ChatMetrics.statsIndent)
+        .padding(.top, 2)
+    }
+
+    private func footerButton(_ icon: String, help: String,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 20, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func copyMessage() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message.content, forType: .string)
     }
 }
 
@@ -2042,14 +2544,48 @@ struct ChatModeToggles: Equatable {
     var thinking: Bool
     var agent: Bool
     var mcp: Bool
+    /// Who decided each control, when it isn't the chat itself — the agent's
+    /// name, for the lock ring and the hover card. nil = the chat's own toggle.
+    var thinkingLockedBy: String? = nil
+    var toolsLockedBy: String? = nil
+    var mcpLockedBy: String? = nil
+
+    var isLocked: Bool { thinkingLockedBy != nil || toolsLockedBy != nil || mcpLockedBy != nil }
 
     static func resolve(isExternalBridge: Bool,
                         telegramThinking: Bool, telegramAgent: Bool, telegramMCP: Bool,
-                        inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool) -> ChatModeToggles {
-        isExternalBridge
+                        inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool,
+                        agentLock: AgentModeLock? = nil) -> ChatModeToggles {
+        let base = isExternalBridge
             ? ChatModeToggles(thinking: telegramThinking, agent: telegramAgent, mcp: telegramMCP)
             : ChatModeToggles(thinking: inAppThinking, agent: inAppAgent, mcp: inAppMCP)
+        guard let lock = agentLock else { return base }
+        return ChatModeToggles(
+            // Thinking is the one an agent may leave unset, and `AgentResolution`
+            // falls back to the surface's own value there — so locking it anyway
+            // would take away a control nobody is deciding for you.
+            thinking: lock.thinking ?? base.thinking,
+            agent: lock.tools,
+            mcp: lock.mcp,
+            thinkingLockedBy: lock.thinking == nil ? nil : lock.name,
+            toolsLockedBy: lock.name,
+            mcpLockedBy: lock.name)
     }
+}
+
+/// What the chat's agent decided about Think / Tools / MCP.
+///
+/// `AgentResolution` takes Tools and MCP straight from the agent's capabilities
+/// and ignores the chat's own toggles — so without this the discs showed one
+/// thing and the turn ran another (every agent defaults `web: true`, which forces
+/// the tool loop on while the wrench renders OFF). Built from the SAME resolution
+/// the turn uses (`ChatDetailView.agentModeLock`), so the two can't drift.
+struct AgentModeLock: Equatable {
+    var name: String
+    /// nil = the agent left thinking unset; the chat's own toggle stands.
+    var thinking: Bool?
+    var tools: Bool
+    var mcp: Bool
 }
 
 /// (both `isAgentSummary`) into one row: a `name(args)` header with the result(s)
@@ -2248,13 +2784,27 @@ struct MarkdownText: View {
     }
 
     var body: some View {
-        SelectableMarkdownNSText(attributed: Self.attributedString(for: source))
-            .contextMenu {
-                Button("Copy All") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(source, forType: .string)
+        // Fenced code renders as its own view (gutter, colors, copy button);
+        // everything between fences stays in ONE text view per run so
+        // drag-selection still crosses paragraphs, lists and tables. See
+        // `MarkdownSegmenter` for why the split is at fences, not at blocks.
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .prose(let text):
+                    SelectableMarkdownNSText(attributed: Self.attributedString(for: text))
+                case .code(let language, let code):
+                    CodeBlockView(language: language, code: code)
                 }
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contextMenu {
+            Button("Copy All") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(source, forType: .string)
+            }
+        }
     }
 
     enum TableAlignment { case left, right, center }
@@ -3039,31 +3589,3 @@ fileprivate final class ComposerTextView: NSTextView {
     }
 }
 
-/// Pure state for the chat header's sandbox shield (rendered by
-/// `sandboxShield` in `headerControls`; pinned by SandboxTransportTests).
-/// Green shield = the Agent Sandbox is effectively on (including builds with
-/// no host shell, where it is always on); gray = tools run on the host and
-/// the tooltip tells the user where to enable it.
-enum SandboxShield {
-    struct State {
-        let isOn: Bool
-        /// Where a click lands: the live sandbox terminal when on, Settings
-        /// (the place to enable it) when off.
-        let windowId: String
-        let help: String
-    }
-
-    static func state(requestedEnabled: Bool,
-                      hostShellAllowed: Bool = BuildFeatures.current.hostShell) -> State {
-        if AgentSandbox.resolveEnabled(requested: requestedEnabled, hostShellAllowed: hostShellAllowed) {
-            return State(
-                isOn: true,
-                windowId: "sandboxTerminal",
-                help: "Agent Sandbox ON — shell commands and MCP servers run inside an isolated Linux VM, not on your Mac. Click to open the sandbox terminal.")
-        }
-        return State(
-            isOn: false,
-            windowId: "settings",
-            help: "Agent Sandbox OFF — agent tools and MCP servers run directly on this Mac. Turn it on in Settings → Agent Sandbox. Click to open Settings.")
-    }
-}

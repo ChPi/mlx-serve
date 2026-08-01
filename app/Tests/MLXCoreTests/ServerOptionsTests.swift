@@ -496,14 +496,18 @@ final class ServerOptionsTests: XCTestCase {
 
     func testEngineFromArchitecture() {
         // The Settings UI hides MLX-only sections when engine != .mlx and
-        // surfaces the GGUF section when engine == .llama. The discriminator
-        // is the `architecture` string the server reports for the active
-        // model, derived from `model_type` in config.json (or the GGUF stub).
+        // surfaces the GGUF section when engine == .llama. The PRIMARY
+        // discriminator is `meta.engine` as the server reports it; the
+        // `architecture` inference below is the legacy fallback for servers
+        // that pre-date the field.
         var info = ModelInfo(name: "x", quantBits: 4, layers: 0,
                              hiddenSize: 0, vocabSize: 0,
                              contextLength: 0, modelMaxTokens: 0,
                              architecture: "gguf")
         XCTAssertEqual(info.engine, .llama)
+        // Legacy fallback: pre-`meta.engine` servers serve deepseek_v4 ONLY
+        // via the embedded ds4 engine (the native arch ships with the same
+        // release that added the field), so the old mapping stays correct.
         info.architecture = "deepseek_v4"
         XCTAssertEqual(info.engine, .dsv4)
         info.architecture = "gemma4"
@@ -512,6 +516,33 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(info.engine, .mlx)
         info.architecture = ""  // older server build that omits the field
         XCTAssertEqual(info.engine, .mlx, "empty arch must default to .mlx (the most common path)")
+    }
+
+    func testEngineFromServerReport() {
+        // `meta.engine` outranks the architecture inference — the case that
+        // forced it: NATIVE deepseek_v4 (safetensors mirror, MLX engine) and
+        // the DeepSeek GGUF (embedded ds4 engine) report the SAME
+        // architecture string, so only the server's own engine field can
+        // label the Settings UI correctly.
+        var info = ModelInfo(name: "ddalcu/DeepSeek-V4-Flash-MLX-Serve",
+                             quantBits: 4, layers: 43,
+                             hiddenSize: 4096, vocabSize: 129280,
+                             contextLength: 0, modelMaxTokens: 0,
+                             architecture: "deepseek_v4")
+        info.engineName = "mlx"
+        XCTAssertEqual(info.engine, .mlx, "native dsv4 must get the MLX Settings profile")
+        info.engineName = "ds4"
+        XCTAssertEqual(info.engine, .dsv4)
+        info.engineName = "llama"
+        XCTAssertEqual(info.engine, .llama)
+        // Unloaded GGUF stub: engine undetermined until load — treat as the
+        // generic GGUF (llama) profile.
+        info.engineName = "gguf"
+        XCTAssertEqual(info.engine, .llama)
+        // Unknown future value: fall back to the architecture inference
+        // rather than guessing.
+        info.engineName = "quantum"
+        XCTAssertEqual(info.engine, .dsv4)
     }
 
     // MARK: helpers
@@ -784,6 +815,56 @@ extension ServerOptionsTests {
         let back = try JSONDecoder().decode(ServerOptions.self, from: data)
         XCTAssertFalse(back.toolAutocorrect)
     }
+
+    // ── Server log file (--log-file) ──
+    func testLogToFileDefaultsOnAndOmitsFlag() {
+        // Mirrors the server: the file sink is ON for all serving paths
+        // (~/.mlx-serve/logs/mlx-serve-<port>.log), so a default launch stays
+        // flag-free (defaults-mirror gotcha).
+        let d = ServerOptions()
+        XCTAssertTrue(d.logToFile, "file logging must default ON, matching the server")
+        XCTAssertFalse(d.toCLIArgs().contains("--log-file"),
+                       "default (on) must not emit --log-file")
+    }
+
+    func testLogToFileOffEmitsLogFileOff() {
+        var opts = ServerOptions()
+        opts.logToFile = false
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--log-file", value: "off"),
+                      "disabling must emit --log-file off")
+    }
+
+    func testLogToFileToggleTriggersRestart() {
+        var a = ServerOptions()
+        var b = ServerOptions()
+        b.logToFile = false
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                       "toggling file logging must require a server restart")
+        a.logToFile = false
+        XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+
+    func testLogToFileHasSettingsMetadata() {
+        guard let field = ServerOptions.serverFlagFields["logToFile"] else {
+            return XCTFail("logToFile metadata missing — the Settings toggle would silently disappear")
+        }
+        XCTAssertFalse(field.title.isEmpty)
+        XCTAssertFalse(field.explainer.isEmpty)
+        XCTAssertTrue(field.needsRestart, "--log-file is a launch flag — must flag a restart")
+    }
+
+    func testLogToFileRoundTripsLegacyDecodesOn() throws {
+        // A blob saved before this field must decode with file logging ON.
+        let legacy = "{\"host\":\"127.0.0.1\",\"port\":11234}"
+        let opts = try JSONDecoder().decode(ServerOptions.self, from: Data(legacy.utf8))
+        XCTAssertTrue(opts.logToFile, "legacy blob must decode file logging ON")
+        // Round-trip preserves an explicit off.
+        var off = ServerOptions()
+        off.logToFile = false
+        let data = try JSONEncoder().encode(off)
+        let back = try JSONDecoder().decode(ServerOptions.self, from: data)
+        XCTAssertFalse(back.logToFile)
+    }
 }
 
 extension ServerOptionsTests {
@@ -964,5 +1045,25 @@ extension ServerOptionsTests {
         o.lanName = "Studio"
         let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(o))
         XCTAssertEqual(back, o)
+    }
+
+    /// Decode attention requant (`--decode-attn-quant`): server default is ON
+    /// (transformer.zig DECODE_ATTN_QUANT_DEFAULT), so a default launch emits
+    /// NOTHING and only the user's OFF emits the flag. A stored blob that
+    /// predates the field decodes to the default (tolerant decoder).
+    func testDecodeAttnQuantMirrorsServerDefaultAndEmitsOnlyOff() throws {
+        var opts = ServerOptions()
+        XCTAssertTrue(opts.decodeAttnQuant)  // transformer.zig DECODE_ATTN_QUANT_DEFAULT
+        XCTAssertFalse(opts.toCLIArgs().contains("--decode-attn-quant"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--no-decode-attn-quant"))
+
+        opts.decodeAttnQuant = false
+        XCTAssertTrue(opts.toCLIArgs().contains("--no-decode-attn-quant"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--decode-attn-quant"))
+
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertTrue(legacy.decodeAttnQuant)
+        let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(opts))
+        XCTAssertEqual(back.decodeAttnQuant, false)
     }
 }
