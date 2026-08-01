@@ -56,7 +56,9 @@ Rules:
 
 CalVer `YY.M.N` (e.g., `v26.4.25` = 2026, April, 25th release). `N` auto-increments from the last GitHub release for that `YY.M` prefix; `build.sh` computes via `gh release list`.
 
-**Version sources**: `app/Info.plist` (`CFBundleVersion`/`CFBundleShortVersionString`), Zig `-Dversion` build option (`build_options.version`), git tag (`gh release create v{version}`).
+**Version sources**: `app/Info.plist` (`CFBundleVersion`/`CFBundleShortVersionString`), Zig `-Dversion` build option (`build_options.version`), git tag (`gh release create v{version}`). CI derives ONE version and stamps all three — the bundle plist is stamped from it, never shipped as committed (v26.8.1's DMG reported 26.7.12 and nagged forever; `docs/gotchas/app.md`).
+
+**`YY.M` is TZ-pinned** (`America/New_York`, in release.yml + app/build.sh): runners are UTC, so a `workflow_dispatch` cut after ~20:00 local otherwise rolls into next month. **Prefer a tag push over a dispatch** when the version is already decided — the tag-push path takes `version=${GITHUB_REF_NAME#v}` and never consults the clock.
 
 **Release**:
 1. Update `CHANGELOG.md` with NEXT version (check `gh release list --limit 1` first — never reuse an existing tag)

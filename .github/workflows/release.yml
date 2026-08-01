@@ -109,10 +109,18 @@ jobs:
         id: version
         env:
           GH_TOKEN: ${{ github.token }}
+          # CalVer's YY.M comes from ONE pinned zone, matching app/build.sh —
+          # cutting v26.8.1 is what forced this. The dispatch ran 01:26 UTC on
+          # Aug 1 while it was still Jul 31 locally, so CI minted 26.8.1 against
+          # a CHANGELOG, Info.plist and perf artifacts that all said 26.7.12.
+          # Runners are UTC; without the pin the two clocks disagree for a few
+          # hours around every month boundary. Guarded by
+          # tests/test_release_workflow_gates.sh.
+          TZ: America/New_York
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # CalVer YY.M.N — N auto-increments from the last vYY.M.* release tag.
-            PREFIX="$(date -u +%y.%-m)"
+            PREFIX="$(date +%y.%-m)"
             LAST_N=$(gh release list --limit 100 --json tagName \
               --jq "[.[] | .tagName | select(test(\"^v${PREFIX}\\\\.[0-9]+$\")) | sub(\"^v${PREFIX}\\\\.\"; \"\") | tonumber] | max // 0")
             N=$((LAST_N + 1))
@@ -122,7 +130,7 @@ jobs:
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
             # PR package: CalVer prefix + PR number + commit — never tagged,
             # never released; only names the artifact and --version output.
-            PREFIX="$(date -u +%y.%-m)"
+            PREFIX="$(date +%y.%-m)"
             VERSION="${PREFIX}.0-pr${{ github.event.pull_request.number }}.$(git rev-parse --short HEAD)"
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=" >> "$GITHUB_OUTPUT"
@@ -278,8 +286,19 @@ jobs:
             exit 1
           fi
 
-          # Info.plist
+          # Info.plist — stamped with the version this run is releasing.
+          # Without the stamp the bundle ships whatever the committed plist
+          # happens to say: v26.8.1 shipped an app reporting 26.7.12, so
+          # UpdateChecker saw a permanently newer release and installing it
+          # never helped (the new DMG said 26.7.12 too). Stamp the COPY — the
+          # Homebrew step later rebases, which refuses a dirty tree.
           cp app/Info.plist "$CONTENTS/"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleVersion ${{ steps.version.outputs.version }}" \
+            "$CONTENTS/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" \
+            "$CONTENTS/Info.plist"
 
           # App icon
           if [ -f app/appiconb.png ]; then

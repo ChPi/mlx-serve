@@ -6,6 +6,7 @@ Compressed rules. Full war stories: `../docs/gotchas/app.md`. Full service contr
 
 - ALWAYS ship via `bash app/build.sh` (signs, entitlements, links Zig artifacts, keeps MLXCore + mlx-serve in lockstep); dev: `SKIP_NOTARIZE=1`. Swift-only fast iteration escape hatch: `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5` (flag vestigial since swift-sdk 0.12.1 — keep sdk >= 0.12.1; 0.10.x cannot compile in the MAS Xcode project).
 - The .app bundles TWO binaries (MLXCore UI + mlx-serve server) — always update together; a stale sibling is the classic "still doesn't work".
+- **The bundle's version is STAMPED from the version being released, never copied from the committed plist**: release.yml PlistBuddy's `$CONTENTS/Info.plist` after the `cp` and before `codesign` (stamping the repo file instead breaks the Homebrew step's `git rebase` on a dirty tree). It shipped unstamped once — v26.8.1's DMG contained an app reporting 26.7.12, so `UpdateChecker` offered an update that installing could never satisfy, forever. CalVer's `YY.M` is TZ-pinned in release.yml and app/build.sh together (runners are UTC; an evening release otherwise lands in next month). Guard: `tests/test_release_workflow_gates.sh`; story: `../docs/gotchas/app.md`.
 - Agent Sandbox needs `com.apple.security.virtualization` in BOTH signing branches of build.sh (ad-hoc included) or VZ refuses to boot. `swift build` binaries / xctest can't boot VMs; live guard = `SANDBOX_SMOKE=1 <MLXCore binary>`.
 
 ## Layout

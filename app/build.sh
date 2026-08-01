@@ -35,8 +35,13 @@ else
     ZIG_MODE_FLAGS=()
 fi
 
-# Set calver version (YY.M.N) — auto-increment N from last GitHub release
-YM="$(date +%y.%-m)"
+# Set calver version (YY.M.N) — auto-increment N from last GitHub release.
+# The month comes from an explicitly pinned zone, matching the one in
+# .github/workflows/release.yml: CI runners are UTC, so an evening release
+# here lands in next month there (v26.8.1 was cut at 21:26 local on Jul 31
+# against a CHANGELOG that said 26.7.12). Guarded by
+# tests/test_release_workflow_gates.sh.
+YM="$(TZ=America/New_York date +%y.%-m)"
 LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null || echo "0")
 NEXT_N=$((LAST_N + 1))
 CALVER="${YM}.${NEXT_N}"

@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 python3 - <<'EOF'
-import sys, yaml
+import re, sys, yaml
 
 FAIL = 0
 def check(cond, msg):
@@ -74,6 +74,66 @@ upload = [s for s in job["steps"]
           if s.get("uses", "").startswith("actions/upload-artifact")]
 check(any("pull_request" in str(s.get("if", "")) for s in upload),
       "artifact upload covers pull_request")
+
+# ── Version consistency: the app bundle can never advertise a version other
+# than the release it came from. ───────────────────────────────────────────
+# The .app's version came from the COMMITTED app/Info.plist while the tag and
+# the CLI binary came from the CI-computed CalVer, and nothing kept the two
+# equal. v26.8.1 shipped a bundle reporting 26.7.12, so UpdateChecker saw a
+# permanently "newer" release and installing it never helped — the new DMG
+# reported 26.7.12 too. Self-perpetuating, and invisible to every other guard.
+pkg_run = str(steps.get("Package app bundle", {}).get("run", ""))
+check("cp app/Info.plist" in pkg_run, "app bundle ships app/Info.plist")
+
+def logical_lines(script):
+    """Shell lines with backslash-continuations folded — a guard must pin what
+    a command DOES, not how it happens to be wrapped."""
+    out, buf = [], ""
+    for raw in script.splitlines():
+        buf += raw[:-1] + " " if raw.rstrip().endswith("\\") else raw
+        if not raw.rstrip().endswith("\\"):
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+lines = logical_lines(pkg_run)
+stamp = [l for l in lines if "PlistBuddy" in l]
+check(any("CFBundleShortVersionString" in l for l in stamp)
+      and any("CFBundleVersion" in l for l in stamp),
+      "app bundle Info.plist is version-stamped")
+check(stamp and all("steps.version.outputs.version" in l for l in stamp),
+      "Info.plist stamp uses the CI-computed version")
+
+# Stamp the bundle COPY, never the repo file: the Homebrew step later runs
+# `git rebase origin/main`, which refuses to run against a dirty tree.
+check(stamp and all('"$CONTENTS/Info.plist"' in l for l in stamp),
+      "stamp targets the bundle copy, not the repo's app/Info.plist")
+
+# ...and it has to land before the bundle is sealed, or the signature breaks.
+sign_at = next((i for i, l in enumerate(lines)
+                if "codesign" in l and '"$APP"' in l), None)
+check(sign_at is not None, "app bundle is codesigned")
+check(stamp and sign_at is not None
+      and max(i for i, l in enumerate(lines) if "PlistBuddy" in l) < sign_at,
+      "Info.plist stamped before the app bundle is signed")
+
+# ── CalVer timezone: the release ran at 01:26 UTC on Aug 1 while it was still
+# Jul 31 locally, so CI minted 26.8.1 against a CHANGELOG, Info.plist and perf
+# artifacts that all said 26.7.12. CI and app/build.sh must resolve YY.M from
+# the SAME clock or they disagree for a few hours around every month boundary.
+wf_text = open(".github/workflows/release.yml").read()
+build_sh = open("app/build.sh").read()
+
+def tz_pin(text):
+    m = re.search(r"TZ[=:]\s*[\"']?([A-Za-z_]+/[A-Za-z_]+)", text)
+    return m.group(1) if m else None
+
+check("date -u +%y" not in wf_text, "CalVer month is not computed in UTC")
+check(tz_pin(wf_text) is not None, "release.yml pins the CalVer timezone")
+check(tz_pin(wf_text) == tz_pin(build_sh),
+      "release.yml and app/build.sh compute CalVer in the SAME timezone")
 
 sys.exit(FAIL)
 EOF
