@@ -508,10 +508,35 @@ If we missed you, please open a PR — happy to add anyone who landed code, fixt
  </picture>
 </a>
 
+## Mac Studio fund
+
+mlx-serve is built on a 16 GB M4 Mac mini and a 128 GB M4 Max, and lately the machines are the bottleneck rather than the code:
+
+- **Calibrated quants.** Building an imatrix-calibrated mirror of a 284B model means holding the source weights and the output at the same time. They don't fit, so the converter downloads, converts and deletes one shard group at a time, and a single run takes most of a day. On a 512 GB box it's one pass.
+- **The big architectures.** Inkling, Laguna, Hunyuan 3 and DeepSeek V4 Flash all load on 128 GB, but only leave room for a ~3K context beside the weights, so agent workloads on them can't really be tested here.
+- **Benchmarks.** The release matrix is hours of wall clock, and thermal drift means it has to run alone with cooldowns between arms. A second machine means benchmarking stops blocking development.
+
+So there's a fund for a Mac Studio Ultra. If mlx-serve replaced an API bill for you and you feel like chipping in, the button is [here](https://github.com/sponsors/ddalcu) (or [Buy Me a Coffee](https://buymeacoffee.com/ddalcu)). Nothing gets paywalled either way: MIT now, MIT after.
+
+**Progress:** ▱▱▱▱▱▱▱▱▱▱ 0%
+
+### Thanks to
+
+Nobody yet. Everyone who chips in gets a line here, with a link if they want one, or stays anonymous. Thank you in advance.
+
+## Follow along
+
+Builds, benchmarks and teardowns of what's under the hood:
+
+- **YouTube** — [@DavidDalcu](https://www.youtube.com/@DavidDalcu)
+- **X** — [@ddalcu](https://x.com/ddalcu)
+
+Subscribing, following, and starring the repo cost nothing and genuinely help the project reach people. It's the cheapest way to support it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
 ---
 
-★ **Found this useful? [Star the repo](https://github.com/ddalcu/mlx-serve/stargazers) — it really does help others discover it.**
+★ **Found this useful? [Star the repo](https://github.com/ddalcu/mlx-serve/stargazers), [subscribe on YouTube](https://www.youtube.com/@DavidDalcu), [follow on X](https://x.com/ddalcu). It really does help others discover it.**

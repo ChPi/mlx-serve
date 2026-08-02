@@ -6073,6 +6073,13 @@ pub fn isEosId(id: u32, eos: []const u32) bool {
 /// few dozen tokens instead of running all the way to `max_tokens`.
 pub const degenerate_loop_max_period: usize = 8;
 pub const degenerate_loop_reps: usize = 16;
+// Tier 2 (2026-08-02 shooter wrap-up class): a two-sentence cycle of ~58
+// tokens repeated 26 times evaded the 8-token tier. Long periods demand
+// fewer reps — 10 verbatim repetitions of a 9..64-token cycle is
+// degeneration with overwhelming probability (identical long lines in real
+// code repeat a handful of times, not ten).
+pub const degenerate_loop_long_max_period: usize = 64;
+pub const degenerate_loop_long_reps: usize = 10;
 
 /// Stall clock for the request timeout: the deadline measures time since the
 /// last PRODUCED token, not since the request started. A wall-clock request
@@ -6110,8 +6117,14 @@ pub const StallClock = struct {
 /// Pure and cheap: only the trailing `max_period * reps` ids are inspected, so
 /// cost is independent of total generated length.
 pub fn isDegenerateTailLoop(tokens: []const u32, max_period: usize, reps: usize) bool {
+    return isDegenerateTailLoopRange(tokens, 1, max_period, reps);
+}
+
+/// Range variant so a long-period tier can scan 9..64 without also lowering
+/// the rep threshold for short cycles (a few "ha ha ha" reps stay legal).
+pub fn isDegenerateTailLoopRange(tokens: []const u32, min_period: usize, max_period: usize, reps: usize) bool {
     if (max_period == 0 or reps < 2) return false;
-    var p: usize = 1;
+    var p: usize = @max(min_period, 1);
     while (p <= max_period) : (p += 1) {
         const span = p * reps;
         if (tokens.len < span) continue;

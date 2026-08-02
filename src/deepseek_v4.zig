@@ -152,11 +152,6 @@ fn getReq(w: *const model.Weights, buf: *NameBuf, comptime fmt: []const u8, args
     };
 }
 
-fn getOpt(w: *const model.Weights, buf: *NameBuf, comptime fmt: []const u8, args: anytype) ?mlx.mlx_array {
-    const name = std.fmt.bufPrint(buf, fmt, args) catch return null;
-    return w.get(name);
-}
-
 /// Load a quantized triple `<base>.{weight,scales,biases}` and solve its
 /// quant params from geometry (mixed-mix checkpoints resolve per weight).
 fn getQ(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf, in_dim: u32, comptime base: []const u8, args: anytype) !Q {
@@ -224,16 +219,12 @@ fn loadDsv4Layer(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf
 
 /// DSpark stage count: ratio-table entries past the trunk (the release
 /// carries no n_mtp_layers key and a stale num_nextn_predict_layers=1 against
-/// 3 shipped stages), gated on dspark_block_size AND the stage weights
-/// actually being on disk (a mirror may drop them).
-fn dsparkStageCount(cfg: *const ModelConfig, w: *const model.Weights) u32 {
+/// 3 shipped stages), gated on dspark_block_size. A config that declares
+/// DSpark whose mtp.* weights are missing is a hard MissingWeight load error
+/// — only our converter's layout is supported, and it always ships them.
+fn dsparkStageCount(cfg: *const ModelConfig) u32 {
     if (cfg.dsv4_dspark_block_size == 0) return 0;
     if (cfg.dsv4_n_compress_ratios <= cfg.num_hidden_layers) return 0;
-    var buf: NameBuf = undefined;
-    if (getOpt(w, &buf, "mtp.0.attn_norm.weight", .{}) == null) {
-        log.warn("dsv4: config declares DSpark but mtp.0.* weights are absent — draft disabled\n", .{});
-        return 0;
-    }
     return cfg.dsv4_n_compress_ratios - cfg.num_hidden_layers;
 }
 
@@ -241,7 +232,7 @@ pub fn loadDsv4Weights(allocator: std.mem.Allocator, cfg: *const ModelConfig, w:
     var buf: NameBuf = undefined;
     const n_layers = cfg.num_hidden_layers;
     const hidden = cfg.hidden_size;
-    const n_mtp = dsparkStageCount(cfg, w);
+    const n_mtp = dsparkStageCount(cfg);
 
     const layers = try allocator.alloc(Dsv4Layer, n_layers + n_mtp);
     errdefer allocator.free(layers);
@@ -2696,11 +2687,13 @@ test "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France i
     var ids = std.array_list.Managed(u32).init(allocator);
     defer ids.deinit();
     try ids.appendSlice(&.{ 671, 6102, 294, 8760, 344 }); // "The capital of France is"
-    // Ground truth RE-DERIVED on the 0731 weights (tests/dsv4_mlx_ref.py,
-    // 2026-07-31): 11111, 66910 = ' Paris', '.",'. The preview's second
-    // token was 16 ('.') — a weights-pinned expectation, so a checkpoint
-    // bump re-derives it from the oracle before anyone calls a diff a bug.
-    const want = [_]u32{ 11111, 66910 };
+    // Ground truth RE-DERIVED per MIRROR (tests/dsv4_mlx_ref.py) — the
+    // expectation is weights-pinned, so a checkpoint OR quant-recipe bump
+    // re-derives it from the oracle before anyone calls a diff a bug.
+    // imx-2-3-8bit (imatrix gs128, 2026-08-01): 11111, 16 = ' Paris', '.'.
+    // The superseded mixed-2-3-8bit (minmax gs64) continued 11111, 66910
+    // ('.",') — same first token, near-tie second.
+    const want = [_]u32{ 11111, 16 };
     for (want) |w| {
         const logits = try forwardPrefill(&mdl, allocator, ids.items);
         defer allocator.free(logits);
@@ -2735,8 +2728,9 @@ test "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France i
             try testing.expect(std.math.isFinite(v));
             if (v > logits[best]) best = i;
         }
-        std.debug.print("dsv4 real decode after batched prefill -> token {d} (want 66910)\n", .{best});
-        try testing.expectEqual(@as(usize, 66910), best);
+        // Same weights-pinned second token as the prefill loop above.
+        std.debug.print("dsv4 real decode after batched prefill -> token {d} (want {d})\n", .{ best, want[1] });
+        try testing.expectEqual(@as(usize, want[1]), best);
     }
 }
 
@@ -9903,6 +9897,86 @@ test "dsv4: fused MoE gate+up kernel is no worse than the composed gathers (GPU)
         std.debug.print("dsv4 moe gate+up bits={d}: err composed={e:.3} fused={e:.3}\n", .{ tc.bits, err_c, err_f });
         // no-worse-than-reference (house rule: never kernel-vs-kernel exact)
         try testing.expect(err_f <= err_c * 1.25 + 1e-3);
+    }
+}
+
+test "dsv4: gs-128 expert pack resolves per-weight and qmm matches the dequant reference" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const alloc = testing.allocator;
+    // The imatrix mirror ships trunk experts 2b/3b at gs 128 over a config
+    // whose top-level quantization block still says gs 64 — the loader owes
+    // the exact per-weight solve (getQ threads in_dim into
+    // computeQuantParams → affineParamsFromGeometry), and the qmm must serve
+    // the g128 pack through the resolved params. This is the "no Zig changes
+    // needed" proof for the g128 rebuild.
+    var cfg = model.ModelConfig{};
+    cfg.quant_bits = 8;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    const K: usize = 256; // in_dim: 2 groups of 128
+    const N: usize = 16;
+    var rng = std.Random.DefaultPrng.init(41);
+    for ([_]u32{ 2, 3 }) |bits| {
+        const wf = try alloc.alloc(f32, N * K);
+        defer alloc.free(wf);
+        for (wf) |*v| v.* = (rng.random().float(f32) - 0.5) * 0.8;
+        const wshape = [_]c_int{ @intCast(N), @intCast(K) };
+        const w32 = uploadF32(wf, &wshape);
+        defer _ = mlx.mlx_array_free(w32);
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        const empty = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(empty);
+        try mlx.check(mlx.mlx_quantize(&qv, wb, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(@intCast(bits)), "affine", empty, s));
+        var wq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wq);
+        try mlx.check(mlx.mlx_vector_array_get(&wq, qv, 0));
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
+        var bs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bs);
+        try mlx.check(mlx.mlx_vector_array_get(&bs, qv, 2));
+
+        const qp = transformer.computeQuantParams(&cfg, wq, sc, @intCast(K));
+        try testing.expectEqual(bits, qp.bits);
+        try testing.expectEqual(@as(u32, 128), qp.group_size);
+
+        const q = Q{ .w = wq, .s = sc, .b = bs, .qp = qp };
+        const xf = try alloc.alloc(f32, K);
+        defer alloc.free(xf);
+        for (xf) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        const xshape = [_]c_int{ 1, @intCast(K) };
+        const x32 = uploadF32(xf, &xshape);
+        defer _ = mlx.mlx_array_free(x32);
+        const y = try gpuQmmB(&q, x32, s);
+        defer _ = mlx.mlx_array_free(y);
+        const got = try toHostF32(alloc, y, N, s);
+        defer alloc.free(got);
+
+        // f32 dequant reference (no bf16 re-round — the qmm's in-kernel
+        // dequant computes in float) against the bf16-rounded x it sees.
+        var deq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(deq);
+        try mlx.check(mlx.mlx_dequantize(&deq, wq, sc, bs, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(@intCast(bits)), "affine", empty, .{ .value = .float32, .has_value = true }, s));
+        const dh = try toHostF32(alloc, deq, N * K, s);
+        defer alloc.free(dh);
+        var xb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xb);
+        try mlx.check(mlx.mlx_astype(&xb, x32, .bfloat16, s));
+        const xh = try toHostF32(alloc, xb, K, s);
+        defer alloc.free(xh);
+        for (0..N) |n| {
+            var t: f64 = 0;
+            for (0..K) |j| t += @as(f64, xh[j]) * dh[n * K + j];
+            try testing.expect(std.math.isFinite(got[n]));
+            try testing.expectApproxEqAbs(@as(f32, @floatCast(t)), got[n], 0.05);
+        }
     }
 }
 

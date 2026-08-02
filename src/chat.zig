@@ -75,6 +75,24 @@ pub const ChatConfig = struct {
     }
 };
 
+/// True when `<model_dir>/config.json` declares the given model_type. Any
+/// read/parse failure is false — this only ARMS a family fallback, never
+/// blocks a load.
+fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, want: []const u8) bool {
+    const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+    defer allocator.free(cfg_path);
+    const file = std.Io.Dir.openFileAbsolute(io, cfg_path, .{}) catch return false;
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var rs = file.reader(io, &buf);
+    const content = rs.interface.allocRemaining(allocator, .limited(1 << 22)) catch return false;
+    defer allocator.free(content);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, want);
+}
+
 /// Load chat template configuration from tokenizer_config.json.
 pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ChatConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
@@ -105,6 +123,17 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             var jinja_reader = f.reader(io, &jinja_buf);
             break :blk try jinja_reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
         } else |_| {
+            // Family fallback: a deepseek_v4 checkpoint that ships NO
+            // template at all (pipenetwork REAP builds — their python
+            // package does its own encoding) gets OUR byte-pinned DSV4
+            // transcription. The generic fallback renders wrong-family
+            // markers the model then echoes into degeneration (the
+            // silent-fallback class, live 2026-08-01), and DSML tool
+            // calling depends on the real template.
+            if (dirModelTypeIs(io, allocator, model_dir, "deepseek_v4")) {
+                log.info("chat: deepseek_v4 checkpoint ships no chat_template — using the embedded DSV4 transcription\n", .{});
+                break :blk try allocator.dupe(u8, @embedFile("fixtures/dsv4_chat_template.jinja"));
+            }
             break :blk try allocator.dupe(u8, "");
         }
     };
@@ -9387,6 +9416,34 @@ test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hol
     try testing.expect(streamShouldBufferForTools("answer text <｜"));
     // plain prose with a fullwidth bar elsewhere must NOT hold
     try testing.expect(!streamShouldBufferForTools("the ｜ character is fun"));
+}
+
+test "loadChatConfig: template-less deepseek_v4 checkpoint gets the embedded DSV4 template" {
+    // pipenetwork REAP builds ship NO chat_template (their python package
+    // does its own encoding) — the generic fallback renders wrong-family
+    // markers and the model degenerates into echoing them (live 2026-08-01:
+    // pi against REAP37 looped `<start_of_turn>model`). A deepseek_v4
+    // checkpoint with no template must get OUR byte-pinned transcription.
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\": \"e\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"deepseek_v4\"}" });
+    var pbuf: [512]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &pbuf);
+    const dir_path = pbuf[0..plen];
+
+    var cc = try loadChatConfig(io, allocator, dir_path);
+    defer cc.deinit();
+    try testing.expect(std.mem.indexOf(u8, cc.chat_template, "thinking_mode") != null);
+    try testing.expect(std.mem.indexOf(u8, cc.chat_template, "DSML") != null);
+
+    // Any other arch keeps the empty fallback (fallbackFormatChat territory).
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"llama\"}" });
+    var cc2 = try loadChatConfig(io, allocator, dir_path);
+    defer cc2.deinit();
+    try testing.expectEqual(@as(usize, 0), cc2.chat_template.len);
 }
 
 test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_result (hermetic)" {

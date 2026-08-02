@@ -162,3 +162,126 @@ benchmark taken on it would be measuring a subtly different model than the refer
 - **Guard**: `ModelConfig: laguna YaRN mscale is COMPUTED, never read from
   attention_factor (Laguna-XS ships 1.0)` — a config carrying `1.0` must still parse to
   `1.3465735…`; verified red before the fix.
+
+## An imatrix is only valid for the weights it was collected on (2026-08-01/02)
+
+The imx mirror shipped 2026-08-01 was calibrated with the only published DSV4
+imatrix — antirez's `DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat`,
+committed 2026-05-12, i.e. collected on the PREVIEW checkpoint. 0731 retrained
+the weights. Live symptom that kicked off the investigation: the o-for-0 digit
+class (`1o` for `10`, `#ff0o0o`) making a pi-driven Three.js build loop on
+self-repair (5 of 8 initial file writes corrupted; the model twice
+re-introduced the corruption while rewriting, then got confused by its own
+grep; run cut by `[length]` at 26K ctx — full record in the session
+post-mortem).
+
+Collection: `lib/ds4/ds4 --imatrix-dataset gguf-tools/imatrix/dataset/
+rendered_prompts.txt --imatrix-out … --ctx 32768` over antirez's official
+imatrix-fixed-0731 GGUF (97.6 GB donor, resident on 128 GB; prebuilt Jul-15
+binary no longer matched the checked-in Metal sources — `make ds4` first). Full
+corpus 2.9M tokens / 4,692 prompts / 747.6M routed observations in ~3.2 h at
+~250 tok/s prefill. The known upstream delimiter bug (fixed on the mxfp4
+branch) split exactly 2 prompts that quote the collector's own source —
+negligible, but cherry-pick `0a62b39` on the next ds4 bump.
+
+Numbers that justify the class rule:
+- preview vs our 0731 collection: median Pearson 0.66, top-5%-channel Jaccard
+  0.33; per-expert slices ~85% of experts decorrelated (r<0.9).
+- our collection vs ox-ox's independent 1.5M-token 0731 collection: 0.85 —
+  two same-weights collections agree far better than either agrees with
+  preview, so the movement is the retrain, not donor/sampling noise. (ox-ox
+  published the first 0731 `.dat`; ours doubles the token count. Their README's
+  structural analysis holds here: post-RMSNorm gate/up statistics are near-flat
+  across channels, so an imatrix mostly informs `down`.)
+- pilot on real 0731 shards (L3/21/40 × w1/w2/w3, today's recipe, old-cal vs
+  new-cal, scored under the new statistics): w2 (3b) −5.5..−10.3% weighted
+  error, w1/w3 (2b) −0.4..−0.7%. 7 wins / 2 ties / 0 losses.
+- v2 vs preview-cal build, live: char precision 35 vs 38 slips; task set 4/5
+  both; o-for-0 collapse rate UNCHANGED (1/12 sampled arms each — the collapse
+  is a 2-bit near-tie property: `o`≈`0` in numeric contexts everywhere in
+  training text, quant noise flips the nearest tie first, then the model
+  copies its own slip → all-or-nothing corruption; greedy oracle parity
+  exonerates the engine). test_dsv4.sh 14/14, template 17/17, greedy pins
+  UNCHANGED, DSpark acceptance 3.79/round at 53.3 tok/s sampled.
+
+Two operational traps caught in the same round: (1) re-converting the mtp
+group is NOT byte-stable across sessions (59/149 tensors drifted at rounding
+level in scales+packed words with identical headers) — the stage byte-identical
+rule is enforced by copying the proven shard, never re-converting; (2) the
+memory preflight legitimately refuses the ~102 GB mirror on a box with a
+browser open (~105 GB "available") — `DSV4_TEST_SKIP_PREFLIGHT=1` in
+test_dsv4.sh mirrors how the mirror is actually served, default stays strict.
+
+## The DSV4 echo-precision saga was a TOKENIZER bug (2026-08-02, iq2 week)
+
+Symptom history: DSV4 mirrors slipped single characters in verbatim material
+(`1o` for `10`, invalid hex, split digits, the sampled o-for-0 collapse) at a
+rate that survived the imatrix recalibration (38→35 char-precision slips).
+During iq2-codebook bring-up the
+new mirror slipped 38-40/70 on the char-precision battery while the SAME GGUF
+weights served through the embedded ds4 engine scored 0/70.
+
+Elimination ladder (each step a real discriminator, all on live boots):
+MV kernels off → identical; f32 expert activations → identical; AR fused
+kernels off → identical; affine canonical on our
+engine → 36/70 (same level); the python reference oracle on the canonical →
+uuid echo PERFECT. Per-case table: the ONE clean case everywhere was the one
+without digit-dense payload. The three clean systems (oracle, ds4) tokenize
+with their OWN encoders; every slipping config used tokenizer.zig.
+
+The probe that ended it (no GPU): `/tokenize` "100" → ours [1,0,0] per-digit;
+canonical HF `tokenizers` → [1457] = "100" one token. DSV4's tokenizer.json
+pre_tokenizer rule 1 is `Split(Regex: \p{N}{1,3}, Isolated)` — greedy 3-digit
+groups — while our hand-rolled gpt2PreTokenize implemented the QWEN reference
+(bare `\p{N}`), correct for Qwen3.6 (which declares single digits — surveyed)
+and wrong for DSV4. Every number the model ever read through our server was
+per-digit segmented — off-distribution for a model trained on {1,3} groups —
+so verbatim digit recall degraded exactly like a quantization-quality bug,
+which is what everyone (including the quality batteries) attributed it to.
+
+Fix: `Tokenizer.digit_group` parsed from the Split rule (exact match on
+`\p{N}{1,3}`, conservative default 1), pattern 3 consumes up to that many
+digits. Char-precision went 38-40 → **0/70** on the iq2 mirror. Guards:
+gpt2PreTokenize group tests (["104","857","6"] etc.), digitGroupFromPreTokenizer
+parse tests, Qwen single-digit behavior pinned unchanged.
+
+Meta-lesson: when a quality defect is INVARIANT across engine configs and
+quant recipes, stop ablating the engine — diff the PROMPT ENCODING against an
+independent tokenizer first. It is a two-minute check that would have saved
+days. (Also: the iq2 bring-up's ds4-vs-native cross-check is what surfaced
+this — an independent-implementation oracle earns its keep.)
+
+## Uniform ≤2-bit experts to the last layer cause TURN-LEVEL agent loops (2026-08-02, tail4)
+
+The shipped DSV4 mirror (`ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit`,
+115.4 GB, HF commit `be89f88`) is the **tail4** build: imatrix-calibrated
+2b/g128 gate/up + 3b/g128 down experts on layers 0-38, but AFFINE 4b/gs64
+experts on the last 4 layers (39-42). The 4-bit tail exists because the
+uniform low-bit build had a failure mode no token-level gate could see:
+**turn-level agent repetition loops**.
+
+Mechanism: the same near-tie physics as the o-for-0 collapse, lifted from the
+token level to the DECISION level. At a turn boundary the model weighs "am I
+done" against "verify once more"; 2-bit expert noise in the late layers flips
+that near-tie, and once the transcript contains one redundant verification
+round the model copies its own pattern (error-echo class) and orbits. Every
+INDIVIDUAL response is short, fluent, and correct — the SEQUENCE is what
+loops — so:
+
+- the token-level degenerate-tail guard (`loopStopReason`, even the 9..64
+  long-period tier) never fires — no token window repeats;
+- the char-precision / o0 batteries score the arms identical;
+- task-success scoring is blind too — the looping runs eventually finish
+  with the SAME 50/50 correctness, just 3-5x the tokens.
+
+bench4 (agent tasks via the pi harness, DSpark on): the uniform-2-bit
+canonical looped 3 of 4 task-B runs, burning 16-28K tokens each; tail4
+looped 0 of 3 at 5.4-7.6K tokens. Correctness identical (50/50), throughput
+identical (~53 tok/s DSpark both arms) — the tail bits buy BEHAVIOR, not
+speed or single-token quality.
+
+Rule distilled to CLAUDE.md: quality gates for low-bit mirrors need an
+AGENT-LOOP cell. The loop metric is **max consecutive identical tool calls**
+across a multi-turn agent run; reusable harness:
+`~/claude-tmp/iq2-week/bench3/loop_stats.py` + the bench4.sh pattern
+(paired arms, same tasks, token budgets + loop stats per run).

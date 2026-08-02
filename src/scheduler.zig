@@ -3426,6 +3426,12 @@ pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
         generate_mod.degenerate_loop_max_period,
         generate_mod.degenerate_loop_reps,
     )) return "length";
+    if (generate_mod.isDegenerateTailLoopRange(
+        generated_ids,
+        generate_mod.degenerate_loop_max_period + 1,
+        generate_mod.degenerate_loop_long_max_period,
+        generate_mod.degenerate_loop_long_reps,
+    )) return "length";
     return null;
 }
 
@@ -4551,6 +4557,41 @@ test "loopStopReason: a degenerate tail cut reports length, a healthy tail is no
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("length", reason);
+}
+
+test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
+    // The 2026-08-02 shooter wrap-up failure: a two-sentence cycle ("The game
+    // is complete. Let me do a final review... Let me verify main.js...") of
+    // ~58 tokens repeated 26 times sailed through the 8-token-period tier and
+    // was never cut. Tier 2 scans periods 9..64 and requires 10 exact
+    // repetitions — verbatim-identical long cycles at that count are
+    // degeneration, not content.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    for (0..30) |i| try ids.append(testing.allocator, @as(u32, @intCast(i * 3 + 11)));
+
+    // 58-token cycle, 9 reps: below the tier-2 threshold — NOT cut.
+    var cycle: [58]u32 = undefined;
+    for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(1000 + i));
+    for (0..9) |_| try ids.appendSlice(testing.allocator, &cycle);
+    try testing.expect(loopStopReason(ids.items) == null);
+
+    // Tenth repetition crosses it — cut, and as a truncation ("length").
+    try ids.appendSlice(testing.allocator, &cycle);
+    const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("length", reason);
+}
+
+test "loopStopReason: periods past the long tier stay uncut" {
+    // A 70-token exact cycle (> long-tier max 64) repeated many times is
+    // outside both tiers — the guard stays scoped rather than judging whole
+    // repeated paragraphs.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    var cycle: [70]u32 = undefined;
+    for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(2000 + i));
+    for (0..12) |_| try ids.appendSlice(testing.allocator, &cycle);
+    try testing.expect(loopStopReason(ids.items) == null);
 }
 
 test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {

@@ -560,6 +560,27 @@ pub const ModelConfig = struct {
         }
     }
 
+    /// DeepSeek-V4 releases ship generation_config.json with the WILD
+    /// signature (temp 1.0 / top_p 1.0) that their own inference/generate.py
+    /// IGNORES — its default is temperature 0.6, the value our converter
+    /// writes into our mirrors. External conversions (pipenetwork REAP) copy
+    /// the source file verbatim, and an agent CLI that omits temperature then
+    /// samples the untruncated tail (live 2026-08-01: pi against REAP37
+    /// degenerated into token loops on its FIRST turn). When the reference
+    /// implementation deliberately ignores a config field, that field is not
+    /// the source of truth (the laguna YaRN class): the EXACT untouched
+    /// signature resolves to the reference's default; anything an author
+    /// actually tuned is left alone, and request/flag values always win.
+    pub fn applyDsv4ReferenceSampling(self: *ModelConfig) void {
+        if (!std.mem.eql(u8, self.model_type, "deepseek_v4")) return;
+        const t = self.gen_temperature orelse return;
+        const p = self.gen_top_p orelse return;
+        if (t == 1.0 and p == 1.0) {
+            log.info("deepseek_v4: generation_config carries the source's wild 1.0/1.0 signature — resolving to the reference default temp 0.6\n", .{});
+            self.gen_temperature = 0.6;
+        }
+    }
+
     pub fn isEosToken(self: *const ModelConfig, id: u32) bool {
         for (self.eos_token_ids[0..self.num_eos_tokens]) |eos| {
             if (id == eos) return true;
@@ -655,6 +676,9 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // still-null truncation knobs with the family's documented defaults so
     // omitted-field resolution never bottoms out at untruncated sampling.
     config.applyFamilySamplingDefaults();
+    // ... and a dsv4 generation_config carrying the source's verbatim wild
+    // signature resolves to the reference implementation's own default.
+    config.applyDsv4ReferenceSampling();
 
     // Qwen image sizing is processor metadata rather than an architecture
     // constant. Prefer processor_config.json and fill any missing field from
@@ -2205,6 +2229,41 @@ test "loadWeights on a weightless dir (incomplete download) errors clearly, not 
         error.NoWeightFiles,
         loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", false),
     );
+}
+
+test "applyDsv4ReferenceSampling: the source's wild signature resolves to the reference's temp 0.6" {
+    // DeepSeek-V4 releases ship generation_config.json with temp 1.0/top_p
+    // 1.0 — the wild signature their own inference/generate.py IGNORES (its
+    // default is 0.6, which our converter writes into our mirrors). External
+    // conversions (pipenetwork REAP) copy the file verbatim; pi (omits
+    // temperature) against REAP37 degenerated into token loops on its first
+    // turn (live 2026-08-01). The exact untouched signature resolves to the
+    // reference default; anything an author actually tuned is untouched.
+    var wild = ModelConfig{ .model_type = "deepseek_v4" };
+    wild.gen_temperature = 1.0;
+    wild.gen_top_p = 1.0;
+    wild.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, 0.6), wild.gen_temperature);
+    try testing.expectEqual(@as(?f32, 1.0), wild.gen_top_p);
+
+    // A tuned config is not the signature — untouched.
+    var tuned = ModelConfig{ .model_type = "deepseek_v4" };
+    tuned.gen_temperature = 1.0;
+    tuned.gen_top_p = 0.9;
+    tuned.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, 1.0), tuned.gen_temperature);
+
+    // Other archs never touched, even with the signature values.
+    var other = ModelConfig{ .model_type = "llama" };
+    other.gen_temperature = 1.0;
+    other.gen_top_p = 1.0;
+    other.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, 1.0), other.gen_temperature);
+
+    // No generation_config at all (both null) — nothing to resolve.
+    var bare = ModelConfig{ .model_type = "deepseek_v4" };
+    bare.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, null), bare.gen_temperature);
 }
 
 test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config" {
