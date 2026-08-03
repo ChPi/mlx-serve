@@ -522,7 +522,14 @@ pub fn isMmprojGgufBasename(basename: []const u8) bool {
 /// model that merely contains the letters "mtp" isn't caught.
 pub fn isMtpGgufBasename(basename: []const u8) bool {
     if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
-    return asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.");
+    // Delimited tokens only, so a chat quant whose scheme name merely
+    // contains the letters can't match. Covers the legacy MTP draft head
+    // (`…-MTP-….gguf`) AND the 0731 DSpark stage bundle
+    // (`DeepSeek-V4-Flash-DSpark-support.gguf`) — ds4 loads either via the
+    // same --mtp slot and classifies by tensors. Swift mirror:
+    // DownloadManager.isGgufSidecar — keep in sync.
+    return asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.") or
+        asciiContainsIgnoreCase(basename, "-dspark-") or asciiContainsIgnoreCase(basename, "-dspark.");
 }
 
 pub fn isGgufSidecarBasename(basename: []const u8) bool {
@@ -1360,6 +1367,17 @@ test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
     try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
     try testing.expect(!isMtpGgufBasename("mmproj-F16.gguf"));
     try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
+
+    // DSpark support GGUF (upstream lib/ds4 `download_model.sh dspark-support`
+    // → `DeepSeek-V4-Flash-DSpark-support.gguf`): the 0731 replacement for the
+    // legacy MTP sidecar. It must be FOUND by the draft matcher (ds4 loads it
+    // via --mtp and `--dspark` selects the runtime) AND filtered as a sidecar
+    // — its name starts with "deepseek-v4-flash", so without the filter it
+    // classifies as a servable chat quant and becomes a pickable tray entry
+    // that can only fail.
+    try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-dsparkle-chat.gguf"));
 
     try testing.expect(!isGgufSidecarBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
     try testing.expect(!isGgufSidecarBasename("Qwen3.5-4B-IQ4_NL.gguf"));

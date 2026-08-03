@@ -182,6 +182,12 @@ pub const LoadParams = struct {
     /// decode. Default on; forced off when `ds4_ssd_streaming` (ds4 refuses the
     /// combination). `--no-ds4-mtp` disables it.
     ds4_mtp: bool = true,
+    /// Select ds4's DSpark runtime when the auto-found support GGUF carries
+    /// DSpark stages (`--dspark`, the same flag that opts the NATIVE dsv4
+    /// engine into its draft stages). Off by default — the engine loads the
+    /// stages but keeps target-only decode. Requires `ds4_mtp` (the sidecar
+    /// is the support model).
+    ds4_dspark: bool = false,
     /// Like `ds4_path` but for the generic llama.cpp engine (any GGUF except
     /// DeepSeek-V4-Flash). The inference thread opens a `LlamaEngine` and
     /// installs it on the entry's `llama_engine` field. Mutually exclusive with
@@ -827,6 +833,11 @@ pub const LoadRequest = struct {
     /// on (a switched-to ds4 model gets speculative decode); forced off under
     /// `ds4_ssd_streaming`.
     ds4_mtp: bool = true,
+    /// DSpark runtime for a cold-loaded ds4 model whose sidecar carries
+    /// DSpark stages. Cold loads inherit the launch flag via the Scheduler's
+    /// `ds4_dspark` (the headless flag-eater class — a LoadRequest default
+    /// would silently drop `--dspark` on every on-demand GGUF load).
+    ds4_dspark: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
@@ -977,6 +988,11 @@ pub const Scheduler = struct {
     llama_cache_entries: u32,
     llama_kv_type_k: i32,
     llama_kv_type_v: i32,
+    /// Launch-flag ds4 speculative settings, retained for cold loads (same
+    /// class as `mtp_enabled` above — `--no-ds4-mtp` / `--dspark` must
+    /// survive an on-demand GGUF load, not just the `--model` primary).
+    ds4_mtp: bool,
+    ds4_dspark: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -1132,6 +1148,8 @@ pub const Scheduler = struct {
             .llama_cache_entries = params.llama_cache_entries,
             .llama_kv_type_k = params.llama_kv_type_k,
             .llama_kv_type_v = params.llama_kv_type_v,
+            .ds4_mtp = params.ds4_mtp,
+            .ds4_dspark = params.ds4_dspark,
             // Initial borrowed-view refs point at the (heap-allocated) CPU
             // state carried on LoadParams; once the inference thread
             // installs them on `entry`, the views still resolve to the
@@ -1574,6 +1592,8 @@ pub const Scheduler = struct {
             .llama_cache_entries = self.llama_cache_entries,
             .llama_kv_type_k = self.llama_kv_type_k,
             .llama_kv_type_v = self.llama_kv_type_v,
+            .ds4_mtp = self.ds4_mtp,
+            .ds4_dspark = self.ds4_dspark,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -1771,6 +1791,49 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
     // Block diffusion denoises whole canvases — no per-token batched decode.
     if (cfg.isDiffusion()) return false;
     return true;
+}
+
+/// A model whose per-request decode state is MODULE-OWNED (one per model,
+/// not per slot) — at most ONE in-flight request may touch it. dsv4 today:
+/// `Dsv4Model.dec_state` is rebuilt at cache.step==0 and advanced by every
+/// decode tick, so a second interleaved slot deinit+rebuilds the active
+/// request's state and both then append tokens to the ONE state (live
+/// 2026-08-02: an app chat leaked into a pi stream, every word doubled).
+/// Serial-tick interleave stays safe for per-slot-state archs (laguna/hy3)
+/// — key on the transformer's dsv4 pointer (mirrors runPrefill's is_dsv4),
+/// NEVER on !modelBatchable.
+fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
+    const t = model.transformer orelse return false;
+    return t.dsv4 != null;
+}
+
+/// One pending-drain candidate (or live decoding slot), reduced to what
+/// admission needs: an opaque model identity + the exclusive-decode bit.
+pub const AdmitCand = struct { model: usize, exclusive: bool };
+
+/// FIFO admission for one drain tick. A candidate on an EXCLUSIVE model
+/// admits only if its model is neither among `active` (live decoding slots)
+/// nor already claimed by an earlier admitted exclusive candidate this tick
+/// (a same-tick sibling is not in `decoding` yet — the claim covers the
+/// window). Non-exclusive candidates always admit — no head-of-line
+/// blocking behind a held exclusive request. Writes admitted candidate
+/// indices to `out` (queue order preserved), returns the count. Held
+/// candidates stay where they are and retry next tick; no release
+/// bookkeeping exists — the busy signal IS presence in `decoding`.
+pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out: []usize) usize {
+    var n: usize = 0;
+    outer: for (cands, 0..) |c, i| {
+        if (n >= out.len) break;
+        if (c.exclusive) {
+            for (active) |a| if (a.model == c.model) continue :outer;
+            for (out[0..n]) |j| {
+                if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
+            }
+        }
+        out[n] = i;
+        n += 1;
+    }
+    return n;
 }
 
 const ThreadCtx = struct {
@@ -2019,12 +2082,16 @@ const DS4_MTP_DRAFT_TOKENS: c_int = 4;
 const DS4_MTP_MARGIN: f32 = 3.0;
 const DS4_MTP_MAX_TOKENS: usize = 17;
 
-/// Whether a ds4 decode step should use MTP speculative decode: the engine
-/// loaded a draft head (`has_mtp`), it's configured for >1 draft token, and
-/// sampling is greedy (ds4's spec path is argmax-based — temp>0 falls back to
-/// the normal sampler). Pure + unit-tested; mirrors ds4's own CLI gate.
-fn ds4MtpShouldEngage(has_mtp: bool, draft_tokens: c_int, temperature: f32) bool {
-    return has_mtp and draft_tokens > 1 and temperature <= 0.0;
+/// Whether a ds4 decode step should use speculative decode: the engine
+/// reports >1 ready draft tokens and sampling is greedy (ds4's spec path is
+/// argmax-based — temp>0 falls back to the normal sampler). The draft count
+/// is the readiness signal for BOTH support kinds — legacy MTP reports its
+/// configured draft count only when `mtp_ready`, DSpark reports its block
+/// size only when `--dspark` armed the runtime — so a `has_mtp` conjunct
+/// (false for DSpark by design) would leave DSpark unreachable, the
+/// dispatch-hole class. Pure + unit-tested; mirrors ds4's own CLI gate.
+fn ds4MtpShouldEngage(draft_tokens: c_int, temperature: f32) bool {
+    return draft_tokens > 1 and temperature <= 0.0;
 }
 
 fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
@@ -2046,9 +2113,12 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,
+        .dspark = params.ds4_dspark,
     });
     errdefer engine.close();
-    log.info("[ds4] engine ready (EOS={d}, has_mtp={})\n", .{ engine.eosToken(), engine.hasMtp() });
+    // draft_tokens is the spec-readiness signal for BOTH support kinds
+    // (legacy MTP count, or DSpark block size when the runtime is armed).
+    log.info("[ds4] engine ready (EOS={d}, has_mtp={}, draft_tokens={d})\n", .{ engine.eosToken(), engine.hasMtp(), engine.mtpDraftTokens() });
 
     // Make sure the stub config knows about the engine's EOS token so the
     // streaming/non-streaming paths' EOS check fires correctly. addEosToken
@@ -2940,9 +3010,41 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
             if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
 
-            while (n_prefill < to_prefill.len and sch.pending.items.len > 0) {
-                to_prefill[n_prefill] = sch.pending.orderedRemove(0);
+            // Single-flight admission (the dsv4 class): a model with
+            // MODULE-OWNED decode state admits at most one live slot.
+            // Snapshot live exclusive-model slots (same liveness predicate
+            // as the step-3 active list), let `admitPendingTick` decide,
+            // and leave held slots in `pending` — their conn threads keep
+            // flowing SSE keepalives while they wait, and the wait
+            // condition above never blocks while `pending` is non-empty,
+            // so a held slot admits on the first tick after the active one
+            // is culled (step 5, same mutex).
+            var live_buf: [32]AdmitCand = undefined;
+            var n_live: usize = 0;
+            for (sch.decoding.items) |s| {
+                if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+                if (!modelExclusiveDecode(s.model)) continue;
+                if (n_live >= live_buf.len) break;
+                live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
+                n_live += 1;
+            }
+            var cand_buf: [32]AdmitCand = undefined;
+            const n_cands = @min(sch.pending.items.len, cand_buf.len);
+            for (sch.pending.items[0..n_cands], 0..) |s, i| {
+                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = modelExclusiveDecode(s.model) };
+            }
+            var admit_idx: [to_prefill.len]usize = undefined;
+            const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
+            for (admit_idx[0..n_admit]) |idx| {
+                to_prefill[n_prefill] = sch.pending.items[idx];
                 n_prefill += 1;
+            }
+            // Remove admitted entries in DESCENDING index order so the
+            // earlier (ascending) indices stay valid during removal.
+            var r = n_admit;
+            while (r > 0) {
+                r -= 1;
+                _ = sch.pending.orderedRemove(admit_idx[r]);
             }
         }
 
@@ -3651,7 +3753,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     // verifies several more, advancing ds4's KV internally (no separate eval).
     // It emits `[sampled, accepted…]`, so this tick may push several tokens.
     // Mirrors ds4's own CLI loop; engages only under greedy sampling.
-    if (ds4MtpShouldEngage(engine.hasMtp(), engine.mtpDraftTokens(), slot.sampling.temperature)) {
+    if (ds4MtpShouldEngage(engine.mtpDraftTokens(), slot.sampling.temperature)) {
         var spec_buf: [DS4_MTP_MAX_TOKENS]i32 = undefined;
         const done: i64 = @intCast(slot.completion_tokens);
         const cap: i64 = @intCast(slot.max_tokens);
@@ -3693,14 +3795,22 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     }
 }
 
-test "ds4MtpShouldEngage: draft head + >1 draft tokens + greedy" {
-    // Engages only greedily (ds4's spec path is argmax) with a loaded head.
-    try std.testing.expect(ds4MtpShouldEngage(true, 4, 0.0));
-    try std.testing.expect(ds4MtpShouldEngage(true, 2, -1.0));
-    // No head, or 1 draft token, or sampling (temp>0) → regular decode.
-    try std.testing.expect(!ds4MtpShouldEngage(false, 4, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(true, 1, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(true, 4, 0.7));
+test "ds4MtpShouldEngage: >1 draft tokens + greedy (legacy MTP and DSpark)" {
+    // Engages only greedily (ds4's spec path is argmax) with a ready draft.
+    // The draft-token count IS the readiness signal for BOTH support kinds:
+    // legacy MTP reports its configured draft count only when `mtp_ready`,
+    // DSpark reports its block size only when `--dspark` armed the runtime
+    // (ds4_engine_mtp_draft_tokens) — a has_mtp conjunct here would leave
+    // DSpark (has_mtp=false by design) permanently unreachable, the
+    // engagement-blind dispatch-hole class.
+    try std.testing.expect(ds4MtpShouldEngage(4, 0.0));
+    try std.testing.expect(ds4MtpShouldEngage(2, -1.0));
+    // DSpark block size (e.g. 16) engages the same way.
+    try std.testing.expect(ds4MtpShouldEngage(16, 0.0));
+    // No ready draft (0), or 1 draft token, or sampling → regular decode.
+    try std.testing.expect(!ds4MtpShouldEngage(0, 0.0));
+    try std.testing.expect(!ds4MtpShouldEngage(1, 0.0));
+    try std.testing.expect(!ds4MtpShouldEngage(4, 0.7));
 }
 
 /// llama.cpp decode tick: argmax (temp < 0.01, matching the MLX greedy
@@ -4470,6 +4580,103 @@ test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     try testing.expect(modelBatchable(&cfg));
+}
+
+test "admitPendingTick: exclusive single-flight FIFO contract" {
+    const A: usize = 0xA0;
+    const B: usize = 0xB0;
+    var out: [16]usize = undefined;
+
+    // Held while a live slot on the same exclusive model is decoding — the
+    // dsv4 class: a second admitted slot deinit+rebuilds the module-owned
+    // dec_state at cache.step==0 and both requests then interleave on it.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+    }
+    // Admits once no live slot holds the model.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+    }
+    // Two exclusive candidates on the SAME model in one tick: only the
+    // first admits — the tick-claim covers slots not yet in `decoding`.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = true },
+            .{ .model = A, .exclusive = true },
+        };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+    }
+    // Distinct exclusive models admit independently.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = true },
+            .{ .model = B, .exclusive = true },
+        };
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+        try testing.expectEqual(@as(usize, 1), out[1]);
+    }
+}
+
+test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
+    const A: usize = 0xA0;
+    const L: usize = 0x10;
+    var out: [16]usize = undefined;
+
+    // Non-exclusive candidates (laguna/hy3: per-slot state) admit freely
+    // even beside live slots — their serial-tick interleave is safe.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false },
+        };
+        const active = [_]AdmitCand{.{ .model = L, .exclusive = false }};
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &active, &out));
+    }
+    // A held exclusive candidate must not head-of-line-block a later
+    // candidate on another model (requests for OTHER models keep flowing).
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = true },
+            .{ .model = L, .exclusive = false },
+        };
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), out[0]);
+    }
+    // `out` caps the admitted count (mirrors to_prefill's 16), in order.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false },
+        };
+        var small: [2]usize = undefined;
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &small));
+        try testing.expectEqual(@as(usize, 0), small[0]);
+        try testing.expectEqual(@as(usize, 1), small[1]);
+    }
+}
+
+test "inferenceLoop pending drain routes through admitPendingTick" {
+    // A pure admission fn nobody calls is a silent no-op (the specTickMode /
+    // hardcoded use_drafter=false class). Needles are ++-split so this
+    // test's own source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
+    try testing.expect(std.mem.indexOf(u8, src, call) != null);
+    // The candidates' exclusive bit must come from the model predicate.
+    const pred = ".exclusive = modelExclusiveDecode(" ++ "s.model)";
+    try testing.expect(std.mem.indexOf(u8, src, pred) != null);
+    // The pre-gate unconditional drain shape must be GONE — its survival
+    // would mean a path still admits without the gate.
+    const old = "to_prefill[n_prefill] = sch.pending." ++ "orderedRemove(0)";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
 }
 
 test "buildGgufStubCpuState: llama stub carries gguf model_type + ctx sizing" {

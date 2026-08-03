@@ -65,6 +65,7 @@ mlx-serve --model ~/models/Qwen3.5-4B-Q4_K_M.gguf --serve
 And because mlx-serve **speaks the Ollama API** (`/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/pull`, …) alongside OpenAI and Anthropic, your existing Ollama-connected tools — Raycast, Obsidian, Enchanted, Open WebUI, `ollama-python`/`js` — work unchanged: point them at `http://localhost:11234` and keep your workflow, on a faster engine.
 
 ## Why mlx-serve
+![MLX Core](website/screenshots/ds4.jpg)
 
 If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to switch — here's the short version, head-to-head:
 
@@ -122,8 +123,6 @@ Numbers and charts in [Performance](#performance).
 - **No Python** — single Zig binary, no `pip`, no venv. The MLX Core app ships everything signed and notarized.
 
 ## MLX Core (macOS App)
-
-![MLX Core](website/demo-diffusion.gif)
 
 Menu-bar app that wraps the server with a full UI:
 
