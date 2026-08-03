@@ -1,7 +1,14 @@
 # Changelog
 
-## v26.8.1 - Next release - dev
-- **Fix Prefill Guard** Adjusted OutOfMemory detector to be more accurate, and allow more of a ceiling.
+## v26.8.1 - New DeepseekV4 Flash optimizations
+- **DeepSeek V4 got a lot faster on our engine.** Serial decode went from 22.6 to about 30 tokens per second on an M4 Max (31.8 with fast decode on), and prefill roughly doubled to about 270 tokens per second at 8K. DSpark was retuned and now also works on sampled requests, which is what agent CLIs actually send: with it on, code, lists and editing decode at 54-68 tokens per second, about twice serial.
+- **A better DeepSeek V4 conversion.** The published model on HF is rebuilt with imatrix calibration collected on the 0731 weights themselves, and the last few expert layers moved to 4-bit: agent sessions no longer get stuck repeating themselves the way uniform 2-bit did. Also found and fixed a tokenizer bug that split numbers digit by digit before the model ever saw them, which read as quant damage ("1o" instead of "10") and wasn't.
+- **Two chats at once no longer corrupt each other on DeepSeek V4.** Its decode state lives on the model, not the request, and a second concurrent request used to reset it mid-generation: replies leaked between conversations with every word doubled. A second request now waits its turn, and streaming clients get keepalives while they queue. Other models are unaffected and still run concurrently.
+- **DSpark for the GGUF engine too.** The embedded ds4 engine now uses DeepSeek's DSpark draft when the support GGUF sits beside the model, with the same `--dspark` flag and Settings toggle as the native engine. The big DSpark wins are on our native engine today; upstream is still tuning theirs.
+- **Fix Prefill Guard.** Adjusted OutOfMemory detector to be more accurate, and allow more of a ceiling.
+- **Bug fixes.**
+  - DSML tool markup no longer leaks into DeepSeek V4 replies.
+  - The chat window's minimum width is a bit wider.
 
 ## v26.7.12 — Deepseek V4 0731 + DSpark, Inkling Small support, Laguna 5x faster, Agents, media generation in chat
 

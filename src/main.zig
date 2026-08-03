@@ -45,6 +45,10 @@ var ds4_ssd_streaming: bool = false;
 // Default on; `--no-ds4-mtp` disables it, and it's forced off under
 // `--ssd-streaming` (ds4 refuses the combination). Read by the same ds4 paths.
 var ds4_mtp: bool = true;
+// `--dspark` for the EMBEDDED ds4 engine: select the DSpark runtime when the
+// auto-found support GGUF carries DSpark stages (the same flag opts the
+// native dsv4 engine into its draft stages via MLX_SERVE_DSV4_DSPARK).
+var ds4_dspark: bool = false;
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
 /// its own Ollama /api/chat endpoint, then brings the server down cleanly
@@ -132,7 +136,12 @@ fn printUsage(io: std.Io) void {
         \\                        in the request body.
         \\  --dspark            Enable DeepSeek-V4 DSpark draft stages (OFF by
         \\                        default: the stages cost ~11 GB resident; the
-        \\                        memory fit-gate still applies at load).
+        \\                        memory fit-gate still applies at load). For a
+        \\                        served .gguf this arms the embedded ds4
+        \\                        engine's DSpark runtime instead, using the
+        \\                        DSpark support GGUF found beside the model
+        \\                        (greedy requests only; needs the sidecar,
+        \\                        so --no-ds4-mtp disables it too).
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
@@ -551,6 +560,9 @@ pub fn main(init: std.process.Init) !void {
             // ~11 GB resident, so the default leaves them lazy and serves
             // serial. deepseek_v4.initModel reads the env at model load.
             _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+            // Same flag, embedded engine: arm ds4's DSpark runtime when a
+            // DSpark support GGUF sits beside a served .gguf model.
+            ds4_dspark = true;
         } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
@@ -1164,6 +1176,8 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama_cache_entries = server_mod.llama_cache_entries,
+            .ds4_mtp = ds4_mtp,
+            .ds4_dspark = ds4_dspark,
             .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
             .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
             .metrics = server_mod.g_metrics,
@@ -1412,6 +1426,7 @@ fn runDs4Offline(
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
         .mtp_margin = 3.0,
+        .dspark = ds4_dspark,
     }) catch |err| {
         log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
         return err;
@@ -1564,6 +1579,8 @@ fn runGenServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = 0,
+        .ds4_mtp = ds4_mtp,
+        .ds4_dspark = ds4_dspark,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1684,6 +1701,12 @@ fn runHeadlessServe(
         .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
+        // ds4 spec flags must survive headless/on-demand GGUF loads (the
+        // runHeadlessServe flag-eater class): the app always boots headless
+        // and cold-loads GGUFs, so a LoadParams default here silently eats
+        // --no-ds4-mtp / --dspark for every embedded-engine load.
+        .ds4_mtp = ds4_mtp,
+        .ds4_dspark = ds4_dspark,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1897,6 +1920,7 @@ fn runDs4Serve(
         .ds4_path = gguf_path_owned,
         .ds4_ssd_streaming = ds4_ssd_streaming,
         .ds4_mtp = ds4_mtp,
+        .ds4_dspark = ds4_dspark,
         .metrics = server_mod.g_metrics,
     };
 
@@ -2169,6 +2193,8 @@ fn runLlamaServe(
         .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
         .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         .llama_path = gguf_path_owned,
+        .ds4_mtp = ds4_mtp,
+        .ds4_dspark = ds4_dspark,
         .metrics = server_mod.g_metrics,
     };
 

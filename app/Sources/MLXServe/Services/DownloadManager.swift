@@ -92,10 +92,14 @@ class DownloadManager: ObservableObject {
     nonisolated static func isGgufSidecar(_ filename: String) -> Bool {
         let lower = (filename as NSString).lastPathComponent.lowercased()
         guard lower.hasSuffix(".gguf") else { return false }
-        // `-MTP-` matched as a delimited token so a chat quant whose scheme name
-        // merely contains "mtp" isn't caught.
+        // `-MTP-` / `-DSpark-` matched as delimited tokens so a chat quant
+        // whose scheme name merely contains the letters isn't caught. The
+        // DSpark support GGUF (`DeepSeek-V4-Flash-DSpark-support.gguf`) is
+        // 0731's replacement for the legacy MTP draft head — same --mtp slot
+        // server-side, never a servable chat quant.
         return lower.hasPrefix("mmproj") || lower.contains("tokenizer")
             || lower.contains("-mtp-") || lower.contains("-mtp.")
+            || lower.contains("-dspark-") || lower.contains("-dspark.")
     }
 
     /// Retained for the mmproj-specific call sites (the Swift mirror of the

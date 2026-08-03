@@ -204,11 +204,18 @@ pub const OpenOptions = struct {
     n_threads: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
-    /// Optional MTP draft-head GGUF (ds4 speculative decode). The engine dupes
-    /// it to a NUL-terminated string, so a plain slice is fine here.
+    /// Optional support GGUF (ds4 speculative decode): the legacy MTP draft
+    /// head OR the 0731 DSpark stage bundle — the engine classifies by
+    /// tensors. It dupes the path to a NUL-terminated string, so a plain
+    /// slice is fine here.
     mtp_path: ?[]const u8 = null,
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
+    /// Select the DSpark runtime for a DSpark-kind support GGUF (upstream
+    /// `--dspark`; without it the engine loads the stages but keeps
+    /// target-only decode). Ignored for legacy-MTP support GGUFs. Confidence
+    /// pruning stays at the engine default (0.9).
+    dspark: bool = false,
     /// SSD weight-streaming (issue #39): skip full model residency + warmup and
     /// stream expert weights from disk, with an in-RAM cache. Lets DeepSeek-V4-Flash
     /// run on machines whose RAM can't hold the full model. 0 cache fields = ds4 auto.
@@ -218,6 +225,14 @@ pub const OpenOptions = struct {
     ssd_streaming_cache_bytes: u64 = 0,
     ssd_streaming_preload_experts: u32 = 0,
 };
+
+/// Whether to actually pass `--dspark` to the engine: only when a support
+/// GGUF is going in too — ds4 hard-errors open() on `--dspark` with no
+/// `--mtp FILE`, and a missing OPTIONAL accelerator must degrade to a serial
+/// boot, never a boot failure. Pure; unit-tested.
+pub fn dsparkEffective(requested: bool, has_support_gguf: bool) bool {
+    return requested and has_support_gguf;
+}
 
 pub const Ds4Engine = struct {
     allocator: std.mem.Allocator,
@@ -234,6 +249,16 @@ pub const Ds4Engine = struct {
         const mtp_z: ?[:0]u8 = if (opts.mtp_path) |p| (allocator.dupeSentinel(u8, p, 0) catch return Error.OutOfMemory) else null;
         errdefer if (mtp_z) |s| allocator.free(s);
 
+        const dspark_on = dsparkEffective(opts.dspark, mtp_z != null);
+        if (opts.dspark and !dspark_on) {
+            log.warn("[ds4] DSpark requested but no support GGUF found beside the model — serving without it\n", .{});
+        } else if (dspark_on) {
+            // Engagement line (the silent-fallback class): the engine still
+            // decides support-kind from the GGUF's tensors and logs its own
+            // detection; this pins that WE armed the runtime.
+            log.info("[ds4] DSpark runtime armed (support GGUF: {s})\n", .{opts.mtp_path.?});
+        }
+
         var options = ffi.EngineOptions{
             .model_path = path_z.ptr,
             .mtp_path = if (mtp_z) |s| s.ptr else null,
@@ -241,6 +266,7 @@ pub const Ds4Engine = struct {
             .n_threads = opts.n_threads,
             .mtp_draft_tokens = opts.mtp_draft_tokens,
             .mtp_margin = opts.mtp_margin,
+            .dspark = dspark_on,
             .directional_steering_file = null,
             .directional_steering_attn = 0,
             .directional_steering_ffn = 0,
@@ -569,6 +595,17 @@ const TokenHolder = struct {
         self.allocator.free(self.buf);
     }
 };
+
+test "dsparkEffective: DSpark arms only with a support GGUF present" {
+    // The engine hard-errors open() on `--dspark` without `--mtp FILE`, so a
+    // dspark request with no sidecar on disk must degrade to a logged serial
+    // boot, never a failed boot (a launcher that refuses to start over a
+    // missing OPTIONAL accelerator is worse than one that serves without it).
+    try std.testing.expect(dsparkEffective(true, true));
+    try std.testing.expect(!dsparkEffective(true, false));
+    try std.testing.expect(!dsparkEffective(false, true));
+    try std.testing.expect(!dsparkEffective(false, false));
+}
 
 test "clampSessionCtx: unset (0) → ds4 default" {
     try std.testing.expectEqual(ds4_default_ctx, clampSessionCtx(0));

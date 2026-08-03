@@ -60,6 +60,29 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertNil(DownloadManager.existingModelDir(rootDir: tempRoot, repoId: "nobody/missing"))
     }
 
+    // MARK: - GGUF sidecar classification (mirror of Zig isGgufSidecarBasename)
+
+    /// The classifier decides which `.gguf` files in a repo folder are
+    /// selectable chat quants — anything not filtered becomes a tray entry
+    /// the server can only fail to load. Must stay in sync with the Zig
+    /// `model_discovery.isGgufSidecarBasename`.
+    func testGgufSidecarClassification() {
+        // mmproj + tokenizer + legacy MTP draft head.
+        XCTAssertTrue(DownloadManager.isGgufSidecar("mmproj-gemma-4-E4B-it-BF16.gguf"))
+        XCTAssertTrue(DownloadManager.isGgufSidecar("qwen3-tts-tokenizer-f16.gguf"))
+        XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"))
+        // DSpark support GGUF (0731's replacement for the MTP sidecar,
+        // upstream `DeepSeek-V4-Flash-DSpark-support.gguf`): its name starts
+        // with "deepseek-v4-flash", so unfiltered it classifies as a
+        // servable chat quant via ggufModelType.
+        XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-DSpark-support.gguf"))
+        // Real chat quants stay servable — including names that merely
+        // contain the letters without the delimited token.
+        XCTAssertFalse(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"))
+        XCTAssertFalse(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-dsparkle-chat.gguf"))
+        XCTAssertFalse(DownloadManager.isGgufSidecar("gemma-4-E4B-it-Q4_K_M.gguf"))
+    }
+
     // MARK: - File selection (recursive tree, incl. mtp/ sidecar)
 
     /// Regression for the silent MTP-sidecar drop: a model download must pull
