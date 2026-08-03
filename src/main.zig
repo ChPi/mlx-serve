@@ -84,6 +84,9 @@ fn printUsage(io: std.Io) void {
         \\  --host <ip>         Bind address (default: 0.0.0.0)
         \\  --port <n>          Bind port (default: 11234)
         \\  --ctx-size <n>      Maximum context length (default: model max)
+        \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
+        \\                      (default auto = the model's declared window; over-limit
+        \\                      inputs get a 400 naming index/count/limit, never truncation)
         \\  --prompt <text>     Run single prompt (interactive mode)
         \\  --stream            Stream tokens as they are generated (with --prompt)
         \\  --max-tokens <n>    Max tokens to generate (default: 100)
@@ -504,6 +507,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
             ctx_size = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--embedding-max-length") and i + 1 < args.len) {
+            i += 1;
+            // Module global (like --max-concurrent): every serve path reads it,
+            // so a hand-rolled ServerConfig can't eat it (the runHeadlessServe
+            // class). "auto" = 0 = bound only by the model's declared window.
+            server_mod.embedding_max_length = if (std.mem.eql(u8, args[i], "auto"))
+                0
+            else
+                try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout = try std.fmt.parseInt(u32, args[i], 10);

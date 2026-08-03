@@ -323,7 +323,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `GET /health` — health check
 - `GET /v1/models` — list loaded models with capabilities + engine info
 - `POST /v1/completions` — text completions
-- `POST /v1/embeddings` — text embeddings (BERT and encoder-only models)
+- `POST /v1/embeddings` — text embeddings (BERT, EmbeddingGemma, and last-token pooling models like Qwen3-Embedding; pooling follows the checkpoint's sentence-transformers metadata)
 - `POST /v1/images/generations`, `POST /v1/images/edits` — image generation and instruction edits; the edits endpoint speaks the OpenAI SDK's multipart shape (`client.images.edit`), including repeated `image[]` for multi-reference
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` — fetch / delete stored responses
 

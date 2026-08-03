@@ -193,6 +193,36 @@ GEN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 "$BASE/v1/chat/completio
 check "chat completion on encoder-only model returns 400" \
     "$([ "$GEN_CODE" = "400" ] && echo 1 || echo 0)" "got HTTP $GEN_CODE"
 
+# --- 4b. pooling signal + embedding input ceiling (issues #116/#117) ---
+# bge-small is a CLS-pooling BERT (its card sets pooling_mode_cls_token); the
+# mlx-community conversion ships no pooling metadata, so the known-family name
+# fallback must engage — the boot log is the observable.
+if [ "$(basename "$EMBED_MODEL")" = "bge-small-en-v1.5-8bit" ]; then
+    check "CLS pooling inferred from checkpoint name at load (issue #116)" \
+        "$(grep -q 'pooling inferred from checkpoint name: cls' /tmp/test_embeddings_server.log && echo 1 || echo 0)"
+fi
+
+# Ready model surfaces the effective embedding input ceiling (issue #117):
+# with no --embedding-max-length flag, auto = the model's declared window.
+META_LIMIT=$(curl -s -m 30 "$BASE/v1/models" | python3 -c "
+import json, sys
+for m in json.load(sys.stdin)['data']:
+    meta = m.get('meta') or {}
+    if m.get('state') == 'ready' and meta.get('embedding_max_length') is not None:
+        print(meta['embedding_max_length']); break
+")
+check "ready encoder advertises meta.embedding_max_length (auto = model window)" \
+    "$([ -n "$META_LIMIT" ] && [ "$META_LIMIT" -gt 0 ] && echo 1 || echo 0)" "got '$META_LIMIT'"
+
+# Over-window input: an explicit structured 400 naming the input index and
+# both counts — never a silent truncation (issue #117). 600 words > any
+# BERT-class 512 window; the index must identify the SECOND input.
+LONG_INPUT=$(python3 -c "print(' '.join(['tokenized']*600))")
+OVER_RESP=$(embed "[\"short one\", \"$LONG_INPUT\"]")
+check "over-limit input earns a 400 naming index + counts (issue #117)" \
+    "$(echo "$OVER_RESP" | grep -q 'Input at index 1 exceeds the maximum embedding input length' && echo 1 || echo 0)" \
+    "$(echo "$OVER_RESP" | head -c 200)"
+
 stop_server
 
 # --- 5. hot-load encoder alongside a chat default ---

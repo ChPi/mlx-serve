@@ -6142,7 +6142,8 @@ pub fn isDegenerateTailLoopRange(tokens: []const u32, min_period: usize, max_per
     return false;
 }
 
-/// Compute mean-pooled, L2-normalized embedding from token IDs.
+/// Compute a pooled (per the model's `pooling_mode` — mean by default),
+/// L2-normalized embedding from token IDs.
 /// Returns a float32 array of shape [hidden_size]. Caller must free the returned slice.
 pub fn computeEmbedding(
     allocator: std.mem.Allocator,
@@ -6158,6 +6159,31 @@ pub fn computeEmbedding(
 /// GPU batch-size cap for encoder embedding forwards: bounds padded-batch
 /// memory while keeping the GPU saturated.
 pub const EMBED_MAX_BATCH: usize = 64;
+
+/// Padded-token budget per embedding sub-batch (issue #117): the item cap
+/// alone lets ONE long input inflate the whole padded allocation (64 rows
+/// padded to a 32K outlier = 2M positions of hidden state). The budget bounds
+/// rows × padded length at the historical worst case (64 rows × 512 — every
+/// legacy BERT batch is unchanged); long-context inputs simply ride smaller
+/// sub-batches. A single over-budget input still runs, alone.
+pub const EMBED_TOKEN_BUDGET: usize = EMBED_MAX_BATCH * 512;
+
+/// End index (exclusive) of the embedding sub-batch starting at `start`:
+/// grows while under BOTH the item cap and the padded-footprint budget
+/// (rows × running max length). Always takes at least one item, so an input
+/// longer than the whole budget is processed rather than looping forever.
+/// Input order is preserved — sub-batches are contiguous slices.
+pub fn embedSubBatchEnd(seqs: []const []const u32, start: usize, max_items: usize, budget: usize) usize {
+    var end = start;
+    var max_len: usize = 0;
+    while (end < seqs.len and end - start < max_items) {
+        const grown_max = @max(max_len, seqs[end].len);
+        if (end > start and (end - start + 1) * grown_max > budget) break;
+        max_len = grown_max;
+        end += 1;
+    }
+    return end;
+}
 
 /// One padded batch of token sequences ready for an encoder forward.
 pub const PaddedBatch = struct {
@@ -6251,6 +6277,42 @@ pub fn maskedMeanPoolNormalize(allocator: std.mem.Allocator, hidden: mlx.mlx_arr
     return l2NormalizeRows(allocator, pooled, s);
 }
 
+/// Single-position pooling (issue #116): select ONE hidden row per batch
+/// element — the CLS token (position 0; bge/mxbai) or the last real,
+/// non-padding token (`lengths[b]-1`; Qwen3-Embedding). Same one-hot
+/// weighted-sum shape as `maskedMeanPool`, so padded garbage can never leak
+/// and a bf16 hidden is promoted to f32 by the weights. Returns the pooled
+/// [B, H] mlx array; caller frees.
+pub fn gatherTokenPool(allocator: std.mem.Allocator, hidden: mlx.mlx_array, lengths: []const usize, mode: model_mod.PoolingMode, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(hidden);
+    const batch: usize = @intCast(shape[0]);
+    const seq_len: usize = @intCast(shape[1]);
+
+    const wbuf = try allocator.alloc(f32, batch * seq_len);
+    defer allocator.free(wbuf);
+    @memset(wbuf, 0);
+    for (lengths, 0..) |len, b| {
+        const pos: usize = switch (mode) {
+            .cls => 0,
+            .last_token => @max(len, 1) - 1,
+            .mean => return error.InvalidPoolingMode,
+        };
+        wbuf[b * seq_len + @min(pos, seq_len - 1)] = 1.0;
+    }
+    const wshape = [_]c_int{ shape[0], shape[1], 1 };
+    const weights = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(weights);
+
+    var weighted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weighted);
+    try mlx.check(mlx.mlx_multiply(&weighted, hidden, weights, s));
+
+    var pooled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_sum_axis(&pooled, weighted, 1, false, s)); // [B, H]
+    return pooled;
+}
+
 /// L2-normalize each row of `pooled` [B, H] and read out as owned f32 rows.
 pub fn l2NormalizeRows(allocator: std.mem.Allocator, pooled: mlx.mlx_array, s: mlx.mlx_stream) ![][]f32 {
     const pshape = mlx.getShape(pooled);
@@ -6315,7 +6377,7 @@ pub fn computeEmbeddingsBatch(
     }
     var start: usize = 0;
     while (start < seqs.len) {
-        const sub = seqs[start..@min(start + EMBED_MAX_BATCH, seqs.len)];
+        const sub = seqs[start..embedSubBatchEnd(seqs, start, EMBED_MAX_BATCH, EMBED_TOKEN_BUDGET)];
         var pb = try buildPaddedBatch(allocator, sub);
         defer pb.deinit(allocator);
 
@@ -6333,15 +6395,20 @@ pub fn computeEmbeddingsBatch(
         const hidden = try xfm.forwardEmbeddingMasked(input, mask);
         defer _ = mlx.mlx_array_free(hidden);
 
-        // Sentence-transformers pipeline order: pool → dense head (when the
-        // checkpoint ships one — EmbeddingGemma) → normalize.
+        // Sentence-transformers pipeline order: pool (per the checkpoint's
+        // declared mode — mean by default, CLS for bge/mxbai, last-token for
+        // Qwen3-Embedding) → dense head (when the checkpoint ships one —
+        // EmbeddingGemma) → normalize.
+        const pooled = switch (xfm.config.effectivePooling()) {
+            .mean => try maskedMeanPool(allocator, hidden, pb.lengths, xfm.s),
+            .cls, .last_token => |m| try gatherTokenPool(allocator, hidden, pb.lengths, m, xfm.s),
+        };
+        defer _ = mlx.mlx_array_free(pooled);
         const rows = if (xfm.hasEmbedProjection()) blk: {
-            const pooled = try maskedMeanPool(allocator, hidden, pb.lengths, xfm.s);
-            defer _ = mlx.mlx_array_free(pooled);
             const projected = try xfm.embedProjection(pooled);
             defer _ = mlx.mlx_array_free(projected);
             break :blk try l2NormalizeRows(allocator, projected, xfm.s);
-        } else try maskedMeanPoolNormalize(allocator, hidden, pb.lengths, xfm.s);
+        } else try l2NormalizeRows(allocator, pooled, xfm.s);
         defer allocator.free(rows);
         for (rows, 0..) |r, i| {
             results[start + i] = r;
@@ -8360,6 +8427,77 @@ test "maskedMeanPoolNormalize excludes padded positions and unit-normalizes" {
     // Row 1: mean of (0,2),(0,4),(0,6) = (0,4) → normalized (0, 1).
     try testing.expectApproxEqAbs(@as(f32, 0.0), rows[1][0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 1.0), rows[1][1], 1e-4);
+}
+
+test "embedSubBatchEnd: item cap, padded-footprint budget, oversize singleton, order" {
+    const short = [_]u32{ 1, 2 };
+    const long: [600]u32 = @splat(0);
+    // Item cap alone (all short): full batch.
+    const all_short = [_][]const u32{ &short, &short, &short };
+    try testing.expectEqual(@as(usize, 3), embedSubBatchEnd(&all_short, 0, 64, 64 * 512));
+    try testing.expectEqual(@as(usize, 2), embedSubBatchEnd(&all_short, 0, 2, 64 * 512));
+
+    // One long input caps how many rows pad to its length: 600-token rows fit
+    // budget/600 = 54 per sub-batch at the default budget, not 64.
+    const many_long: [60][]const u32 = @splat(&long);
+    const end = embedSubBatchEnd(&many_long, 0, 64, 64 * 512);
+    try testing.expectEqual(@as(usize, (64 * 512) / 600), end);
+
+    // A mixed batch stops BEFORE a long input would inflate the padded
+    // footprint of everything before it.
+    const mixed = [_][]const u32{ &short, &short, &long };
+    const mixed_end = embedSubBatchEnd(&mixed, 0, 64, 4);
+    try testing.expectEqual(@as(usize, 2), mixed_end);
+
+    // An input larger than the whole budget still runs — alone.
+    const huge: [40000]u32 = @splat(0);
+    const with_huge = [_][]const u32{ &huge, &short };
+    try testing.expectEqual(@as(usize, 1), embedSubBatchEnd(&with_huge, 0, 64, 64 * 512));
+    // ...and the next sub-batch starts right after it (order preserved).
+    try testing.expectEqual(@as(usize, 2), embedSubBatchEnd(&with_huge, 1, 64, 64 * 512));
+}
+
+test "gatherTokenPool: cls takes position 0, last_token takes the last real position" {
+    const s = mlx.gpuStream();
+    // hidden [2, 3, 2]; row 0 has 2 real positions (position 2 is pad garbage
+    // that must never be selected), row 1 has 3.
+    const data = [_]f32{
+        1, 0, 3, 4, 100, 100,
+        0, 2, 0, 4, 0,   6,
+    };
+    const shape = [_]c_int{ 2, 3, 2 };
+    const hidden = mlx.mlx_array_new_data(&data, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(hidden);
+    const lengths = [_]usize{ 2, 3 };
+
+    const cls = try gatherTokenPool(testing.allocator, hidden, &lengths, .cls, s);
+    defer _ = mlx.mlx_array_free(cls);
+    try testing.expectEqualSlices(c_int, &[_]c_int{ 2, 2 }, mlx.getShape(cls));
+    try mlx.check(mlx.mlx_array_eval(cls));
+    const cls_data = mlx.mlx_array_data_float32(cls).?;
+    try testing.expectEqual(@as(f32, 1), cls_data[0]); // hidden[0,0,:]
+    try testing.expectEqual(@as(f32, 0), cls_data[1]);
+    try testing.expectEqual(@as(f32, 0), cls_data[2]); // hidden[1,0,:]
+    try testing.expectEqual(@as(f32, 2), cls_data[3]);
+
+    const last = try gatherTokenPool(testing.allocator, hidden, &lengths, .last_token, s);
+    defer _ = mlx.mlx_array_free(last);
+    try mlx.check(mlx.mlx_array_eval(last));
+    const last_data = mlx.mlx_array_data_float32(last).?;
+    try testing.expectEqual(@as(f32, 3), last_data[0]); // hidden[0,1,:] — NOT the pad slot
+    try testing.expectEqual(@as(f32, 4), last_data[1]);
+    try testing.expectEqual(@as(f32, 0), last_data[2]); // hidden[1,2,:]
+    try testing.expectEqual(@as(f32, 6), last_data[3]);
+}
+
+test "gatherTokenPool: mean mode is not a gather — callers must dispatch it to maskedMeanPool" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 1, 2 };
+    const shape = [_]c_int{ 1, 1, 2 };
+    const hidden = mlx.mlx_array_new_data(&data, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(hidden);
+    const lengths = [_]usize{1};
+    try testing.expectError(error.InvalidPoolingMode, gatherTokenPool(testing.allocator, hidden, &lengths, .mean, s));
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

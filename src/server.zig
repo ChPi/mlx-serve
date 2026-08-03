@@ -836,6 +836,37 @@ pub var llama_kv_quant: arch_llama.LlamaKvQuant = .off;
 /// guard checks before enabling.
 pub var max_concurrent: u32 = 1;
 
+/// Issue #117: operator ceiling on per-input embedding length, in TOKENS.
+/// 0 = auto (bound only by the loaded model's declared context window). Set
+/// via `--embedding-max-length N`. Over-limit inputs earn a structured 400
+/// naming the input index, its token count and the effective limit — never a
+/// silent truncation (the Python-server `max_length=512` class). Applies to
+/// every embedding route (/v1/embeddings, /api/embed, legacy /api/embeddings
+/// — they all funnel into `handleEmbeddings`).
+pub var embedding_max_length: u32 = 0;
+
+/// Effective per-input embedding token ceiling: the tighter of the operator
+/// flag and the model's declared window (0 on either side = no bound from
+/// that side; 0 result = unbounded). A flag above the model's window clamps
+/// to the window — a 512-position BERT never accepts a 4096 override.
+pub fn embedEffectiveLimit(flag: u32, model_max: u32) u32 {
+    if (flag == 0) return model_max;
+    if (model_max == 0) return flag;
+    return @min(flag, model_max);
+}
+
+/// Overflow 400 body text: names the offending input INDEX and both counts,
+/// because the client can only fix what it can see (the contextOverflowMessage
+/// principle). bufPrint failure falls back to the bare sentence rather than
+/// sending no body (the media-gen fixed-buffer class).
+pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "Input at index {d} exceeds the maximum embedding input length: {d} tokens given, {d} allowed",
+        .{ index, tokens, limit },
+    ) catch "Input exceeds the maximum embedding input length";
+}
+
 // Plan 05: vision encoder and model id moved to `LoadedModel.vision_encoder`
 // and `LoadedModel.id`. Handlers read them off `lm`. `global_vision_encoder`
 // and `global_model_id` singletons were removed. The `discovered_models`
@@ -2130,6 +2161,9 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
             const e = entry_buf[idx];
             const template: []const u8 = if (e.chat_config) |cc| cc.chat_template else "";
             const is_encoder = if (e.config) |c| c.is_encoder_only else std.mem.eql(u8, e.arch_hint, "bert");
+            // Embedding capability is wider than encoder-ness: a pooling-
+            // contracted decoder (Qwen3-Embedding) reports it too (issue #116).
+            const has_embedding = if (e.config) |c| c.hasEmbeddingCapability() else std.mem.eql(u8, e.arch_hint, "bert");
             const has_chat = !is_encoder;
             rendered = try ollama_mod.renderShowJson(allocator, .{
                 .tag = ollamaTagEntryOf(stream.io, e),
@@ -2139,7 +2173,7 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
                 .has_tools = has_chat,
                 .has_vision = e.vision_encoder != null,
                 .has_thinking = has_chat and chatTemplateSupportsThinking(template),
-                .has_embedding = is_encoder,
+                .has_embedding = has_embedding,
             });
         }
     }
@@ -2830,7 +2864,9 @@ const ReadyCaps = struct {
     has_vision: bool = false,
     has_audio: bool = false,
     has_reasoning: bool = false,
-    is_encoder_only: bool = false,
+    /// Encoder-only (BERT/EmbeddingGemma) OR a decoder with a pooling contract
+    /// (Qwen3-Embedding) — `config.hasEmbeddingCapability()`. Issue #116.
+    has_embedding: bool = false,
     has_image_engine: bool = false,
     has_audio_engine: bool = false,
     /// Audio engine's backend is the ACE-Step music generator (advertises
@@ -2874,7 +2910,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
     if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
-    if (c.is_encoder_only) try append_cap(allocator, &caps, &n_caps, "embeddings");
+    if (c.has_embedding) try append_cap(allocator, &caps, &n_caps, "embeddings");
     // Native media-generation engines (resident).
     if (c.has_image_engine) try append_cap(allocator, &caps, &n_caps, "image");
     if (c.has_audio_engine and !c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
@@ -2992,7 +3028,7 @@ fn renderModelEntry(
             .has_vision = has_vision,
             .has_audio = has_audio,
             .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template),
-            .is_encoder_only = config.is_encoder_only,
+            .has_embedding = config.hasEmbeddingCapability(),
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
             .has_music_backend = if (entry.audio_engine) |ae| ae.backend == .music else false,
@@ -3033,8 +3069,17 @@ fn renderModelEntry(
         const gen_top_k_str = try optSamplingRecJson(allocator, u32, config.gen_top_k);
         defer allocator.free(gen_top_k_str);
 
+        // Effective embedding input ceiling (issue #117): surfaced so clients
+        // can discover the limit instead of learning it from a 400. null for
+        // models with no embedding capability; 0 = embedding-capable, unbounded.
+        const embed_limit_str = if (config.hasEmbeddingCapability())
+            try std.fmt.allocPrint(allocator, "{d}", .{embedEffectiveLimit(embedding_max_length, config.max_position_embeddings)})
+        else
+            try allocator.dupe(u8, "null");
+        defer allocator.free(embed_limit_str);
+
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -3050,6 +3095,7 @@ fn renderModelEntry(
             config.quant_bits,
             ctx_str,
             config.max_position_embeddings,
+            embed_limit_str,
             if (config.isMoe()) "true" else "false",
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
@@ -3094,6 +3140,12 @@ fn renderModelEntry(
     // encoder), so an unloaded stub may under-report those two.
     const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert") or
         (sm.found and sm.is_encoder);
+    // Decoder embedding stubs (issue #116): StubMeta's pooling signal
+    // (config key / sidecar), plus the known-family name rule for the
+    // metadata-less mlx-community conversions — the SAME `poolingFromDirName`
+    // the load path uses, so stub and loaded capability can't disagree.
+    const stub_has_embedding = (sm.found and sm.has_embedding) or
+        model_mod.poolingFromDirName(std.fs.path.basename(entry.path), entry.arch_hint) != null;
     // GGUF discovery stub (issue #59): no config.json to read StubMeta from,
     // but the embedded llama/ds4 engines always serve chat (the GGUF's own
     // template is adopted at load), so advertise the chat capability set the
@@ -3112,7 +3164,7 @@ fn renderModelEntry(
         }
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
         if (is_gguf_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"chat\",\"tool_use\",\"streaming\",\"json_schema\"]");
-        if (!sm.found or !(sm.has_chat or sm.has_vision)) break :blk try allocator.dupe(u8, "");
+        if (!sm.found or !(sm.has_chat or sm.has_vision or stub_has_embedding)) break :blk try allocator.dupe(u8, "");
         var b = std.ArrayList(u8).empty;
         errdefer b.deinit(allocator);
         try b.appendSlice(allocator, ",\"capabilities\":[");
@@ -3133,6 +3185,7 @@ fn renderModelEntry(
             try add(allocator, &b, &n, "json_schema");
         }
         if (sm.has_vision) try add(allocator, &b, &n, "vision");
+        if (stub_has_embedding) try add(allocator, &b, &n, "embeddings");
         try b.append(allocator, ']');
         break :blk try b.toOwnedSlice(allocator);
     };
@@ -3711,6 +3764,11 @@ test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
     const wrapped = try wrapEncoderIds(a, &.{ 10, 11, 12 }, 2, 1);
     defer a.free(wrapped);
     try testing.expectEqualSlices(u32, &.{ 2, 10, 11, 12, 1 }, wrapped);
+    // Qwen3-Embedding shape (issue #116): eos-only append — the reference
+    // pools the appended <|endoftext|> position, so the id must be there.
+    const eos_only = try wrapEncoderIds(a, &.{ 10, 11 }, null, 151643);
+    defer a.free(eos_only);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 151643 }, eos_only);
 
     // Missing specials are skipped, never invented.
     const no_bos = try wrapEncoderIds(a, &.{ 10, 11 }, null, 1);
@@ -3828,9 +3886,38 @@ fn handleEmbeddings(
                 config.bos_token_id,
                 if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
             );
+        } else if (config.effectivePooling() == .last_token) blk: {
+            // Last-token pooling models pool an APPENDED terminator: the
+            // Qwen3-Embedding tokenizer's TemplateProcessing post-processor
+            // adds <|endoftext|> (the config's eos_token_id) to every encode,
+            // and the reference pools THAT position — without it, we'd pool
+            // the final text token and quietly diverge from the model card.
+            defer allocator.free(raw_ids);
+            break :blk try wrapEncoderIds(
+                allocator,
+                raw_ids,
+                null,
+                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+            );
         } else raw_ids;
         total_tokens += ids.len;
         try seqs.append(allocator, ids);
+    }
+
+    // Issue #117: enforce the effective per-input token ceiling BEFORE the
+    // forward pass — the server owns the exact tokenizer, so the counts here
+    // are authoritative. Over-limit is an explicit 400, never truncation.
+    const embed_limit = embedEffectiveLimit(embedding_max_length, config.max_position_embeddings);
+    if (embed_limit > 0) {
+        for (seqs.items, 0..) |ids, idx| {
+            if (ids.len > embed_limit) {
+                var msg_buf: [160]u8 = undefined;
+                const msg = embedOverflowMessage(&msg_buf, idx, ids.len, embed_limit);
+                log.warn("  embedding input {d} over limit: {d} > {d}\n", .{ idx, ids.len, embed_limit });
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
+                return;
+            }
+        }
     }
 
     // Phase A: route through scheduler when available so the encoder
@@ -13394,6 +13481,43 @@ test "isTextGenRoute covers exactly the guarded surfaces" {
     try std.testing.expect(!isTextGenRoute("POST", "/v1/embeddings"));
     try std.testing.expect(!isTextGenRoute("POST", "/api/embed"));
     try std.testing.expect(!isTextGenRoute("GET", "/v1/models"));
+}
+
+test "embedEffectiveLimit: tighter of flag and model window; zeros mean unbounded" {
+    // Auto (no flag): the model's window rules; a windowless model is unbounded.
+    try std.testing.expectEqual(@as(u32, 512), embedEffectiveLimit(0, 512));
+    try std.testing.expectEqual(@as(u32, 0), embedEffectiveLimit(0, 0));
+    // Operator override: enforced when tighter…
+    try std.testing.expectEqual(@as(u32, 1024), embedEffectiveLimit(1024, 32768));
+    // …and clamped to the model's declared window when looser — a 512-position
+    // BERT never accepts a 4096 override (issue #117 acceptance case).
+    try std.testing.expectEqual(@as(u32, 512), embedEffectiveLimit(4096, 512));
+    // Flag against a windowless model still binds.
+    try std.testing.expectEqual(@as(u32, 2048), embedEffectiveLimit(2048, 0));
+}
+
+test "embedOverflowMessage: names the input index and both counts" {
+    var buf: [160]u8 = undefined;
+    const msg = embedOverflowMessage(&buf, 3, 1301, 1024);
+    try std.testing.expectEqualStrings(
+        "Input at index 3 exceeds the maximum embedding input length: 1301 tokens given, 1024 allowed",
+        msg,
+    );
+}
+
+test "readyCapsJson: embeddings capability — encoders alone, decoders beside chat" {
+    const a = std.testing.allocator;
+    // Encoder-only (BERT/EmbeddingGemma): embeddings, nothing else.
+    var enc = try readyCapsJson(a, .{ .has_embedding = true });
+    defer enc.deinit(a);
+    try std.testing.expectEqualStrings("[\"embeddings\"]", enc.items);
+    // A pooling-contracted decoder (Qwen3-Embedding, issue #116) keeps its
+    // chat set AND advertises embeddings — a READY model never advertises
+    // less capability than its stub.
+    var both = try readyCapsJson(a, .{ .has_chat = true, .has_embedding = true });
+    defer both.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, both.items, "\"chat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, both.items, "\"embeddings\"") != null);
 }
 
 test "readyCapsJson: every resident media engine surfaces its capability (mesh -> 3d)" {

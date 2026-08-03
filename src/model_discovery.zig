@@ -853,6 +853,12 @@ pub const StubMeta = struct {
     /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
     /// advertises "embeddings" and no chat capabilities.
     is_encoder: bool = false,
+    /// Embedding capability (issue #116): every encoder, PLUS a decoder with a
+    /// declared pooling contract (config.json `pooling_mode`, or — added by
+    /// `readStubMeta` — a `1_Pooling/config.json` sidecar). The name-based
+    /// fallback for metadata-less checkpoints lives at the server's stub-cap
+    /// site via `model.poolingFromDirName` (one shared rule, no copy here).
+    has_embedding: bool = false,
 };
 
 fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
@@ -932,6 +938,10 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     };
     meta.is_encoder = std.mem.eql(u8, mt, "bert") or bidirectional;
     meta.has_chat = has_chat_template and !meta.is_encoder;
+    meta.has_embedding = meta.is_encoder;
+    if (root.get("pooling_mode")) |v| {
+        if (v == .string) meta.has_embedding = true;
+    }
     return meta;
 }
 
@@ -956,7 +966,16 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .{};
     defer allocator.free(bytes);
 
-    return parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
+    var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
+    // A sentence-transformers pooling sidecar marks embedding capability even
+    // when config.json says nothing (the load path parses its mode; the stub
+    // only needs existence). Issue #116.
+    if (meta.found and !meta.has_embedding) {
+        if (dir.statFile(io, "1_Pooling/config.json", .{})) |st| {
+            if (st.kind == .file) meta.has_embedding = true;
+        } else |_| {}
+    }
+    return meta;
 }
 
 /// True if the model dir ships a chat template — a `chat_template.jinja` file,
@@ -1486,6 +1505,21 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         const m = parseStubMeta(a, "{\"model_type\":\"bert\",\"hidden_size\":384}", true);
         try testing.expect(!m.has_chat);
         try testing.expect(m.is_encoder);
+        try testing.expect(m.has_embedding);
+    }
+    // Decoder embedding checkpoint (issue #116): an explicit `pooling_mode`
+    // marks embeddings capability WITHOUT turning the stub into an encoder —
+    // Qwen3-Embedding keeps its causal arch (and its chat template).
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560,\"pooling_mode\":\"last_token\"}", true);
+        try testing.expect(m.has_embedding);
+        try testing.expect(!m.is_encoder);
+        try testing.expect(m.has_chat);
+    }
+    // A plain chat qwen3 advertises no embeddings capability.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560}", true);
+        try testing.expect(!m.has_embedding);
     }
     // Bidirectional embedding model (EmbeddingGemma): a gemma3_text config
     // with use_bidirectional_attention — the stub must advertise embeddings,
