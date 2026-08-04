@@ -25,6 +25,7 @@ const acestep = @import("acestep.zig");
 const kokoro = @import("kokoro.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
+const minimax_h3 = @import("minimax_h3.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -79,6 +80,21 @@ pub const Modality = enum {
 /// (stub) config's `model_type`, so it must accept the markers from
 /// `Modality.modelType` AND the raw config strings discovery peeks
 /// ("flux2-klein-4b", "qwen3_tts", "AudioVideo").
+/// Every media `model_type` this server serves. The ONE list the two
+/// duplicated predicates below are checked against.
+///
+/// `model_discovery.isMediaModelType` cannot call `modalityFromType` — that
+/// module stays filesystem-only so it never pulls in mlx — so the duplication
+/// is deliberate and documented. What was missing was a guard: `minimax_h3`
+/// was registered here and NOT there, so discovery rejected the model with
+/// "unsupported model_type" while the engine that serves it was ready and
+/// waiting. The test at the bottom of this file pins them together.
+pub const media_model_types = [_][]const u8{
+    "flux2",     "krea",      "mage_flow", "mageflow",
+    "qwen3_tts", "acestep",   "kokoro",    "AudioVideo",
+    "hunyuan3d", "minimax_h3",
+};
+
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
@@ -87,6 +103,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     return null;
 }
@@ -195,16 +212,36 @@ fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// for a regular LM/embedding arch. The video (LTX "AudioVideo") branch
 /// additionally requires `connector.safetensors` so a generic "AudioVideo"
 /// config without the LTX bundle isn't misrouted.
+/// A file that must be present for `model_type` to be accepted as that media
+/// backend, or null when the `model_type` alone is sufficient.
+///
+/// This is keyed on the TYPE, not the modality. It used to be
+/// `if (modality == .video) require connector.safetensors` — a marker that
+/// belongs to LTX only. The moment a second video backend existed, that guard
+/// rejected it, `detectModality` returned null, and the loader fell through to
+/// the MLX TEXT path: it globbed all four of MiniMax-H3's safetensors into one
+/// weight map and died on `model.norm.weight`. A per-MODALITY guard cannot
+/// survive a modality growing a second backend.
+pub fn requiredMarkerFor(model_type: []const u8) ?[]const u8 {
+    // LTX: distinguishes the real bundle from any other "AudioVideo" config
+    // and proves the text path can load.
+    if (std.mem.eql(u8, model_type, "AudioVideo")) return "connector.safetensors";
+    // MiniMax-H3: our converted layout always writes this next to config.json.
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
+    return null;
+}
+
 pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?Modality {
     const mt = peekModelType(io, allocator, model_dir) orelse return null;
     defer allocator.free(mt);
     const modality = modalityFromType(mt) orelse return null;
-    if (modality == .video) {
-        // Require the connector — distinguishes the LTX bundle from any other
-        // "AudioVideo" config and ensures the text path can load.
-        const conn_path = std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{model_dir}, 0) catch return null;
-        defer allocator.free(conn_path);
-        if (!fileExists(io, conn_path)) return null;
+    if (requiredMarkerFor(mt)) |marker| {
+        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return null;
+        defer allocator.free(p);
+        if (!fileExists(io, p)) {
+            log.warn("[gen] {s} at {s} is missing {s}; not treating it as a media model\n", .{ mt, model_dir, marker });
+            return null;
+        }
     }
     return modality;
 }
@@ -866,7 +903,80 @@ pub const TransformerVariant = enum {
 /// stream; the forward graph runs on the GPU stream. The 11 GB transformer slot
 /// holds ONE variant at a time; `ensureTransformer` swaps it (deinit + reload)
 /// so dev + distilled are never resident together.
+/// The `.video` modality slot, one arm per backend — the same shape
+/// `ImageEngine` uses for flux|krea|mage_flow. Adding a backend is one arm plus
+/// an impl file; every call site holds `*VideoEngine` and dispatches here.
 pub const VideoEngine = struct {
+    allocator: std.mem.Allocator,
+    backend: union(enum) {
+        ltx: *LtxVideoEngine,
+        h3: *H3VideoEngine,
+    },
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
+        const self = try allocator.create(VideoEngine);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .backend = undefined };
+        if (peekModelType(io, allocator, model_dir)) |mt| {
+            defer allocator.free(mt);
+            if (std.mem.eql(u8, mt, "minimax_h3")) {
+                self.backend = .{ .h3 = try H3VideoEngine.load(allocator, model_dir) };
+                return self;
+            }
+        }
+        self.backend = .{ .ltx = try LtxVideoEngine.load(io, allocator, model_dir) };
+        return self;
+    }
+
+    pub fn deinit(self: *VideoEngine) void {
+        switch (self.backend) {
+            .ltx => |e| e.deinit(),
+            .h3 => |e| e.deinit(),
+        }
+        self.allocator.destroy(self);
+    }
+
+    /// LoRA is an LTX-only capability; H3 ships no adapter format, so this is a
+    /// NAMED refusal rather than a silent no-op that reports a match count of 0.
+    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
+        return switch (self.backend) {
+            .ltx => |e| e.setLora(path, scale),
+            .h3 => if (path == null) 0 else error.LoraUnsupported,
+        };
+    }
+};
+
+/// MiniMax-H3 video+audio. Holds only paths: `minimax_h3.generate` stages the
+/// text encoder and the DiT sequentially because they cannot both be resident,
+/// so there is nothing useful to keep loaded between requests.
+pub const H3VideoEngine = struct {
+    allocator: std.mem.Allocator,
+    model_dir: []u8,
+
+    pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
+        const self = try allocator.create(H3VideoEngine);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .model_dir = try allocator.dupe(u8, model_dir) };
+        return self;
+    }
+
+    pub fn deinit(self: *H3VideoEngine) void {
+        self.allocator.free(self.model_dir);
+        self.allocator.destroy(self);
+    }
+
+    pub fn paths(self: *const H3VideoEngine, a: std.mem.Allocator) !minimax_h3.GenPaths {
+        return .{
+            .tokenizer_dir = self.model_dir,
+            .text_encoder = try std.fmt.allocPrint(a, "{s}/text_encoder.safetensors", .{self.model_dir}),
+            .dit = try std.fmt.allocPrint(a, "{s}/transformer.safetensors", .{self.model_dir}),
+            .vae = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{self.model_dir}),
+            .audio_vae = try std.fmt.allocPrint(a, "{s}/audio_vae.safetensors", .{self.model_dir}),
+        };
+    }
+};
+
+pub const LtxVideoEngine = struct {
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     transformer: ltx.Component,
@@ -887,8 +997,8 @@ pub const VideoEngine = struct {
     lora_scale: f32 = 1.0,
     lora_matched: u32 = 0,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
-        const self = try allocator.create(VideoEngine);
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*LtxVideoEngine {
+        const self = try allocator.create(LtxVideoEngine);
         errdefer allocator.destroy(self);
         self.* = undefined;
         self.allocator = allocator;
@@ -945,7 +1055,7 @@ pub const VideoEngine = struct {
         return self;
     }
 
-    fn hasVariant(self: *VideoEngine, io: std.Io, variant: TransformerVariant) bool {
+    fn hasVariant(self: *LtxVideoEngine, io: std.Io, variant: TransformerVariant) bool {
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, variant.fileName() }, 0) catch return false;
         return fileExists(io, p);
@@ -954,7 +1064,7 @@ pub const VideoEngine = struct {
     /// Swap the transformer slot to `want` (no-op when already loaded). The old
     /// component is freed BEFORE the new one loads so dev + distilled (11 GB
     /// each) never coexist.
-    pub fn ensureTransformer(self: *VideoEngine, want: TransformerVariant) !void {
+    pub fn ensureTransformer(self: *LtxVideoEngine, want: TransformerVariant) !void {
         if (self.transformer_variant == want) return;
         log.info("[video] swapping transformer: {s} -> {s}\n", .{ @tagName(self.transformer_variant), @tagName(want) });
         self.transformer.deinit();
@@ -970,7 +1080,7 @@ pub const VideoEngine = struct {
     /// `path == null` detaches; the same path+scale is a no-op reuse; a new
     /// path/scale loads + installs on the transformer Component. Returns the
     /// number of adapter modules present in the DiT.
-    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
+    pub fn setLora(self: *LtxVideoEngine, path: ?[]const u8, scale: f32) !u32 {
         if (path) |p| {
             if (self.lora_path) |cur| {
                 if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
@@ -993,7 +1103,7 @@ pub const VideoEngine = struct {
         return 0;
     }
 
-    fn clearLora(self: *VideoEngine) void {
+    fn clearLora(self: *LtxVideoEngine) void {
         self.transformer.lora = null;
         if (self.lora_file) |*lf| lf.deinit();
         self.lora_file = null;
@@ -1002,13 +1112,13 @@ pub const VideoEngine = struct {
         self.lora_matched = 0;
     }
 
-    fn applyLora(self: *VideoEngine) void {
+    fn applyLora(self: *LtxVideoEngine) void {
         self.transformer.lora = if (self.lora_file) |*lf| lf else null;
         self.transformer.lora_scale = self.lora_scale;
     }
 
     /// Lazily load the spatial-x2 upsampler for the two-stage boundary.
-    pub fn ensureUpsampler(self: *VideoEngine, io: std.Io) !*const ltx.Component {
+    pub fn ensureUpsampler(self: *LtxVideoEngine, io: std.Io) !*const ltx.Component {
         if (self.upsampler) |*u| return u;
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }, 0) catch return error.MissingUpsampler;
@@ -1022,7 +1132,7 @@ pub const VideoEngine = struct {
         return &self.upsampler.?;
     }
 
-    pub fn deinit(self: *VideoEngine) void {
+    pub fn deinit(self: *LtxVideoEngine) void {
         self.clearLora();
         self.transformer.deinit();
         self.connector.deinit();
@@ -1331,6 +1441,26 @@ fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
 /// source window matching the target's aspect ratio — the image is never
 /// stretched; mismatched aspects lose edges to a center crop instead of
 /// distorting the subject. Returns null on decode failure.
+/// [1,3,H,W] in [0,1] (decodeImageToBCHW's cover output) -> [1,3,1,H,W] in
+/// [-1,1] f32 — the shape/range MiniMax-H3's keyframe encoder consumes.
+fn unitToPm1BCFHW(bchw: mlx.mlx_array, target_h: u32, target_w: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const two = mlx.mlx_array_new_float(2.0);
+    defer _ = mlx.mlx_array_free(two);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, bchw, two, s));
+    var pm1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pm1);
+    try mlx.check(mlx.mlx_subtract(&pm1, scaled, one, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const shape5 = [_]c_int{ 1, 3, 1, @intCast(target_h), @intCast(target_w) };
+    try mlx.check(mlx.mlx_reshape(&out, pm1, &shape5, 5, s));
+    return out;
+}
+
 fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32) ?mlx.mlx_array {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -2106,10 +2236,58 @@ pub fn videoGuiderDefaults(pipeline: VideoPipeline, cfg_video: ?f32, cfg_audio: 
     }
 }
 
+/// H3 result -> the SAME wire shape the LTX path emits (base64 rgb8 frames plus
+/// interleaved pcm_s16le), so the Swift client's existing decode and
+/// AVAssetWriter mux need no new branch.
+fn sendH3Video(allocator: std.mem.Allocator, conn: *Conn, res: *const minimax_h3.GenResult, want_stream: bool) !void {
+    const s = mlx.gpuStream();
+    const audio_mod = @import("minimax_h3_audio.zig");
+
+    // [1,3,F,H,W] in [-1,1] -> [F,H,W,3] u8
+    const rgb = try minimax_h3.pixelsToRgb8(allocator, res, s);
+    defer allocator.free(rgb);
+    log.info("[video] -> {d}f {d}x{d} ({d} rgb bytes)\n", .{ res.frame_count, res.height, res.width, rgb.len });
+
+    const b64_len = std.base64.standard.Encoder.calcSize(rgb.len);
+    const b64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, rgb);
+
+    var audio_b64: ?[]u8 = null;
+    defer if (audio_b64) |a| allocator.free(a);
+    if (res.audio) |wave| {
+        const pcm = try minimax_h3.audioToPcm16(allocator, wave, s);
+        defer allocator.free(pcm);
+        const al = std.base64.standard.Encoder.calcSize(pcm.len);
+        const ab = try allocator.alloc(u8, al);
+        _ = std.base64.standard.Encoder.encode(ab, pcm);
+        audio_b64 = ab;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const prefix = if (want_stream) "data: {\"type\":\"complete\"," else "{\"created\":0,";
+    const head = try std.fmt.allocPrint(allocator, "{s}\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":24,\"format\":\"rgb8\",\"data\":\"", .{ prefix, res.frame_count, res.height, res.width });
+    defer allocator.free(head);
+    try out.appendSlice(allocator, head);
+    try out.appendSlice(allocator, b64);
+    try out.appendSlice(allocator, "\"");
+    if (audio_b64) |ab| {
+        const ah = try std.fmt.allocPrint(allocator, ",\"audio_sample_rate\":{d},\"audio_channels\":2,\"audio_format\":\"pcm_s16le\",\"audio_data\":\"", .{audio_mod.SAMPLE_RATE});
+        defer allocator.free(ah);
+        try out.appendSlice(allocator, ah);
+        try out.appendSlice(allocator, ab);
+        try out.appendSlice(allocator, "\"");
+    }
+    try out.appendSlice(allocator, if (want_stream) "}\n\n" else "}");
+    if (want_stream) return conn.writeAll(out.items);
+    return sendBytesJson(conn, allocator, out.items);
+}
+
 /// Stage-2 transformer provider for the two-stage boundary: swaps the engine's
 /// transformer slot from dev to distilled (freeing dev first).
 const Stage2Swap = struct {
-    engine: *VideoEngine,
+    engine: *LtxVideoEngine,
 
     fn swap(ctx: *anyopaque) anyerror!*const ltx.Component {
         const self: *Stage2Swap = @ptrCast(@alignCast(ctx));
@@ -2119,6 +2297,121 @@ const Stage2Swap = struct {
 };
 
 pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *VideoEngine) !void {
+    return switch (engine.backend) {
+        .ltx => |e| handleVideoLtx(io, allocator, conn, body, e),
+        .h3 => |e| handleVideoH3(io, allocator, conn, body, e),
+    };
+}
+
+/// MiniMax-H3 text-to-audio-video.
+///
+/// The request surface is deliberately NARROWER than LTX's: H3 has no LoRA, no
+/// CFG scale and no pipeline mode, and its frame counts live on a 17k+5 ladder
+/// rather than 8N+1. Anything the client sends that this backend cannot honor
+/// is a NAMED 400 — a silently ignored field is the class the app's preset
+/// rules exist to prevent.
+fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *H3VideoEngine) !void {
+    const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
+    const prompt = try jsonUnescape(allocator, prompt_raw);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+
+    // Only LoRA is refused, because only LoRA is a request the server cannot
+    // honor in any form. `cfg_scale` / `stg_scale` / `pipeline` are NOT
+    // rejected: the app sends them unconditionally for every video backend,
+    // so 400-ing on their PRESENCE made every H3 request fail. Hiding a
+    // control is not the same as not sending the field. They are ignored,
+    // which is honest here — H3 is CFG-distilled and single-pipeline, so
+    // there is no setting they could have selected that we silently dropped.
+    if (extractJsonString(body, "lora_path")) |lp| {
+        if (lp.len > 0)
+            return sendError(conn, 400, "MiniMax-H3 has no LoRA adapter format");
+    }
+
+    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
+    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
+    const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
+    const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
+
+    if (width % 32 != 0 or height % 32 != 0)
+        return sendError(conn, 400, "width and height must be multiples of 32");
+
+    // Snap to the model's own ladder and SAY SO: silently generating a
+    // different length than asked is how a client's audio mux drifts.
+    const shape = minimax_h3.temporalShape(requested_frames);
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[video] minimax-h3 {d}x{d} {d}f (requested {d}, snapped to the 17k+5 ladder) steps={d} stream={}\n", .{ width, height, shape.frame_count, requested_frames, steps, want_stream });
+
+    // fl2va keyframes. NOT graceful (the a2vid rule: the user asked for THIS
+    // frame): an undecodable image is a named 400, never a silent t2va. The
+    // reference's resize policy per anchor: first = plain STRETCH to the
+    // canvas (the geometry anchor), last = aspect-preserving center-COVER.
+    var keyframes_buf: [2]minimax_h3.Keyframe = undefined;
+    var n_kf: usize = 0;
+    defer for (keyframes_buf[0..n_kf]) |kf| {
+        _ = mlx.mlx_array_free(kf.pixels);
+    };
+    inline for (.{ .{ "first_frame_image", minimax_h3.KeyframeAnchor.first }, .{ "last_frame_image", minimax_h3.KeyframeAnchor.last } }) |spec| {
+        if (extractJsonString(body, spec[0])) |raw_img| {
+            const b64 = try jsonUnescape(allocator, raw_img);
+            defer allocator.free(b64);
+            if (b64.len > 0) {
+                const img_bytes = base64DecodeAlloc(allocator, b64) catch
+                    return sendError(conn, 400, "keyframe image is not valid base64");
+                defer allocator.free(img_bytes);
+                const arr: ?mlx.mlx_array = switch (spec[1]) {
+                    .first => decodeImageToBCFHW(allocator, img_bytes, height, width, mlx.gpuStream()),
+                    .last => blk: {
+                        const bchw = decodeImageToBCHW(allocator, img_bytes, height, width) orelse break :blk null;
+                        defer _ = mlx.mlx_array_free(bchw);
+                        break :blk unitToPm1BCFHW(bchw, height, width, mlx.gpuStream()) catch null;
+                    },
+                };
+                if (arr == null) return sendError(conn, 400, "keyframe image could not be decoded (PNG/JPEG expected)");
+                keyframes_buf[n_kf] = .{ .anchor = spec[1], .pixels = arr.? };
+                n_kf += 1;
+                log.info("[video] minimax-h3 {s} keyframe conditioning engaged ({d}x{d})\n", .{ @tagName(spec[1]), width, height });
+            }
+        }
+    }
+
+    // Generations here run for MINUTES, so a silent socket is indistinguishable
+    // from a wedged server; the client drives its meter off these events.
+    var sctx = sse.StreamCtx{ .conn = conn };
+    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const paths = try engine.paths(allocator);
+    defer {
+        allocator.free(paths.text_encoder);
+        allocator.free(paths.dit);
+        allocator.free(paths.vae);
+        if (paths.audio_vae) |p| allocator.free(p);
+    }
+
+    var res = minimax_h3.generate(allocator, io, paths, .{
+        .prompt = prompt,
+        .width = width,
+        .height = height,
+        .frames = requested_frames,
+        .steps = steps,
+        .seed = seed,
+        .fast = sse.bodyBool(body, "fast"),
+        .keyframes = keyframes_buf[0..n_kf],
+    }, prog, mlx.gpuStream()) catch |e| {
+        log.err("[video] minimax-h3 generation failed: {any}\n", .{e});
+        // Mid-stream the headers are already out, so an error must be an SSE
+        // event, not a status line the client will never parse.
+        if (want_stream) return sse.sendError(conn, "MiniMax-H3 generation failed");
+        return sendError(conn, 500, "MiniMax-H3 generation failed");
+    };
+    defer res.deinit();
+
+    try sendH3Video(allocator, conn, &res, want_stream);
+}
+
+fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *LtxVideoEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);
@@ -2570,8 +2863,13 @@ pub fn freeStubCpuState(allocator: std.mem.Allocator, s: *StubCpuState) void {
 /// transformer/, vae/, text_encoder/; LTX keeps them top-level). Returns 0 on
 /// any read failure (treated as "unknown" → the registry skips the byte cap).
 pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
+    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
+    return sumSafetensorsIn(io, dir);
+}
+
+fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
     var total: u64 = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
@@ -2590,6 +2888,44 @@ pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
         }
     }
     return total;
+}
+
+/// MiniMax-H3's staged residency plan, as a bill: `minimax_h3.generate` loads
+/// the text encoder, runs it and FREES it before the DiT loads, so the two
+/// never coexist and the load peak is max(TE, DiT). The VAEs load after the
+/// DiT is released but are billed ADDITIVELY as the direction-safe margin for
+/// decode-phase activations — an under-bill here is an uncatchable Metal OOM.
+pub fn h3PeakBytes(te: u64, dit: u64, video_vae: u64, audio_vae: u64) u64 {
+    return @max(te, dit) + video_vae + audio_vae;
+}
+
+/// Per-backend generation-peak estimate for the media load preflight. A
+/// backend with a STAGED residency plan declares it here; every other type
+/// keeps the sum-of-safetensors default — over-billing fails safe (a refused
+/// load names its numbers), under-billing kills the process mid-request.
+pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
+    if (std.mem.eql(u8, model_type, "minimax_h3")) {
+        const sz = struct {
+            fn f(io_: std.Io, d: std.Io.Dir, name: []const u8) u64 {
+                const st = d.statFile(io_, name, .{}) catch return 0;
+                return @intCast(st.size);
+            }
+        }.f;
+        return h3PeakBytes(
+            sz(io, dir, "text_encoder.safetensors"),
+            sz(io, dir, "transformer.safetensors"),
+            sz(io, dir, "video_vae.safetensors"),
+            sz(io, dir, "audio_vae.safetensors"),
+        );
+    }
+    return sumSafetensorsIn(io, dir);
+}
+
+pub fn estimatePeakResidentBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
+    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    return estimatePeakResidentBytesIn(io, dir, model_type);
 }
 
 // ── HTTP response helpers (self-contained; mirror the old *_server.zig) ──
@@ -3521,4 +3857,87 @@ test "paint stage dir resolves from the combined single-repo layout (subdir firs
     const bare = try mkModelDir(allocator, tmp.dir, root, "bare/shape-only");
     defer allocator.free(bare);
     try testing.expect(findPaintDir(allocator, bare) == null);
+}
+
+test "media model types: discovery and modality dispatch agree" {
+    // CLASS GUARD. `model_discovery.isMediaModelType` and `modalityFromType`
+    // are documented duplication (discovery must not import mlx), and they
+    // silently drifted: `minimax_h3` was added to the dispatcher but not to
+    // discovery, so `/v1/load-model` answered
+    //   400 "Model at that path has an unsupported model_type"
+    // for a model the server could actually serve. Neither side is wrong on
+    // its own — only their DISAGREEMENT is — so the check is bidirectional.
+    for (media_model_types) |mt| {
+        try std.testing.expect(discovery.isMediaModelType(mt));
+        try std.testing.expect(modalityFromType(mt) != null);
+    }
+    // And a non-media type must be rejected by BOTH, or a chat model would be
+    // routed to a media engine.
+    for ([_][]const u8{ "gemma4", "qwen3", "llama", "deepseek_v4", "bert" }) |mt| {
+        try std.testing.expect(!discovery.isMediaModelType(mt));
+        try std.testing.expect(modalityFromType(mt) == null);
+    }
+}
+
+test "h3 staged-residency peak bills max(TE,DiT)+VAEs, never their sum" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // The TE is loaded, run and FREED before the DiT loads — they never
+    // coexist, so billing their sum refuses a 48 GB Mac that would work.
+    try std.testing.expectEqual(41 * GB, h3PeakBytes(28 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // Whichever staged component is larger sets the peak.
+    try std.testing.expectEqual(54 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // All-unknown must stay 0: the preflight treats 0 as "unknown, never block".
+    try std.testing.expectEqual(@as(u64, 0), h3PeakBytes(0, 0, 0, 0));
+}
+
+test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const b300: [300]u8 = @splat('x');
+    const b500: [500]u8 = @splat('x');
+    const b120: [120]u8 = @splat('x');
+    const b30: [30]u8 = @splat('x');
+    const b1000: [1000]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "text_encoder.safetensors", .data = &b300 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer.safetensors", .data = &b500 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "video_vae.safetensors", .data = &b120 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "audio_vae.safetensors", .data = &b30 });
+    // A file H3's residency plan never loads: billed by the default sum,
+    // never by the staged estimate.
+    try tmp.dir.writeFile(io, .{ .sub_path = "extra.safetensors", .data = &b1000 });
+
+    // H3: max(300, 500) + 120 + 30.
+    try std.testing.expectEqual(@as(u64, 650), estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    // Any other media type: the plain sum over the dir (the safe default —
+    // a backend without a declared residency plan must not under-bill).
+    try std.testing.expectEqual(@as(u64, 1950), estimatePeakResidentBytesIn(io, tmp.dir, "flux2"));
+}
+
+test "media markers are per-TYPE, not per-modality" {
+    // REGRESSION. `detectModality` guarded the whole `.video` modality on
+    // LTX's `connector.safetensors`. MiniMax-H3 has no such file, so detection
+    // returned null and the loader fell through to the MLX TEXT path — it
+    // globbed all four H3 safetensors into one weight map and failed on
+    // `model.norm.weight`, a Qwen tensor H3 does not have.
+    //
+    // The invariant: a marker belongs to a BACKEND. Requiring one backend's
+    // file from every model in its modality breaks the next backend added.
+    try std.testing.expectEqualStrings("connector.safetensors", requiredMarkerFor("AudioVideo").?);
+    try std.testing.expectEqualStrings("transformer.safetensors", requiredMarkerFor("minimax_h3").?);
+    // H3 must NOT be gated on LTX's file.
+    try std.testing.expect(!std.mem.eql(u8, requiredMarkerFor("minimax_h3").?, "connector.safetensors"));
+
+    // Every media type either declares its own marker or needs none; none may
+    // inherit another backend's.
+    for (media_model_types) |mt| {
+        if (requiredMarkerFor(mt)) |m| {
+            try std.testing.expect(m.len > 0);
+            if (!std.mem.eql(u8, mt, "AudioVideo"))
+                try std.testing.expect(!std.mem.eql(u8, m, "connector.safetensors"));
+        }
+    }
+    // A non-media type never carries one.
+    try std.testing.expect(requiredMarkerFor("gemma4") == null);
 }

@@ -53,6 +53,26 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(body["first_frame_image"])
     }
 
+    func testH3FastRecipeDefaultOnWithOffSwitch() {
+        // David's eyeball verdict on the same-seed 768p capstone pair: the
+        // fast recipe (server-side step cache + attention broadcast, 2.83x)
+        // is DEFAULT-ON, so the app sends NO field in the default case and
+        // "fast": false only when the user opts into max quality.
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 256, height: 256,
+                                  numFrames: 56, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        var body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(body["fast"], "default must ride the server's fast default, not restate it")
+        req.bestQuality = true
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(body["fast"] as? Bool, false)
+        // LTX has no fast recipe — the field never appears, toggled or not.
+        var ltx = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                  numFrames: 9, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        ltx.bestQuality = true
+        let lbody = VideoGenService.requestBody(model: "m", prompt: "p", request: ltx, firstFrameB64: nil)
+        XCTAssertNil(lbody["fast"])
+    }
+
     func testRequestBodyPipelineModeMapping() {
         func pipeline(_ mode: VideoPipelineMode) -> String? {
             let req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
@@ -812,5 +832,138 @@ final class MediaGenServiceTests: XCTestCase {
         // Editing is a trained FLUX.2 capability; Krea doesn't have it.
         XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.supportsReferenceEdit)
         XCTAssertFalse(ImageModelPreset.krea2Turbo.supportsReferenceEdit)
+    }
+}
+
+// MARK: - MiniMax-H3 declared capabilities
+
+extension MediaGenServiceTests {
+
+    /// H3 is not LTX-shaped, and the pane gates on the PRESET rather than on a
+    /// model id. Mage-Flow shipped five dead image controls before its preset
+    /// started declaring capabilities; this pins the video equivalent.
+    func testMiniMaxH3DeclaresTheCapabilitiesItActuallyHas() {
+        let h3 = VideoModelPreset.minimaxH3
+
+        // No adapter format, no guidance pass (CFG-distilled), no pipeline
+        // modes. The server answers a NAMED 400 for each, so offering them
+        // would be a control that can only fail.
+        XCTAssertFalse(h3.supportsLoRA)
+        XCTAssertFalse(h3.supportsCFG)
+        XCTAssertFalse(h3.supportsPipelineModes)
+
+        // It writes its own soundtrack jointly with the frames, so there is no
+        // audio INPUT to condition on.
+        XCTAssertFalse(h3.supportsAudioInput)
+        XCTAssertTrue(h3.generatesAudio)
+
+        // LTX keeps every capability — the defaults must not have moved.
+        let ltx = VideoModelPreset.ltx23Q4
+        XCTAssertTrue(ltx.supportsLoRA)
+        XCTAssertTrue(ltx.supportsCFG)
+        XCTAssertTrue(ltx.supportsPipelineModes)
+        XCTAssertTrue(ltx.supportsAudioInput)
+    }
+
+    /// H3's ladder is 17k+5, LTX's is 8N+1. Offering a count off the ladder
+    /// means the server snaps it and the clip is a different length than the
+    /// one requested — which silently desynchronizes an external audio mux.
+    func testMiniMaxH3FrameLadderIs17kPlus5() {
+        let h3 = VideoModelPreset.minimaxH3
+        XCTAssertFalse(h3.frameOptions.isEmpty)
+        for n in h3.frameOptions {
+            XCTAssertEqual(n % 17, 5, "\(n) is not on the 17k+5 ladder")
+            XCTAssertLessThanOrEqual(n, h3.maxFrames)
+        }
+        // Floor is 124 (the reference node's own trained-range start), not
+        // the raw ladder's mathematical floor of 5 — below it the model
+        // generates off-distribution, so the picker must not offer it.
+        XCTAssertEqual(h3.frameOptions.first, 124)
+        XCTAssertTrue(h3.frameOptions.contains(124))
+        // Ceiling is our own validated max: the frame count behind the
+        // confirmed-good rap demo at 1344x768, not the reference docs' wider
+        // (untested-by-us) 362 claim.
+        XCTAssertTrue(h3.frameOptions.contains(209))
+
+        // Every quality preset's frame count must land ON the ladder, or the
+        // Frames picker renders blank for that tier.
+        for q in QualityPreset.allCases {
+            let n = h3.settings(q).numFrames
+            XCTAssertTrue(h3.frameOptions.contains(n),
+                          "\(q) frame count \(n) is off the ladder")
+        }
+
+        // LTX's ladder is a DIFFERENT rule and must not have been changed.
+        for n in VideoModelPreset.ltx23Q4.frameOptions {
+            XCTAssertEqual(n % 8, 1, "\(n) is not on LTX's 8N+1 ladder")
+        }
+    }
+
+    /// Every H3 canvas must be a multiple of 32: the DiT patchifies 2x2 over a
+    /// 16x-compressed latent, so an off-grid size cannot be expressed.
+    func testMiniMaxH3ResolutionsAreOn32PixelGrid() {
+        for r in VideoModelPreset.minimaxH3.resolutions {
+            XCTAssertEqual(r.width % 32, 0, "width \(r.width) is off the 32 grid")
+            XCTAssertEqual(r.height % 32, 0, "height \(r.height) is off the 32 grid")
+        }
+    }
+}
+
+extension MediaGenServiceTests {
+
+    /// Every video preset's backend must be recognized as a MEDIA type, or the
+    /// browser and picker treat it as a chat model. This is the client half of
+    /// the same duplication that made `/v1/load-model` answer 400 "unsupported
+    /// model_type" for MiniMax-H3: the server-side dispatcher knew the type and
+    /// discovery did not.
+    func testEveryVideoBackendIsRecognizedAsAMediaType() {
+        XCTAssertTrue(isMediaModelType("minimax_h3"))
+        XCTAssertTrue(isMediaModelType("AudioVideo"))   // LTX
+        // A chat arch must NOT be, or it would be routed to a media engine.
+        for t in ["gemma4", "qwen3", "llama", "deepseek_v4"] {
+            XCTAssertFalse(isMediaModelType(t), "\(t) must not read as media")
+        }
+    }
+}
+
+extension MediaGenServiceTests {
+
+    /// The request must carry only what the backend declares it can honor.
+    /// REGRESSION: `pipeline` was added to the body unconditionally, so every
+    /// MiniMax-H3 generation shipped a field that backend has no concept of and
+    /// the server refused it — the pane's controls were hidden, but the request
+    /// builder had not been told.
+    func testRequestOmitsFieldsTheBackendDoesNotSupport() {
+        let h3 = VideoGenRequest(
+            model: .minimaxH3, prompt: "a cat", width: 256, height: 256,
+            numFrames: 56, fps: 24, mode: .oneStage, steps: 30,
+            cfgScale: 1.0, loraPath: "/tmp/some.safetensors")
+        // audioB64 present: a stale in-memory clip from an earlier LTX pick
+        // must never reach a backend that generates its own soundtrack.
+        let body = VideoGenService.requestBody(
+            model: "m", prompt: "a cat", request: h3,
+            firstFrameB64: nil, audioB64: "QUJD")
+
+        XCTAssertNil(body["pipeline"], "H3 has no pipeline modes")
+        XCTAssertNil(body["cfg_scale"], "H3 is CFG-distilled")
+        XCTAssertNil(body["stg_scale"])
+        XCTAssertNil(body["lora_path"], "H3 has no adapter format")
+        XCTAssertNil(body["audio"], "H3 takes no audio input")
+        // The fields every backend needs must still be there.
+        for k in ["model", "prompt", "num_frames", "height", "width", "steps", "seed"] {
+            XCTAssertNotNil(body[k], "\(k) must always be sent")
+        }
+
+        // LTX keeps all of them — the gating must not have narrowed it.
+        let ltx = VideoGenRequest(
+            model: .ltx23Q4, prompt: "a cat", width: 704, height: 480,
+            numFrames: 97, fps: 24, mode: .oneStage, steps: 12,
+            cfgScale: 3.0, loraPath: "/tmp/some.safetensors")
+        let lbody = VideoGenService.requestBody(
+            model: "m", prompt: "a cat", request: ltx,
+            firstFrameB64: nil, audioB64: nil)
+        XCTAssertNotNil(lbody["pipeline"])
+        XCTAssertNotNil(lbody["cfg_scale"])
+        XCTAssertNotNil(lbody["lora_path"])
     }
 }

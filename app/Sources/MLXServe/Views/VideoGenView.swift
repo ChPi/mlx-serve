@@ -55,6 +55,7 @@ struct VideoGenView: View {
     @State private var player: AVPlayer?
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
+    @State private var bestQuality: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -256,7 +257,9 @@ struct VideoGenView: View {
         let durationSec = Double(s.numFrames) / Double(model.fps)
         // With a clip attached, a one-stage preset runs two-stage on the wire
         // (audio-to-video requires it) — say so instead of lying "1-stage".
-        let label = (audioURL != nil && s.mode == .oneStage) ? "2-stage (audio-to-video)" : modeLabel(s.mode)
+        // Gated on the capability so a stale clip can't make H3 claim it.
+        let label = (model.supportsAudioInput && audioURL != nil && s.mode == .oneStage)
+            ? "2-stage (audio-to-video)" : modeLabel(s.mode)
         return "\(label), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
     }
 
@@ -403,7 +406,32 @@ struct VideoGenView: View {
     // becomes the mp4's soundtrack (guaranteed words — no hoping the joint
     // model nails quoted dialogue). Two sources: any audio file, or a line
     // synthesized by the local Qwen3-TTS voice right from this pane.
+    @ViewBuilder
     private var speechSection: some View {
+        // A backend that GENERATES its soundtrack takes no audio input, so the
+        // whole section is hidden rather than offered and refused. Declared by
+        // the preset, never inferred from the model id.
+        if !model.supportsAudioInput {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Sound").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text(model.generatesAudio ? "generated with the video" : "not supported")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if model.generatesAudio {
+                    Text("This model writes its own soundtrack. Describe it in the prompt after \"overall_soundscape:\" (and \"non_diegetic_music:\" for score).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            audioInputSection
+        }
+    }
+
+    private var audioInputSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Speech & sound").font(.subheadline.weight(.semibold))
@@ -611,22 +639,37 @@ struct VideoGenView: View {
             Text("More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default.")
                 .font(.caption2).foregroundStyle(.secondary)
 
-            // CFG scale — always adjustable; the native engine honors it in
-            // every pipeline mode (one-stage and both two-stage variants).
-            sliderRow("CFG scale", value: $cfgScale, range: 1...10, step: 0.5,
-                      help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
-            Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
-                .font(.caption2).foregroundStyle(.secondary)
+            // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
+            // backend has no guidance pass to scale — showing the slider there
+            // would be a dead control (the Mage-Flow class).
+            if model.supportsCFG {
+                sliderRow("CFG scale", value: $cfgScale, range: 1...10, step: 0.5,
+                          help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
+                Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
 
             HStack {
                 numberField("Seed", value: $seed, step: 1)
                 Spacer()
+            }
+            if model.supportsFastRecipe {
+                Toggle("Max quality (slower)", isOn: $bestQuality)
+                    .font(.caption)
+                    .help("Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders.")
             }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
             residencyRow
 
+            if model.supportsLoRA { loraSection }
+        }
+    }
+
+    @ViewBuilder
+    private var loraSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
             Divider()
             Text("Style LoRA").font(.caption.weight(.semibold))
             if loraPath.isEmpty {
@@ -884,6 +927,7 @@ struct VideoGenView: View {
         stgScale = s.stgScale
         seed = s.seed
         keepResident = s.keepResident
+        bestQuality = s.bestQuality
         loraPath = s.loraPath
         // The LoRA file may have moved since last session — drop a stale path.
         if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
@@ -905,6 +949,7 @@ struct VideoGenView: View {
         s.stgScale = stgScale
         s.seed = seed
         s.keepResident = keepResident
+        s.bestQuality = bestQuality
         s.loraPath = loraPath
         s.save()
     }
@@ -915,6 +960,16 @@ struct VideoGenView: View {
         quality = model.defaultQuality
         resolution = model.defaultResolution
         fps = model.fps
+        // A clip attached under LTX must not survive a switch to a backend
+        // that takes no audio input: the section hides, so the user can't
+        // clear it, the quality hint claims "audio-to-video", and an
+        // unreadable file still hard-errors a generate it wouldn't reach.
+        // (The first-frame image deliberately survives — every backend
+        // supports keyframe conditioning.)
+        if !model.supportsAudioInput {
+            clearAudio()
+            audioSource = .none
+        }
         applyQualityDefaults()
     }
 
@@ -935,9 +990,13 @@ struct VideoGenView: View {
     /// cap (`8N+1` ladder) — but no RAM-based clamping anymore. The user
     /// gets a soft warning instead.
     private func clampFramesToRAM() {
-        if numFrames > model.maxFrames,
-           let snap = model.frameOptions.last(where: { $0 <= model.maxFrames }) {
-            numFrames = snap
+        guard let lo = model.frameOptions.first, let hi = model.frameOptions.last else { return }
+        if numFrames > hi {
+            numFrames = model.frameOptions.last(where: { $0 <= hi }) ?? hi
+        } else if numFrames < lo {
+            // Stale persisted value below a raised floor (e.g. H3's 5→124) —
+            // the slider can't self-correct since it only reads `numFrames`.
+            numFrames = lo
         }
     }
 
@@ -959,8 +1018,12 @@ struct VideoGenView: View {
             cfgScale: cfgScale,
             stgScale: stgScale,
             firstFrameImagePath: firstFrameImageURL?.path,
-            audioPath: audioURL?.path,
+            // Belt-and-braces with the requestBody gate: a clip must never
+            // reach the transcode (whose failure is a hard error) on a
+            // backend that generates its own soundtrack.
+            audioPath: model.supportsAudioInput ? audioURL?.path : nil,
             keepResident: keepResident,
+            bestQuality: bestQuality,
             lanModelId: lanModel,
             loraPath: loraPath.isEmpty ? nil : loraPath
         )

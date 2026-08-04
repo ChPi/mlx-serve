@@ -351,6 +351,14 @@ struct VideoQualitySettings: Hashable {
     let numFrames: Int
 }
 
+/// Which server-side engine arm serves this preset. Explicit rather than
+/// sniffed from the id: the download bundle and the request surface both
+/// dispatch on it, and a magic-string check in two places is how they drift.
+enum VideoBackendKind: String, Hashable {
+    case ltx
+    case minimaxH3
+}
+
 struct VideoModelPreset: Identifiable, Hashable {
     let id: String
     let name: String
@@ -367,6 +375,32 @@ struct VideoModelPreset: Identifiable, Hashable {
     let frameOptions: [Int]
     /// Plain-English explanation shown under the model in the Media pane.
     let description: String
+
+    // What the BACKEND can actually do. Declared, never inferred — the pane
+    // gates on these instead of assuming every video model is LTX-shaped.
+    // Mage-Flow shipped with five dead image controls before its preset started
+    // declaring capabilities; these exist so the video pane cannot repeat it.
+    // Defaults describe LTX, so existing presets are unchanged.
+
+    /// Which engine arm serves it.
+    var backend: VideoBackendKind = .ltx
+    /// Runtime LoRA adapters. MiniMax-H3 has no adapter format; the server
+    /// answers a named 400 rather than silently ignoring the field.
+    var supportsLoRA: Bool = true
+    /// Classifier-free guidance. H3 is CFG-DISTILLED — there is no guidance
+    /// pass to scale, so a CFG slider would be a dead control.
+    var supportsCFG: Bool = true
+    /// One-stage / two-stage / two-stage-HQ pipelines. LTX-only.
+    var supportsPipelineModes: Bool = true
+    /// Audio-to-video conditioning from an attached clip. H3 GENERATES its
+    /// soundtrack jointly with the frames and takes no audio input on FL2VA.
+    var supportsAudioInput: Bool = true
+    /// Whether the model produces its own soundtrack.
+    var generatesAudio: Bool = false
+    /// Server-side fast recipe (H3: step cache + attention broadcast, 2.83x
+    /// at 768p). DEFAULT-ON server-side; the pane offers a max-quality
+    /// opt-out that sends "fast": false.
+    var supportsFastRecipe: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -432,7 +466,106 @@ struct VideoModelPreset: Identifiable, Hashable {
         )
     }()
 
-    static let all: [VideoModelPreset] = [.ltx23Q4]
+    /// The server sends width/height straight to the DiT with no resampling,
+    /// so these must already be on the model's trained canvas — no smaller
+    /// tier exists (MiniMax's H3-Base generates natively at 768p; 2K needs a
+    /// separate regenerate stage we haven't converted). Computed via
+    /// `adapt_canvas`/`minimax_h3.adaptCanvas`'s own math (768px short edge,
+    /// ≤768×1344 area, /32) over MiniMax's stated six aspect ratios (21:9 to
+    /// 9:16). 1344×768 is the reference node's default and the confirmed-good
+    /// rap demo's resolution. Speed labels are pixel-count ratios vs the
+    /// smallest option (768×768 = 0.59MP), squared — the DiT attends over one
+    /// packed sequence, so cost is roughly quadratic in pixel count: 4:3/3:4
+    /// (0.79MP) ≈1.8x, and 16:9/9:16/21:9 all land on the same area cap
+    /// (1.03MP) ≈3.1x. Estimates, not measured per-resolution timings.
+    private static let h3Resolutions: [ResolutionOption] = [
+        .init(width: 1344, height: 768,  label: "1344 × 768 (16:9 widescreen) — recommended, 3x slower"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square) — fastest"),
+        .init(width: 1024, height: 768,  label: "1024 × 768 (4:3 landscape) — 2x slower"),
+        .init(width: 768,  height: 1024, label: "768 × 1024 (3:4 portrait) — 2x slower"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (9:16 portrait) — 3x slower"),
+        .init(width: 1536, height: 672,  label: "1536 × 672 (21:9 cinematic) — 3x slower"),
+    ]
+
+    /// H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1` (its VAE folds 17
+    /// source frames into 5 latent tokens) — offering a count off it means the
+    /// server silently snaps it. Floor is 124, the reference node's own
+    /// trained-range start; shorter is off-distribution, not just "fast".
+    private static func h3FrameLadder(minFrames: Int, maxFrames: Int) -> [Int] {
+        var out: [Int] = []
+        var n = minFrames
+        while n <= maxFrames {
+            out.append(n)
+            n += 17
+        }
+        return out
+    }
+
+    /// Both H3 packs share everything except repo/size/RAM: same engine, same
+    /// frame ladder, same fast recipe. One factory so they cannot drift.
+    private static func minimaxH3Preset(repo: String, name: String,
+                                        downloadGB: Int, ramGB: Int,
+                                        description: String) -> VideoModelPreset {
+        // Trained range is ~124-362 (reference tooltip); 209 is our own
+        // validated ceiling (the rap demo), not the untested-by-us 362.
+        let minF = 124
+        let cap = 209
+        return VideoModelPreset(
+            id: repo,
+            name: name,
+            repo: repo,
+            approxDownloadGB: downloadGB,
+            // Self-contained: weights, both VAEs and the tokenizer ship in the
+            // one repo, so there is no separate text-encoder pull.
+            approxFirstRunDownloadGB: downloadGB,
+            // The text encoder and the DiT are staged sequentially (they cannot
+            // both be resident), so the peak is the larger of the two plus
+            // activations, not their sum.
+            approxRAMGB: ramGB,
+            resolutions: h3Resolutions,
+            defaultResolution: h3Resolutions[0],
+            fps: 24,
+            // .good = the eyeballed capstone A/B; .quality = the rap demo's
+            // longer 209-frame run.
+            qualityProfiles: [
+                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
+                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
+                .quality:      .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: cap),
+                .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: cap),
+            ],
+            defaultQuality: .good,
+            maxFrames: cap,
+            frameOptions: h3FrameLadder(minFrames: minF, maxFrames: cap),
+            description: description,
+            backend: .minimaxH3,
+            supportsLoRA: false,
+            supportsCFG: false,
+            supportsPipelineModes: false,
+            supportsAudioInput: false,
+            generatesAudio: true,
+            supportsFastRecipe: true
+        )
+    }
+
+    static let minimaxH3: VideoModelPreset = minimaxH3Preset(
+        repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit",
+        name: "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio",
+        downloadGB: 69,
+        ramGB: 44,
+        description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Slow: with the fast recipe on (default), the recommended 1344 × 768 / 124 frames takes about 50 minutes on an M4 Max; 209 frames takes roughly 2 hours. Off, both take 2-6x longer."
+    )
+
+    /// The 4-bit pack: same speed (the DiT is compute-bound), ~40 GB download
+    /// and a ~25 GB staged peak — the pick for 32-48 GB Macs.
+    static let minimaxH3Q4: VideoModelPreset = minimaxH3Preset(
+        repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit",
+        name: "MiniMax-H3 (Hailuo 3.0) 4-bit — video + native audio, low RAM",
+        downloadGB: 40,
+        ramGB: 26,
+        description: "The 4-bit build of MiniMax-H3: same generation speed, a 40 GB download instead of 69, and it fits comfortably on 32 GB Macs. Slightly softer detail than the 8-bit build — pick that one if you have 48 GB or more."
+    )
+
+    static let all: [VideoModelPreset] = [.ltx23Q4, .minimaxH3, .minimaxH3Q4]
 }
 
 // MARK: - Audio presets (TTS / voice cloning)
@@ -1031,6 +1164,9 @@ struct VideoGenRequest {
     var audioPath: String? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
@@ -1058,6 +1194,9 @@ struct AudioGenRequest {
     var temperature: Double = 0.7
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
@@ -1082,6 +1221,9 @@ struct MusicGenRequest {
     var seed: Int = -1
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
@@ -1103,6 +1245,9 @@ struct Model3DGenRequest {
     var seed: Int = -1
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
