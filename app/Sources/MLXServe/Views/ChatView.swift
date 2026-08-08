@@ -2835,7 +2835,7 @@ struct MarkdownText: View {
     }
 
     var body: some View {
-        // Fenced code renders as its own view (gutter, colors, copy button);
+        // Fenced code renders as its own view (colors, copy button);
         // everything between fences stays in ONE text view per run so
         // drag-selection still crosses paragraphs, lists and tables. See
         // `MarkdownSegmenter` for why the split is at fences, not at blocks.
@@ -3151,9 +3151,31 @@ struct MarkdownText: View {
 
     // MARK: NSAttributedString assembly
 
+    /// Rendered prose runs, keyed by their source text.
+    ///
+    /// A streamed reply re-renders the whole message ~20 times a second, but
+    /// only the LAST segment can still be growing — every earlier prose run is
+    /// final and was already built. Rebuilding them all cost 4 ms per pass on a
+    /// 60-paragraph reply, so they are remembered instead. Safe against a theme
+    /// change because the colours that adapt are dynamic `NSColor`s, which
+    /// resolve when drawn rather than when built.
+    private static let renderCache: NSCache<NSString, NSAttributedString> = {
+        let c = NSCache<NSString, NSAttributedString>()
+        c.countLimit = 256
+        return c
+    }()
+
     /// Build the NSAttributedString fed to NSTextView. Public-static so the
     /// rendering path can be exercised by tests later if needed.
     static func attributedString(for source: String) -> NSAttributedString {
+        let key = source as NSString
+        if let hit = renderCache.object(forKey: key) { return hit }
+        let built = buildAttributedString(for: source)
+        renderCache.setObject(built, forKey: key)
+        return built
+    }
+
+    private static func buildAttributedString(for source: String) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let blocks = parseBlocks(source: source)
         for (idx, block) in blocks.enumerated() {
@@ -3443,13 +3465,25 @@ fileprivate struct SelectableMarkdownNSText: NSViewRepresentable {
 /// so embedding it in SwiftUI's layout system "just works" — no manual height
 /// binding required.
 fileprivate final class IntrinsicTextView: NSTextView {
+    /// Answering costs a full `ensureLayout` of the run, and auto-layout asks
+    /// several times per pass — so the answer is cached until something that can
+    /// actually change it happens.
+    private var cachedHeight: CGFloat?
+
     override var intrinsicContentSize: NSSize {
+        if let cachedHeight { return NSSize(width: NSView.noIntrinsicMetric, height: cachedHeight) }
         guard let lm = layoutManager, let tc = textContainer else {
             return super.intrinsicContentSize
         }
         lm.ensureLayout(for: tc)
-        let used = lm.usedRect(for: tc)
-        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(used.height))
+        let height = ceil(lm.usedRect(for: tc).height)
+        cachedHeight = height
+        return NSSize(width: NSView.noIntrinsicMetric, height: height)
+    }
+
+    override func invalidateIntrinsicContentSize() {
+        cachedHeight = nil
+        super.invalidateIntrinsicContentSize()
     }
 
     override func didChangeText() {
@@ -3458,9 +3492,13 @@ fileprivate final class IntrinsicTextView: NSTextView {
     }
 
     override func setFrameSize(_ newSize: NSSize) {
+        // This view WRAPS, so only a width change can alter its height.
+        // Invalidating on any frame change fed the height we ourselves just
+        // reported straight back in as a fresh invalidation — layout, invalidate,
+        // layout again, several times per frame.
+        let widthChanged = abs(newSize.width - frame.width) > 0.5
         super.setFrameSize(newSize)
-        // Width changes (parent re-flow) require a layout-driven height re-check.
-        invalidateIntrinsicContentSize()
+        if widthChanged { invalidateIntrinsicContentSize() }
     }
 }
 

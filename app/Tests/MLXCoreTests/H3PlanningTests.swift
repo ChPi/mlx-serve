@@ -300,6 +300,40 @@ final class H3PlanningTests: XCTestCase {
         XCTAssertEqual(clock.eta(totalSteps: 30)!, 60 * 26, accuracy: 60)
     }
 
+    /// Under the fast recipe most steps cost NOTHING — the engine reuses a
+    /// cached velocity (measured 128 of 200 in a live run) — so the lap
+    /// distribution is bimodal and a MEDIAN lands on one spike or the other
+    /// with nothing in between. Both readings are wrong: while 2 of every 3
+    /// steps are cached the bar sat at 75% saying "about 0 sec left" with
+    /// minutes to go, and where the cadence evens out to 1:1 the same estimate
+    /// flips to a full-cost lap and doubles what is left. What remains is
+    /// (real + skipped) steps at the cadence observed so far, which is the
+    /// AMORTIZED lap.
+    func testFastRecipeCachedStepsNeitherVanishNorDoubleTheEstimate() {
+        // The engine's own `sc_consec < 2` cap: 2 cached steps per real one.
+        var twoOfThree: [Double] = [90]                      // step 0: graph build, discarded
+        for i in 0..<15 { twoOfThree.append(i % 3 == 0 ? 12 : 0.02) }
+        // 14 steps left, 5 of them real work at 12 s.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: twoOfThree, totalSteps: 30)!,
+                       56, accuracy: 12)
+
+        // Late in the schedule the cadence evens out and the median sits on the
+        // knife edge — the same run must not suddenly claim twice the work.
+        var alternating: [Double] = [90]
+        for i in 0..<17 { alternating.append(i % 2 == 0 ? 12 : 0.02) }
+        // 12 steps left, half of them free — 76 s, not the 144 s a full-cost
+        // lap would claim.
+        XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: alternating, totalSteps: 30)!,
+                       76, accuracy: 16)
+    }
+
+    /// A sub-second estimate rounds to zero, and "about 0 sec left" on a job
+    /// with work still to do reads as a stuck progress bar.
+    func testASubSecondEstimateNeverRendersAsZero() {
+        XCTAssertEqual(H3TimeEstimate.duration(0.3), "about 1 sec")
+        XCTAssertEqual(H3TimeEstimate.duration(0), "unknown")
+    }
+
     /// After a real run the estimate should stop being someone else's
     /// measurement. One scalar is fitted — the machine factor — because the
     /// SHAPE of the curve is already known and a per-geometry table would need

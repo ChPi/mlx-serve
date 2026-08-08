@@ -107,6 +107,21 @@ final class ModelRootsTests: XCTestCase {
                       "models downloaded before the move must stay visible")
     }
 
+    /// The roots the APP ITSELF reads and deletes from — destination first,
+    /// built-in second. Unlike `scanRoots` this is not existence-filtered (a
+    /// read against a missing folder just finds nothing) and never includes
+    /// LM Studio / custom folders, which are other tools' trees the app must
+    /// not delete into.
+    func testOwnedRootsKeepTheBuiltInFolderAfterTheDestinationMoves() {
+        var roots = ModelRoots(defaults: defaults)
+        XCTAssertEqual(roots.ownedRoots, [ModelRoots.builtInRoot])
+
+        let dest = tempDir("dest")
+        roots.configuredDownloadRoot = dest
+        XCTAssertEqual(roots.ownedRoots, [dest, ModelRoots.builtInRoot],
+                       "the pre-move library must stay readable, destination's copy winning")
+    }
+
     /// De-duped, and never a folder that isn't there: each entry becomes a
     /// `--model-dir`, and the server logs a warning per unopenable one.
     func testScanRootsAreDedupedAndExist() {

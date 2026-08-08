@@ -799,3 +799,29 @@ Result: Mistral went from *cannot load* to **99.5% engine conformance**
 field you have not shape-checked is a crash, not a graceful miss. Any new
 tokenizer_config/config reader owes both shapes — or an explicit switch whose
 `else` returns null.
+
+## An adapter's alpha lives wherever its exporter put it (`lora.fileAlphaScale`, 2026-08-06)
+
+A LoRA's net strength is alpha/rank, and four real community files ship four conventions — a kohya per-module `.alpha` TENSOR, a PEFT JSON document inside one `lora_adapter_metadata` metadata string (`transformer.lora_alpha`/`transformer.r`), flat `lora_alpha`+`lora_rank`|`r` pairs, kohya's `ss_network_alpha`/`ss_network_dim` — plus files declaring none at all (alpha baked into the weights, 1.0 is correct). Reading only the tensor ran every PEFT export at 1.0 = rank/alpha = **8x too strong** for the common 4/32 pairing, which renders PURE STATIC. Resolution order is nested-JSON > flat > `ss_*` > none, per-module tensor still WINS (more specific), and a non-finite/non-positive alpha or rank is DECLINED — a scale we had to guess at is the bug. The resolved scale is logged per file (`[lora] <file>: scale …`) so a wrong one is visible instead of silent; `lora_scales` stays a MULTIPLIER on top of it.
+
+**The test lesson is the bigger half**: `test_multi_lora.sh`'s 56 checks were all green through this — its exact stacking maths (`d+d == 2d` byte-for-byte, zero-B transparency, order independence) is satisfied by noise, and a second real adapter passed only by being weak enough to survive 8x. Renders now go through `tests/lora_noise.py` (mean abs difference of horizontally adjacent pixels, bar 20: real 4-8, static 43-50) and `tests/test_real_loras.sh` runs published adapters on all four backends asserting scale + attach counts + usable output. A guard that asks "did the bytes change?" must be paired with one that LOOKS.
+
+## A sampler must never draw a RESERVED special (`tokenizer.reservedOutputIds`)
+
+`<|fim_hole|>`-class FIM markers can be EMITTED at temp 0 by a checkpoint whose distribution collapses. Per-model mask = `special: true` added tokens MINUS EOS ids MINUS specials whose text appears in the chat template source (thinking/tool/role markers ride each model's own template; no template ⇒ off, so fallback-formatted models are untouched). The legit-output set is DERIVED, never hardcoded. Built once at load (`generate.installSuppressMask`, `[suppress]` engagement log, `MLX_SERVE_SUPPRESS_RESERVED=0`), sized to the LOGITS dim (`unpadded_vocab_size` when set — inkling), riding `SamplingParams.suppress_mask` through the `initWithOptions` chokepoint into BOTH samplers + both stochastic-verify filters (`mlx_where` + -inf, fully lazy, no host sync; the batched tick reads `gen.sampling`, not `slot.sampling`). Logprobs stay the RAW distribution — under suppression rank 1 may differ from the emitted token BY DESIGN (the field reports the model; the mask is policy).
+
+## The degenerate-tail loop guard needs a LONG-period tier (dsv4, 2026-08-02)
+
+A two-sentence ~58-token cycle repeated 26x sailed through the 8-token scan; `loopStopReason` also fires on periods 9..64 at 10 exact reps (`isDegenerateTailLoopRange` — long periods demand fewer reps: identical long lines in real code repeat a handful of times, not ten).
+
+## A tiled decoder's tiles are not slices of an untiled pass (H3 visual VAE)
+
+`create_token_ids` maps each axis to `(arange(0.5,n)/n)*2-1`, so a 256-px tile's coordinates differ from that region's coordinates in a full-canvas pass — tiling is SEMANTIC, not a memory optimization. `minimax_h3_vae.decode` refuses above the 256-px tile extent (`fitsSingleTile` → `error.TilingUnsupported`) rather than silently decoding untiled and producing off-distribution output that looks like a quality problem. Same reason its TEMPORAL chunking (5-token chunks, 2 overlap, 3-frame pre-pad drop, 5-frame cross-fade) cannot be collapsed into one pass: the VAE was trained on 17-frame clips.
+
+## An oracle that cannot execute the reference must say so (H3 DiT parity)
+
+The reference block calls comfy_kitchen CUDA kernels that do not run on a Mac, so `tests/dump_minimax_h3_fixtures.py` is a TRANSCRIPTION and its header states that a green test proves agreement with an independently written implementation, not with the reference. Where the reference CAN run (`dump_minimax_h3_layout.py` — pure layout/schedule math) it is executed directly, with import stubs that RAISE on attribute access so no golden value can be produced by a mock. Prefer executing the reference; when you cannot, say which one you built.
+
+## A permutation-invariant checksum cannot see a permutation (H3 layout fixture)
+
+The per-axis position SUM passes unchanged when the two stereo channels' pinned `w` coordinates are swapped. Pair any column checksum with a row-index-WEIGHTED one (`pos_weighted`) — found by doing red-on-revert properly rather than by inspection.

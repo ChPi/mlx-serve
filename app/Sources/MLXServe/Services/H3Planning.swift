@@ -296,20 +296,22 @@ enum H3TimeEstimate {
     /// when there is not enough to say.
     ///
     /// Step 0 carries graph build and Metal JIT and is thrown away — including
-    /// it inflated a 30-step estimate by minutes. The rest is a MEDIAN, not a
-    /// mean or the last lap: under the fast recipe a velocity-cached step takes
-    /// ~0.02 s, and one of those in the trailing window makes the whole
-    /// remaining run look instant.
+    /// it inflated a 30-step estimate by minutes. The rest is a MEAN, because
+    /// what is left to pay is the SUM of the remaining laps and the laps are
+    /// bimodal: under the fast recipe the engine reuses a cached velocity on
+    /// most steps (measured 128 of 200 live), so a lap is either ~0.02 s or the
+    /// full cost and nothing in between. A median lands on one spike or the
+    /// other — at 2-cached-per-real it reported "about 0 sec left" with minutes
+    /// to go, and where the cadence evens out to 1:1 the same run flipped to a
+    /// full-cost lap and doubled what was left. Averaging over whole cycles
+    /// prices a step at what it actually costs amortized.
     static func liveEta(stepDurations: [Double], totalSteps: Int) -> Double? {
         let laps = Array(stepDurations.dropFirst())
         guard laps.count >= 2, totalSteps > 0 else { return nil }
         let remaining = totalSteps - stepDurations.count
         guard remaining > 0 else { return 0 }
-        let sorted = laps.sorted()
-        let median = sorted.count % 2 == 1
-            ? sorted[sorted.count / 2]
-            : (sorted[sorted.count / 2 - 1] + sorted[sorted.count / 2]) / 2
-        return median * Double(remaining)
+        let mean = laps.reduce(0, +) / Double(laps.count)
+        return mean * Double(remaining)
     }
 
     /// "about 50 min" / "about 3 h 20 min", with where the number came from.
@@ -340,10 +342,12 @@ enum H3TimeEstimate {
     }
 
     /// Coarse on purpose: a job measured in hours does not have a meaningful
-    /// seconds digit, and printing one invites the user to time us.
+    /// seconds digit, and printing one invites the user to time us. Floored at
+    /// one second — there is work left to do or we would not be printing a
+    /// number, and "about 0 sec" beside a moving bar reads as a stuck job.
     static func duration(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds > 0 else { return "unknown" }
-        if seconds < 90 { return "about \(Int(seconds.rounded())) sec" }
+        if seconds < 90 { return "about \(max(1, Int(seconds.rounded()))) sec" }
         let minutes = Int((seconds / 60).rounded())
         if minutes < 60 { return "about \(minutes) min" }
         let h = minutes / 60

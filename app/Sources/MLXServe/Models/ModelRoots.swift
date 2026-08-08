@@ -75,6 +75,20 @@ struct ModelRoots {
         return Self.existingDirectory(raw)
     }
 
+    /// The folders the app ITSELF downloads into — destination first, then the
+    /// built-in root every install started with. `scanRoots` is what the SERVER
+    /// scans; this is what the app's own reads ("is this repo on disk?",
+    /// discovery, delete) must check. Reading only the destination is how
+    /// moving it made the pre-move library vanish from the picker while
+    /// `/v1/models`, which scans both, kept serving it. Not existence-filtered
+    /// (a read against a missing folder just finds nothing), and never LM
+    /// Studio / custom folders — other tools' trees the app must not delete
+    /// into.
+    var ownedRoots: [String] {
+        let dest = downloadRoot
+        return dest == Self.builtInRoot ? [dest] : [dest, Self.builtInRoot]
+    }
+
     /// Every folder to scan, in the order the server should take them:
     /// download destination first, because `--model-dir` is first-wins on a
     /// repeated model id and the folder we write into holds the live copy.
