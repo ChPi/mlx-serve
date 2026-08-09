@@ -214,17 +214,19 @@ struct ImageModelPreset: Identifiable, Hashable {
         .init(width: 512,  height: 2048, label: "512 × 2048 (tall 1:4)"),
     ]
 
-    /// Microsoft Mage-Flow-Turbo — the official MIT diffusers repo (no login /
-    /// license step). Native double-stream flow DiT + Qwen3-VL text encoder +
-    /// DiCo VAE, served by the native `mage_flow` backend (auto-detected from
+    /// Mage-Flow-Turbo — the official MIT diffusers repo (no login / license
+    /// step; Microsoft renamed the org to `mage-flow-community`, old
+    /// `microsoft/` dirs on disk keep working — nothing keys on the org).
+    /// Native double-stream flow DiT + Qwen3-VL text encoder + DiCo VAE,
+    /// served by the native `mage_flow` backend (auto-detected from
     /// `model_index.json`, not `config.json`). Distilled Turbo: 4-step flow
     /// matching, guidance 1.0 (no CFG). Runs bf16 (DiT+encoder) + f32 VAE.
     static let mageFlowTurbo = ImageModelPreset(
-        id: "microsoft/mage-flow-turbo",
+        id: "mage-flow-community/mage-flow-turbo",
         name: "Mage-Flow Turbo (~17 GB)",
         variant: .mageFlowTurbo,
         configName: "mage_flow",
-        repo: "microsoft/Mage-Flow-Turbo",
+        repo: "mage-flow-community/Mage-Flow-Turbo",
         approxDownloadGB: 17,
         approxRAMGB: 16,
         resolutions: mageFlowResolutions,
@@ -248,11 +250,11 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// guidance 1.0. Same MIT diffusers layout (`model_index.json`), served by
     /// the `mage_flow` backend (the Edit weights light up `supportsEdit`).
     static let mageFlowEditTurbo = ImageModelPreset(
-        id: "microsoft/mage-flow-edit-turbo",
+        id: "mage-flow-community/mage-flow-edit-turbo",
         name: "Mage-Flow Edit Turbo (~17 GB)",
         variant: .mageFlowEditTurbo,
         configName: "mage_flow",
-        repo: "microsoft/Mage-Flow-Edit-Turbo",
+        repo: "mage-flow-community/Mage-Flow-Edit-Turbo",
         approxDownloadGB: 17,
         approxRAMGB: 16,
         resolutions: mageFlowResolutions,
@@ -323,7 +325,6 @@ struct ImageModelPreset: Identifiable, Hashable {
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
         .krea2Turbo,                                   // 15
-        .mageFlowTurbo, .mageFlowEditTurbo,            // 17, 17
     ]
 }
 

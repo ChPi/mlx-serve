@@ -105,6 +105,24 @@ final class CustomMediaModelsTests: XCTestCase {
         XCTAssertEqual(custom.approxRAMGB, ImageModelPreset.krea2Turbo.approxRAMGB)
     }
 
+    /// End to end from the wire: a real `/v1/models` entry (verbatim server
+    /// JSON shape, live 2026-08-09) parses into the ModelInfo the pickers
+    /// read and produces its "On This Mac" row.
+    func testServerListEntryParsesIntoAVideoRow() {
+        let entry: [String: Any] = [
+            "id": "antocorr/MiniMax-H3-FL2VA-MLX-Serve-2bit-text-encoder",
+            "loaded": false, "state": "unloaded", "bytes_resident": 0,
+            "capabilities": ["video"], "input_modalities": ["text"],
+            "meta": ["architecture": "minimax_h3", "engine": "mlx",
+                     "quantization": "4-bit", "context_length": 0],
+        ]
+        let m = APIClient.parseModelInfo(entry)
+        XCTAssertEqual(m.architecture, "minimax_h3")
+        XCTAssertNil(m.lanPeer)
+        XCTAssertEqual(CustomMediaModels.videoPresets(from: [m]).map(\.id),
+                       ["antocorr/MiniMax-H3-FL2VA-MLX-Serve-2bit-text-encoder"])
+    }
+
     // MARK: - Settings resolution
 
     /// A persisted custom pick resolves against the live model list; with the

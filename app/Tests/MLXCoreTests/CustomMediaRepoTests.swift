@@ -60,6 +60,45 @@ final class CustomMediaRepoTests: XCTestCase {
         XCTAssertFalse(sd.isCompatible)
     }
 
+    func testDiffusersRepoDetectedFromItsPipelineClassName() throws {
+        // A diffusers repo carries NO `model_type` — HF surfaces the pipeline's
+        // own `_class_name` instead. Live shape from
+        // "mage-flow-community/Mage-Flow-Turbo" (the renamed microsoft org,
+        // 2026-08-09), tags verbatim: none spells a served model_type. Only
+        // classes our engines load in that repo's OWN layout map to a family;
+        // any other diffusers repo keeps its old incompatibility.
+        let json = Data("""
+        [{"id":"mage-flow-community/Mage-Flow-Turbo","pipeline_tag":"text-to-image",
+          "tags":["diffusers","safetensors","text-to-image","diffusion","mage-flow"],
+          "config":{"diffusers":{"_class_name":"MageFlowPipeline"}}},
+         {"id":"x/sdxl","pipeline_tag":"text-to-image","tags":["diffusers"],
+          "config":{"diffusers":{"_class_name":"StableDiffusionXLPipeline"}}}]
+        """.utf8)
+        let models = try JSONDecoder().decode([HFModel].self, from: json)
+        XCTAssertEqual(models[0].mediaFamilyModelType, "mage_flow")
+        XCTAssertTrue(models[0].isServedMediaRepo)
+        XCTAssertFalse(models[0].isCompatible) // unverified until the tree check
+        XCTAssertFalse(models[1].isServedMediaRepo)
+        XCTAssertFalse(models[1].isCompatible)
+
+        // The tree check runs the mage_flow family markers, and the Edit repo
+        // adopts the edit family by its name — the server's dirIsEdit rule.
+        let bundle = CustomMediaModels.bundle(
+            arch: "mage_flow", repoId: "mage-flow-community/Mage-Flow-Edit-Turbo")!
+        XCTAssertEqual(bundle.primaryRepo, "mage-flow-community/Mage-Flow-Edit-Turbo")
+        let markers = bundle.components[0].readyMarkers
+        let tree: [HFSearchService.TreeFileEntry] = [
+            .init(path: "model_index.json", size: 120),
+            .init(path: "transformer/diffusion_pytorch_model.safetensors", size: 9),
+            .init(path: "vae/diffusion_pytorch_model.safetensors", size: 9),
+            .init(path: "text_encoder/model.safetensors", size: 9),
+            .init(path: "scheduler/scheduler_config.json", size: 9),
+        ]
+        XCTAssertTrue(HFSearchService.mediaStructureSatisfied(markers: markers, files: tree))
+        XCTAssertFalse(HFSearchService.mediaStructureSatisfied(
+            markers: markers, files: tree.filter { !$0.path.hasPrefix("transformer/") }))
+    }
+
     // MARK: - Tree verification
 
     func testStructureCheckIsTheFamilyBundlesOwnMarkers() {

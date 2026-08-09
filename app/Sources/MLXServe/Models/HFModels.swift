@@ -73,11 +73,30 @@ func isMediaModelType(_ modelType: String) -> Bool {
 
 /// The `config` block the HF API returns when asked (`expand[]=config`).
 /// `model_type` is the field the server dispatches on, so it's the definitive
-/// arch signal a search row can carry.
+/// arch signal a search row can carry. A diffusers repo has no `model_type`;
+/// HF surfaces the pipeline's own class instead
+/// (`{"diffusers":{"_class_name":"MageFlowPipeline"}}`).
 struct HFConfigMeta: Codable {
     let modelType: String?
-    enum CodingKeys: String, CodingKey { case modelType = "model_type" }
+    var diffusers: DiffusersMeta? = nil
+    var diffusersClassName: String? { diffusers?.className }
+
+    struct DiffusersMeta: Codable {
+        let className: String?
+        enum CodingKeys: String, CodingKey { case className = "_class_name" }
+    }
+    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers }
 }
+
+/// Served media families recognizable from a diffusers repo's `_class_name`.
+/// Only pipelines our engines load in that repo's OWN layout belong here —
+/// the class is a family claim, and the tree check still has to prove the
+/// files. Krea and FLUX conversions ship a root config.json with `model_type`
+/// (they come through the main door); their raw upstream layouts are not
+/// served, so their classes deliberately map nowhere.
+private let servedDiffusersClasses: [String: String] = [
+    "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+]
 
 struct HFModel: Identifiable, Codable {
     let id: String
@@ -125,11 +144,14 @@ struct HFModel: Identifiable, Codable {
     }
 
     /// The served media family this repo declares — `config.model_type`
-    /// first (definitive), else a tag spelling a media model_type verbatim
-    /// (mlx-serve packs tag it, e.g. "minimax_h3"). nil = not a media repo we
-    /// serve; Kokoro deliberately maps nowhere (voice-mode-only catalog rule).
+    /// first (definitive), else a served diffusers `_class_name` (Mage-Flow —
+    /// diffusers repos carry no model_type), else a tag spelling a media
+    /// model_type verbatim (mlx-serve packs tag it, e.g. "minimax_h3").
+    /// nil = not a media repo we serve; Kokoro deliberately maps nowhere
+    /// (voice-mode-only catalog rule).
     var mediaFamilyModelType: String? {
         if let t = config?.modelType, isMediaModelType(t) { return t }
+        if let c = config?.diffusersClassName, let t = servedDiffusersClasses[c] { return t }
         return (tags ?? []).first(where: isMediaModelType)
     }
 

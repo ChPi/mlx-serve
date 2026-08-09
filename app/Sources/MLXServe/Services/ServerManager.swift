@@ -738,15 +738,15 @@ class ServerManager: ObservableObject {
     }
 
     /// Resolve a HuggingFace repo id to its local model directory, checking
-    /// every OWNED root — the download destination first, then the built-in
-    /// `~/.mlx-serve/models`, so a pack downloaded before the destination
-    /// moved doesn't read as `.modelMissing` and get offered as a full
-    /// re-download. No HF-cache fallback: the app owns downloads (chat +
-    /// media), so a model the user hasn't downloaded through us simply isn't
-    /// available. nil when no root holds it. The media-gen services call this
-    /// before loading.
+    /// every SERVED root (`ModelRoots.readRoots`) — the download destination
+    /// first, then the built-in `~/.mlx-serve/models`, LM Studio and the
+    /// custom scan folder, so a pack in any folder the server serves doesn't
+    /// read as `.modelMissing` and get offered as a full re-download. No
+    /// HF-cache fallback: the app owns downloads (chat + media), so a model
+    /// the user hasn't downloaded through us simply isn't available. nil when
+    /// no root holds it. The media-gen services call this before loading.
     static func resolveModelDir(repo: String) -> String? {
-        resolveModelDir(repo: repo, roots: ModelRoots().ownedRoots)
+        resolveModelDir(repo: repo, roots: ModelRoots.readRoots())
     }
 
     /// Multi-root form of the pure core below; first root holding the repo wins.

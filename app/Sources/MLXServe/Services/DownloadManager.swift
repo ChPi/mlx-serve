@@ -115,6 +115,16 @@ class DownloadManager: ObservableObject {
         return [modelsDir, ModelRoots.builtInRoot]
     }
 
+    /// The folders READS check — everything the server scans (destination,
+    /// built-in, LM Studio, custom folder), so a pack in ANY served folder
+    /// never reads as "not downloaded" (`ModelRoots.readRoots`). Writes and
+    /// deletes stay on `ownedRoots`. A test-pinned root stays alone —
+    /// hermetic tests must never resolve into the developer's real library.
+    var readRoots: [String] {
+        guard pinnedRoot == nil else { return [modelsDir] }
+        return ModelRoots().readRoots(lmStudioRoot: lmStudioRoot)
+    }
+
     // MARK: - Path resolution
     //
     // New downloads land under `<modelsDir>/<author>/<name>/` (same shape as
@@ -425,12 +435,13 @@ class DownloadManager: ObservableObject {
         Self.newLayoutDir(rootDir: modelsDir, repoId: repoId)
     }
 
-    /// Where `repoId` lives, across every owned root. Reads must check them
+    /// Where `repoId` lives, across every SERVED root. Reads must check them
     /// all: resolving against the destination alone is how moving it made a
-    /// pre-move library read as absent (re-download offers on models already
-    /// on disk). Write targets keep using `newLayoutDir(for:)`.
+    /// pre-move library read as absent, and skipping the custom scan folder is
+    /// how a pack there got a Download bar over a copy already being served.
+    /// Write targets keep using `newLayoutDir(for:)`.
     func existingModelDir(for repoId: String) -> String? {
-        Self.existingModelDir(roots: ownedRoots, repoId: repoId)
+        Self.existingModelDir(roots: readRoots, repoId: repoId)
     }
 
     /// First root holding the repo wins — the destination leads `ownedRoots`,
@@ -962,7 +973,7 @@ class DownloadManager: ObservableObject {
     }
 
     func componentReady(_ comp: MediaComponent) -> Bool {
-        Self.componentReady(comp, roots: ownedRoots)
+        Self.componentReady(comp, roots: readRoots)
     }
 
     /// Multi-root form: ready in ANY owned root — a pack downloaded before the
@@ -1798,9 +1809,7 @@ class DownloadManager: ObservableObject {
     /// drafter for the loaded base model and by the Model Browser to badge
     /// already-downloaded drafter rows.
     func discoverDrafters() -> [LocalDrafter] {
-        var roots = ownedRoots
-        if let lms = lmStudioRoot { roots.append(lms) }
-        return Self.discoverDrafters(in: roots)
+        Self.discoverDrafters(in: readRoots)
     }
 
     /// Pick the drafter that pairs with the loaded base model. Returns nil
