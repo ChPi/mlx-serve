@@ -347,7 +347,7 @@ class APIClient {
     /// Each field is optional — `nil` = leave it out of the request body and
     /// let the server's default win. Pre-built once at the call site (usually
     /// from `ServerOptions`) and passed through unchanged.
-    struct RequestDefaults {
+    struct RequestDefaults: Equatable {
         var topP: Double? = nil
         var topK: Int? = nil
         var repeatPenalty: Double? = nil

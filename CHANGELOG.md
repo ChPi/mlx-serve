@@ -1,5 +1,19 @@
 # Changelog
 
+## v26.8.4 — Unreleased
+
+### Agents can pin their own sampling.
+- Top-p, top-k, repeat penalty, presence penalty and reasoning budget join temperature and max tokens in the agent editor. 
+- Each is an override: App default follows Settings, a set value wins for that agent's turns, and an off value (top-k 0, repeat penalty 1.0) clears your global default for that agent.
+
+### Fixes
+- "Model load failed" now says why (issue #144). Every on-demand load failure answered with that bare 500 no matter the cause. A load refused by the memory check now comes back as a clear not-enough-free-memory error you can retry after closing other apps, and any other failure names its reason, like `Model load failed: FileNotFound`.
+- Picking a download folder no longer hides the models you already have. The server kept serving the built-in `~/.mlx-serve/models`, but the app's picker, delete and download checks stopped looking there the moment you set a custom location. Both are always scanned now.
+- Long code blocks no longer make the chat stutter. A streaming reply re-renders many times a second, and each pass paid a full text layout plus a pile of color allocations on a big block; that work is done once now.
+- GGUF repos that ship the same quant for several releases now label each file with its build (`0731` and so on), so you can tell the new DeepSeek 0731 files from the older ones instead of staring at two identical rows in the quant picker.
+- The MiniMax-H3 time estimate stopped swinging. Under the fast recipe most steps are near-free cache hits, and depending on where those fell the estimate could read "about 0 sec" with minutes to go, or double the real remainder. Steps are priced at their average cost now.
+- Internal docs reorganized and compacted.
+
 ## v26.8.3 — MiniMax-H3 references and Turbo, stacked LoRAs, model folders
 
 ### MiniMax-H3: references, Turbo, longer clips

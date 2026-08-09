@@ -1531,6 +1531,8 @@ pub const Scheduler = struct {
     ///   error.UnknownModelId    — id isn't in the registry.
     ///   error.NoDefaultModel    — id empty AND no default set.
     ///   error.NotEnoughMemory   — would exceed caps and no LRU victim.
+    ///   error.InsufficientMemory — memory preflight refused the load (free
+    ///                             RAM can't hold weights + headroom).
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
@@ -1598,8 +1600,9 @@ pub const Scheduler = struct {
                         continue :wait_loop;
                     },
                     .error_state => {
+                        const load_err = ModelRegistry.loadErrorFromName(entry.error_name);
                         self.registry.mutex.unlock(self.io);
-                        return error.LoadFailed;
+                        return load_err;
                     },
                     .unloaded => break :wait_loop,
                 }
@@ -1704,10 +1707,13 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
 
         if (req.error_name) |name| {
-            self.allocator.free(name);
+            // The failure crosses the thread boundary by NAME — map it back
+            // to a typed error so a memory-preflight refusal surfaces as a
+            // named 503, not the generic "Model load failed" 500 (#144).
+            defer self.allocator.free(name);
             // On success the inference thread took ownership of cpu_state;
             // on failure it didn't, so we still hold it.
-            return error.LoadFailed;
+            return ModelRegistry.loadErrorFromName(name);
         }
 
         // Success — inference thread installed cpu_state onto the entry.
@@ -1726,6 +1732,13 @@ pub const Scheduler = struct {
     /// under registry.mutex.
     pub fn release(self: *Scheduler, lm: *LoadedModel) void {
         self.registry.release(lm);
+    }
+
+    /// Duped stored failure name for the id `ensureLoaded` just refused with
+    /// `error.LoadFailed` — feeds the "Model load failed: <name>" HTTP
+    /// message (#144). Caller frees.
+    pub fn loadErrorName(self: *Scheduler, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
+        return self.registry.loadErrorNameDupe(alloc, id_or_empty);
     }
 
     /// Run a media-generation job on the inference thread. Posts `req` to the
@@ -3591,9 +3604,17 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     doLoadOnInferenceThread(sch, req) catch |err| {
         log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
         sch.registry.mutex.lockUncancelable(sch.io);
-        // markErrorLocked dupes the error name onto the entry; the
-        // conn thread reads it back from the entry, not from req.
-        sch.registry.markErrorLocked(req.entry, @errorName(err));
+        if (err == error.InsufficientMemory) {
+            // A memory-preflight refusal is transient, not a property of the
+            // checkpoint: the 503 tells the user to free memory and retry, so
+            // the entry must go back to .unloaded — stuck in .error_state the
+            // retry would fail fast until a server restart (#144).
+            sch.registry.markUnloadedLocked(req.entry);
+        } else {
+            // markErrorLocked dupes the error name onto the entry; the
+            // conn thread reads it back from the entry, not from req.
+            sch.registry.markErrorLocked(req.entry, @errorName(err));
+        }
         sch.registry.mutex.unlock(sch.io);
         finishLoadRequest(sch, req, @errorName(err));
         return;

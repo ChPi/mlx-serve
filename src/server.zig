@@ -1832,8 +1832,12 @@ fn handleConnection(
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
             return;
         },
+        error.InsufficientMemory => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
+            return;
+        },
         error.LoadFailed => {
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+            try sendLoadFailedResponse(allocator, stream, scheduler, requested_model_id);
             return;
         },
         error.Shutdown => {
@@ -3430,8 +3434,12 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
             return;
         },
+        error.InsufficientMemory => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
+            return;
+        },
         error.LoadFailed => {
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+            try sendLoadFailedResponse(allocator, stream, scheduler, requested_id);
             return;
         },
         else => {
@@ -7920,6 +7928,28 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 pub const not_enough_memory_message =
     "Not enough memory to load model: it would exceed the resident-model budget and no loaded model could be evicted. " ++
     "Raise or disable the cap with --max-resident-mem <size>|0 (the server log names the estimate and the current cap).";
+
+/// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
+/// headroom) is distinct from the resident-budget gate above and has a
+/// different knob. Counts go to the log (#126); the client gets the remedy.
+pub const insufficient_free_memory_message =
+    "Not enough free memory to load model: weights + warmup headroom exceed what is currently available. " ++
+    "Close other apps or models and retry (the server log names the peak estimate and available memory), or pass --skip-mem-preflight to override.";
+
+/// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
+/// every on-demand load failure — the inference thread's error name was
+/// dropped at the thread boundary. The registry keeps it; echo it.
+fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8) !void {
+    if (sched.loadErrorName(allocator, id)) |name| {
+        defer allocator.free(name);
+        if (std.fmt.allocPrint(allocator, "Model load failed: {s}", .{name}) catch null) |msg| {
+            defer allocator.free(msg);
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
+            return;
+        }
+    }
+    try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
+}
 
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
     return std.fmt.bufPrint(
