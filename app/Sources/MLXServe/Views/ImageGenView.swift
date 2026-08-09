@@ -290,12 +290,16 @@ struct ImageGenView: View {
             Text("Model").font(.subheadline.weight(.semibold))
             Picker("", selection: LanPick.selection(
                 model: $model, lanModel: $lanModel,
-                resolve: { id in ImageModelPreset.all.first { $0.id == id } },
+                resolve: { [models = server.allModels] id in
+                    ImageModelPreset.all.first { $0.id == id }
+                        ?? CustomMediaModels.imagePreset(for: id, from: models)
+                },
                 persist: persist)
             ) {
                 ForEach(ImageModelPreset.all) { preset in
                     Text(preset.name).tag(preset.id)
                 }
+                CustomModelPickerRows(presets: CustomMediaModels.imagePresets(from: server.allModels))
                 LanModelPickerRows(capability: "image")
             }
             .labelsHidden()
@@ -697,7 +701,7 @@ struct ImageGenView: View {
     /// writes trigger doesn't reapply preset defaults over them.
     private func hydrate() {
         let s = ImageGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)

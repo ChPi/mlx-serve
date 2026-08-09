@@ -2022,6 +2022,12 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
         const stub = try gen_mod.buildStubCpuState(allocator, modality);
         return .{ .config = stub.config, .tok = stub.tok, .chat_config = stub.chat_config };
     }
+    // A media-typed dir that FAILED its marker check must not fall through to
+    // the text path below: it would glob whatever safetensors are present and
+    // die on the first missing weight. Refuse by name instead (#144 flow).
+    if (gen_mod.incompleteMediaDir(io, allocator, model_dir)) {
+        return error.IncompleteMediaPack;
+    }
 
     const config = try allocator.create(ModelConfig);
     errdefer allocator.destroy(config);
@@ -2480,19 +2486,48 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
-/// "unknown" by the caller, which then skips the check).
+/// "unknown" by the caller, which then skips the check). Symlinked weights
+/// count (statFile follows links) — an HF hub-cache snapshot is ALL symlinks.
 fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     var it = dir.iterate();
     var total: u64 = 0;
     while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
         total += @intCast(st.size);
     }
     return total;
+}
+
+test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
+    // A model served straight out of the HuggingFace hub cache is a snapshot
+    // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
+    // 121 GB checkpoint at 0 bytes, and memInsufficientForLoad treats 0 as
+    // "unknown" → the preflight waved the load through into 34 GB of swap.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/abc123", .data = "0123456789abcdef" });
+    try tmp.dir.createDirPath(io, "snapshots/rev");
+    try tmp.dir.symLink(io, "../../blobs/abc123", "snapshots/rev/model.safetensors", .{});
+    // A dangling link (blob pruned) is skipped, never an error…
+    try tmp.dir.symLink(io, "../../blobs/gone", "snapshots/rev/model-00002.safetensors", .{});
+    // …and a symlink to a DIRECTORY must not be summed (statFile follows it).
+    try tmp.dir.symLink(io, "../../blobs", "snapshots/rev/dir.safetensors", .{});
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const snap = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/snapshots/rev", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(snap);
+
+    try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
 }
 
 /// Pure: would loading `weights_bytes` of model with `avail_bytes` free RAM risk

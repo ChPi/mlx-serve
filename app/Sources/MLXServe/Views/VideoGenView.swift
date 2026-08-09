@@ -252,12 +252,16 @@ struct VideoGenView: View {
             Text("Model").font(.subheadline.weight(.semibold))
             Picker("", selection: LanPick.selection(
                 model: $model, lanModel: $lanModel,
-                resolve: { id in VideoModelPreset.all.first { $0.id == id } },
+                resolve: { [models = server.allModels] id in
+                    VideoModelPreset.all.first { $0.id == id }
+                        ?? CustomMediaModels.videoPreset(for: id, from: models)
+                },
                 persist: persist)
             ) {
                 ForEach(VideoModelPreset.all) { preset in
                     Text(preset.name).tag(preset.id)
                 }
+                CustomModelPickerRows(presets: CustomMediaModels.videoPresets(from: server.allModels))
                 LanModelPickerRows(capability: "video")
             }
             .labelsHidden()
@@ -873,8 +877,13 @@ struct VideoGenView: View {
                         // than at Generate: 744 MB discovered 30 seconds into
                         // a job reads as a hang, and this way the Downloads
                         // pane shows it while the user finishes their prompt.
+                        // The off-flip CANCELS an in-flight fetch — without
+                        // that, a briefly-ticked box still downloads 744 MB
+                        // in the background with nothing on screen saying so.
                         if on, turboFetchDecision == .fetch {
                             downloads.startTurboLora(repoId: model.repo)
+                        } else if !on {
+                            downloads.cancelTurboLora(repoId: model.repo)
                         }
                     }
                 if turboFetchDecision == .fetch {
@@ -1196,7 +1205,7 @@ struct VideoGenView: View {
 
     private func hydrate() {
         let s = VideoGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)

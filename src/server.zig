@@ -78,6 +78,32 @@ pub var g_lan_share_spec: ?[]const u8 = null;
 pub var g_lan_name: ?[]const u8 = null;
 pub var g_lan_discover: bool = false;
 
+/// Should boot print the open-bind warning? True only when serve mode is about
+/// to listen on a non-loopback address the user never chose: no explicit
+/// `--host` (the default is still 0.0.0.0) and no `--lan-share` (which needs
+/// the wide bind). A future release flips the default to 127.0.0.1 — at which
+/// point the host check silences this without a code change.
+pub fn shouldWarnOpenBind(host_explicit: bool, lan_share: bool, host: []const u8) bool {
+    if (host_explicit or lan_share) return false;
+    return !(std.mem.startsWith(u8, host, "127.") or
+        std.mem.eql(u8, host, "::1") or
+        std.mem.eql(u8, host, "localhost"));
+}
+
+test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
+    // Default bind (0.0.0.0, nobody asked) → warn: a first-launch user is
+    // serving whatever network the laptop joins.
+    try std.testing.expect(shouldWarnOpenBind(false, false, "0.0.0.0"));
+    // Someone who CHOSE the bind is not nagged — explicit --host (any value)…
+    try std.testing.expect(!shouldWarnOpenBind(true, false, "0.0.0.0"));
+    // …or --lan-share, which needs the wide bind by design.
+    try std.testing.expect(!shouldWarnOpenBind(false, true, "0.0.0.0"));
+    // Loopback defaults never warn (the future 127.0.0.1 default).
+    try std.testing.expect(!shouldWarnOpenBind(false, false, "127.0.0.1"));
+    try std.testing.expect(!shouldWarnOpenBind(false, false, "localhost"));
+    try std.testing.expect(!shouldWarnOpenBind(false, false, "::1"));
+}
+
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
 const multipart = @import("multipart.zig");
@@ -628,6 +654,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/load-model",
     "/v1/messages",
     "/v1/models",
+    "/v1/models/rescan",
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/unload-model",
@@ -1708,6 +1735,12 @@ fn handleConnection(
         // default). The stub stays registered so it can reload. Idempotent.
         log.debug("POST /v1/unload-model -> 200\n", .{});
         try handleUnloadModelStrict(allocator, stream, request_body);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
+        // Absorb models downloaded AFTER boot (the Model Browser pulls while
+        // the server runs; discovery only walks the roots at startup).
+        try handleModelsRescan(allocator, stream);
         return;
     }
 
@@ -3351,6 +3384,24 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     if (body.len > 0) try stream.writeAll(body);
 }
 
+/// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
+/// new dirs (add-only; `ModelRegistry.rescan`). Answers `{"added":N}`.
+fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
+    const registry = global_registry orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        return;
+    };
+    const added = registry.rescan() catch |err| {
+        log.warn("/v1/models/rescan failed: {s}\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "Model rescan failed", 500);
+        return;
+    };
+    if (added > 0) log.info("[registry] rescan added {d} model(s)\n", .{added});
+    const body = try std.fmt.allocPrint(allocator, "{{\"added\":{d}}}", .{added});
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
+}
+
 /// Plan 05 Phase E: `POST /v1/load-model`. Renders a status payload for the
 /// resolved-and-loaded `lm` (the dispatcher already called
 /// `scheduler.ensureLoaded` against the body's `model` field, so the load
@@ -3416,6 +3467,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             },
             error.UnsupportedQuantMode => {
                 try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model at that path has an unsupported quantization mode", 400);
+                return;
+            },
+            error.IncompleteMediaPack => {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model at that path is an incomplete media pack (weights still downloading, or a partial copy)", 400);
                 return;
             },
             else => return err,

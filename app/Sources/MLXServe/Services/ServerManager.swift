@@ -610,6 +610,18 @@ class ServerManager: ObservableObject {
         }
     }
 
+    /// Fire-and-forget: have the running server pick up models downloaded
+    /// after it booted (POST /v1/models/rescan), then refresh the list so the
+    /// media panes' "On This Mac" rows see them. No-op when stopped — the
+    /// next boot's discovery covers it.
+    func rescanModels() {
+        guard status == .running else { return }
+        Task {
+            try? await api.rescanModels(port: port)
+            await refreshModels()
+        }
+    }
+
     /// Plan 05 Phase G — explicit hot-load. Posts /v1/load-model and
     /// refreshes the model list on success. Throws on 404/500/timeout so
     /// callers can fall back to a server restart if hot-switch fails.

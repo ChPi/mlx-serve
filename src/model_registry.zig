@@ -681,11 +681,15 @@ pub const ModelRegistry = struct {
     /// basename-derived id differs from the discovered `org/name` id —
     /// two ids for one path would let the same weights load twice.
     pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.peekByPathLocked(path);
+    }
+
+    fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         var trimmed = path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         if (trimmed.len == 0) return null;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             var entry_path: []const u8 = entry_ptr.*.path;
@@ -693,6 +697,30 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, entry_path, trimmed)) return entry_ptr.*;
         }
         return null;
+    }
+
+    /// Re-run discovery over the roots the server booted with and absorb NEW
+    /// dirs as `.unloaded` stubs (`POST /v1/models/rescan` — the Model
+    /// Browser downloads models while the server runs, and a boot-only scan
+    /// can't see them). Add-only: an id or path already registered wins
+    /// (first-wins, like boot) and live entries are never re-pointed or
+    /// removed. Returns the number of stubs added. No roots (a `--model`-only
+    /// server) rescans nothing.
+    pub fn rescan(self: *ModelRegistry) !u32 {
+        const roots = if (self.discovery) |d| d.roots else &.{};
+        if (roots.len == 0) return 0;
+        var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
+        defer found.deinit();
+        var added: u32 = 0;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (found.models) |m| {
+            if (self.entries.get(m.id) != null) continue;
+            if (self.peekByPathLocked(m.path) != null) continue;
+            _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
+            added += 1;
+        }
+        return added;
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
@@ -1523,4 +1551,36 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     bge.config = null;
     chat.config = null;
     chat2.config = null;
+}
+
+test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, idempotent)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // One model present at boot.
+    try tmp.dir.createDirPath(io, "org/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/model.safetensors", .data = "0123" });
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    try testing.expect(reg.peek("org/first") != null);
+
+    // A second model lands on disk AFTER boot (the Model Browser download).
+    try tmp.dir.createDirPath(io, "org/second");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/second/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/second/transformer.safetensors", .data = "0123" });
+
+    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    const stub = reg.peek("org/second") orelse return error.TestExpectedResult;
+    try testing.expectEqualStrings("minimax_h3", stub.arch_hint);
+    try testing.expectEqual(LoadState.unloaded, stub.state);
+    // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expect(reg.peek("org/first") != null);
 }

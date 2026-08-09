@@ -635,8 +635,14 @@ class DownloadManager: ObservableObject {
     /// (`LiquidAI/LFM2.5-2.6B-MLX-4bit`) for the server to discover it. Progress
     /// stays keyed on `repoId` — the row the user clicked is the repo's.
     func download(repoId: String, selection: FileSelection = .chatDefault,
-                  alertOnFailure: Bool = true, destRepoId: String? = nil) async {
-        let destDir = newLayoutDir(for: destRepoId ?? repoId)
+                  alertOnFailure: Bool = true, destRepoId: String? = nil,
+                  destDirOverride: String? = nil) async {
+        // `destDirOverride`: an absolute dir that already holds the model —
+        // used when a fetch ADDS to an existing pack (the Turbo adapter),
+        // which may live in a non-destination owned root. Writing it to the
+        // destination instead creates a fragment dir that reads as a (broken)
+        // model to every resolver (live 2026-08-08).
+        let destDir = destDirOverride ?? newLayoutDir(for: destRepoId ?? repoId)
 
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
 
@@ -873,16 +879,47 @@ class DownloadManager: ObservableObject {
             }
             return
         }
+        // The adapter belongs BESIDE the pack's weights, wherever those live —
+        // a pack in a non-destination root must not grow a fragment dir in the
+        // destination (it shadows the real pack and the server dies loading it).
+        let packDir = existingModelDir(for: repoId)
+        turboLoraFetches.insert(repoId)
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.download(repoId: repoId,
                                 selection: FileSelection(keepSafetensors: [TurboLoraFetch.fileName]),
-                                alertOnFailure: true)
-            self.finalizeIfCancelled(repoId: repoId)
+                                alertOnFailure: true,
+                                destDirOverride: packDir)
+            self.finalizeCancelledTurboLora(repoId: repoId, packDir: packDir)
+            self.turboLoraFetches.remove(repoId)
             self.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    /// Repo ids whose `activeTasks` entry is a Turbo-adapter fetch, not a full
+    /// pack download — `cancelTurboLora` must never cancel the latter.
+    private var turboLoraFetches: Set<String> = []
+
+    /// Stop an in-flight Turbo-adapter fetch (the toggle's off-flip). With no
+    /// adapter fetch running this does NOTHING — the generic `cancel(_:)`
+    /// no-task fallback wipes the repo's whole download dir, which here is a
+    /// live pack.
+    func cancelTurboLora(repoId: String) {
+        guard turboLoraFetches.contains(repoId) else { return }
+        activeTasks[repoId]?.cancel()
+    }
+
+    /// Cancel cleanup for a Turbo-adapter fetch: drop the ONE file's partials,
+    /// never the directory — the destination is the pack itself.
+    private func finalizeCancelledTurboLora(repoId: String, packDir: String?) {
+        guard Task.isCancelled else { return }
+        downloads.removeValue(forKey: repoId)
+        let dir = packDir ?? newLayoutDir(for: repoId)
+        let base = (dir as NSString).appendingPathComponent(TurboLoraFetch.fileName)
+        try? FileManager.default.removeItem(atPath: base + ".partial")
+        try? FileManager.default.removeItem(atPath: base + ".partial.parts")
     }
 
     // MARK: - Media bundles

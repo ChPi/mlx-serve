@@ -128,12 +128,16 @@ struct Model3DGenView: View {
             Text("Model").font(.subheadline.weight(.semibold))
             Picker("", selection: LanPick.selection(
                 model: $model, lanModel: $lanModel,
-                resolve: { id in Model3DModelPreset.all.first { $0.id == id } },
+                resolve: { [models = server.allModels] id in
+                    Model3DModelPreset.all.first { $0.id == id }
+                        ?? CustomMediaModels.meshPreset(for: id, from: models)
+                },
                 persist: persist)
             ) {
                 ForEach(Model3DModelPreset.all) { preset in
                     Text(preset.name).tag(preset.id)
                 }
+                CustomModelPickerRows(presets: CustomMediaModels.meshPresets(from: server.allModels))
                 LanModelPickerRows(capability: "3d")
             }
             .labelsHidden()
@@ -331,7 +335,7 @@ struct Model3DGenView: View {
 
     private func hydrate() {
         let s = Model3DGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         steps = s.steps
         guidance = s.guidance

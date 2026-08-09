@@ -63,8 +63,8 @@ struct ImageQualitySettings: Hashable {
 }
 
 struct ImageModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     let variant: FluxVariant
     /// `ModelConfig` factory name — sets the model architecture (e.g.
     /// "schnell", "dev", "flux2_klein_4b"). Weights themselves are loaded
@@ -74,7 +74,7 @@ struct ImageModelPreset: Identifiable, Hashable {
     /// non-gated — every preset ships with one we've verified is open.
     /// Loaded via `snapshot_download` + `model_path`, so weights download
     /// directly with no HF login or license-accept step.
-    let repo: String
+    var repo: String
     let approxDownloadGB: Int
     let approxRAMGB: Int
     let resolutions: [ResolutionOption]
@@ -360,9 +360,9 @@ enum VideoBackendKind: String, Hashable {
 }
 
 struct VideoModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
-    let repo: String                          // open HF mirror
+    var id: String
+    var name: String
+    var repo: String                          // open HF mirror
     let approxDownloadGB: Int                 // weights only
     let approxFirstRunDownloadGB: Int         // + Gemma text encoder
     let approxRAMGB: Int
@@ -699,10 +699,10 @@ struct VideoModelPreset: Identifiable, Hashable {
 /// We deliberately don't surface the macOS system voices here — those live in
 /// Voice mode. This panel is neural-only.
 struct AudioModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     /// Open `mlx-community` Qwen3-TTS repo (downloaded via DownloadManager).
-    let repo: String
+    var repo: String
     /// Rough on-disk weight size, GB (first-run download). Shown in the picker.
     let approxDownloadGB: Double
     /// Peak unified-memory footprint, GB — drives the soft RAM gate.
@@ -838,11 +838,11 @@ struct AudioModelPreset: Identifiable, Hashable {
 /// for which the pane shows a "convert locally" hint instead of a Download
 /// button.
 struct Model3DModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
     /// convert-on-device model (no HF pull); any other prefix is a normal repo.
-    let repo: String
+    var repo: String
     /// Peak unified-memory footprint, GB — drives the soft RAM gate. The paint
     /// stage is the peak (shape frees before it loads).
     let approxRAMGB: Int
@@ -873,11 +873,11 @@ struct Model3DModelPreset: Identifiable, Hashable {
 /// ACE-Step music-generation checkpoints (the second audio backend beside
 /// Qwen3-TTS). Same local-convert convention as `Model3DModelPreset`.
 struct MusicModelPreset: Identifiable, Hashable {
-    let id: String
-    let name: String
+    var id: String
+    var name: String
     /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
     /// convert-on-device model (no HF pull); any other prefix is a normal repo.
-    let repo: String
+    var repo: String
     /// Peak unified-memory footprint, GB — drives the soft RAM gate
     /// (DiT + Qwen3-Embedding text encoder + Oobleck VAE resident together).
     let approxRAMGB: Int

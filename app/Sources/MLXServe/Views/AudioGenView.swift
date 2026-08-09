@@ -291,12 +291,16 @@ struct VoiceGenView: View {
             Text("Model").font(.subheadline.weight(.semibold))
             Picker("", selection: LanPick.selection(
                 model: $model, lanModel: $lanModel,
-                resolve: { id in AudioModelPreset.all.first { $0.id == id } },
+                resolve: { [models = server.allModels] id in
+                    AudioModelPreset.all.first { $0.id == id }
+                        ?? CustomMediaModels.audioPreset(for: id, from: models)
+                },
                 persist: persist)
             ) {
                 ForEach(AudioModelPreset.all) { preset in
                     Text(preset.name).tag(preset.id)
                 }
+                CustomModelPickerRows(presets: CustomMediaModels.audioPresets(from: server.allModels))
                 LanModelPickerRows(capability: "audio")
             }
             .labelsHidden()
@@ -560,7 +564,7 @@ struct VoiceGenView: View {
 
     private func hydrate() {
         let s = AudioGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         speed = s.speed
         temperature = s.temperature

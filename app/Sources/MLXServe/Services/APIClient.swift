@@ -219,6 +219,19 @@ class APIClient {
     /// keeps the stub so it can reload). Used by the media-gen
     /// load→generate→unload flow. Idempotent server-side; a non-resident model
     /// returns 200.
+    /// Ask the server to absorb models downloaded after it booted (discovery
+    /// only walks the roots at startup). Add-only and idempotent server-side.
+    func rescanModels(port: UInt16) async throws {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/models/rescan")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        let (_, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.badStatus(code: (response as? HTTPURLResponse)?.statusCode ?? -1, detail: "")
+        }
+    }
+
     func unloadModel(port: UInt16, id: String) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/unload-model")!
         var request = URLRequest(url: url)

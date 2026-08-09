@@ -1306,7 +1306,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runImageTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = ImageGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         // A LAN model picked in the Image pane needs no local download — the
         // hosting Mac has the weights.
         let lanId = LanPick.lanId(s.modelId)
@@ -1337,7 +1337,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runSpeechTool(_ args: [String: String],
                                onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = AudioGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1357,7 +1357,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runMusicTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = MusicGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1373,7 +1373,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runVideoTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = VideoGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: "\(model.approxFirstRunDownloadGB)",
