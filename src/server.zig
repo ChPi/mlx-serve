@@ -669,6 +669,28 @@ fn routeExists(path: []const u8) bool {
     return false;
 }
 
+pub const max_request_bytes: usize = 64 * 1024 * 1024;
+pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+
+/// Per-route request-body cap. Media bodies are base64 payloads — a single
+/// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
+/// reference images approach 500 MB (issue #151) — while no JSON chat body
+/// has any business near 64 MB.
+pub fn maxRequestBytesFor(path: []const u8) usize {
+    for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
+        if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
+    return max_request_bytes;
+}
+
+/// The 413 names BOTH numbers it compared (context-overflow-400 class): a
+/// refusal that only names the cap reads as "this should have worked".
+fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
+    const mb = 1024 * 1024;
+    return std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds this endpoint's {d} MB limit", .{
+        (got + mb - 1) / mb, cap / mb,
+    }) catch "Request body too large";
+}
+
 /// The requested model id from a request body of EITHER shape.
 ///
 /// Every endpoint we serve takes JSON except `/v1/images/edits`, which is
@@ -1566,9 +1588,20 @@ fn handleConnection(
     // Phase 2: Allocate buffer for full request and read remaining body
     const cl = content_length orelse 0;
     const total_size = header_end_pos + cl;
-    const max_request_size = 64 * 1024 * 1024; // 64MB hard limit
+    // The cap is per ROUTE, so peek the path off the request line we already
+    // have — media bodies carry base64 frames and dwarf any JSON chat body.
+    const req_path = blk: {
+        const line_end = std.mem.indexOf(u8, hdr_buf[0..header_end_pos], "\r\n") orelse break :blk "";
+        var it = std.mem.splitScalar(u8, hdr_buf[0..line_end], ' ');
+        _ = it.next();
+        break :blk it.next() orelse "";
+    };
+    const max_request_size = maxRequestBytesFor(req_path);
     if (total_size > max_request_size) {
-        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", "Request body too large (max 64MB)", 413);
+        var msg_buf: [128]u8 = undefined;
+        const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
+        log.warn("[http] 413 {s}: {s}\n", .{ req_path, msg });
+        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
         return;
     }
 
@@ -15080,4 +15113,27 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
     // A token straddling the boundary belongs to content — it put bytes there.
     const mid = contentTokenRange(allocator, &tok, &token_ids, full, full[("<think>\nBecause.\n</thi").len..]);
     try std.testing.expectEqual(@as(usize, 2), mid.start);
+}
+
+test "request body cap is per route: media bodies are base64 frame payloads" {
+    // Issue #151: ONE ref2va reference video is ~100 MB of base64 JPEG frames,
+    // three of them plus full-res ref images can approach 500 MB — while no
+    // JSON chat body has any business near 64 MB.
+    for ([_][]const u8{
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/video/generations",
+        "/v1/audio/speech",
+        "/v1/audio/music-generations",
+        "/v1/3d/generations",
+    }) |p| try std.testing.expectEqual(max_media_request_bytes, maxRequestBytesFor(p));
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/api/chat", "/", "" }) |p|
+        try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
+}
+
+test "the 413 names both counts it compared" {
+    var buf: [128]u8 = undefined;
+    const msg = payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "98 MB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "64 MB") != null);
 }

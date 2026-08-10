@@ -551,11 +551,14 @@ mlx-serve is built on a 16 GB M4 Mac mini and a 128 GB M4 Max, and lately the ma
 
 So there's a fund for a Mac Studio Ultra. If mlx-serve replaced an API bill for you and you feel like chipping in, the button is [here](https://github.com/sponsors/ddalcu) (or [Buy Me a Coffee](https://buymeacoffee.com/ddalcu)). Nothing gets paywalled either way: MIT now, MIT after.
 
-**Progress:** ▱▱▱▱▱▱▱▱▱▱ 0%
+**Progress:** ▱▱▱▱▱▱▱▱▱▱ 1%
 
 ### Thanks to
 
-Nobody yet. Everyone who chips in gets a line here, with a link if they want one, or stays anonymous. Thank you in advance.
+@jcprichard
+@skudinov
+
+Everyone who chips in gets a line here, with a link if they want one, or stays anonymous. (msg me) Thank you in advance.
 
 ## Follow along
 
