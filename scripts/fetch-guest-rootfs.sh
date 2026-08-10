@@ -23,7 +23,7 @@ ROOTFS_IMAGE="${GUEST_ROOTFS_IMAGE:-ddalcu/agent-shell-mlxserve}"
 # Manifest-list digest of the pinned image (docker buildx imagetools inspect).
 # Empty = pull `:latest` unpinned — first-bring-up escape hatch only; a build
 # from an unpinned tag is not reproducible.
-ROOTFS_DIGEST="${GUEST_ROOTFS_DIGEST:-sha256:a46f6170612a29828cc2567f337e2c28a85981f7d0068f02a6937cfafb0c4db0}"
+ROOTFS_DIGEST="${GUEST_ROOTFS_DIGEST:-sha256:72c09e9266d5a38478035fbc7a15b3726de14bbd39bad8e0b89c0e3153743268}"
 
 # Expected kernel SHA256 (of the .gz release asset). The rootfs needs no
 # separate hash — the docker digest IS content-addressed.
