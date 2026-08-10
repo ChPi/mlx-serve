@@ -45,6 +45,7 @@ let supportedModelTypes: Set<String> = [
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
+    "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text served, vision pending)
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so

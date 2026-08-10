@@ -3359,6 +3359,12 @@ const LayerWeights = struct {
     kv_source: ?u32 = null,
     // Gemma 4 (31B): V aliases K projection within this layer (no v_proj weight loaded)
     k_eq_v: bool = false,
+    // MuseGlimmer: elementwise sigmoid attention output gate
+    // (self_attn.gate_proj, read off the post-input-norm hidden). Null ag_w
+    // on every other arch.
+    ag_w: ?mlx.mlx_array = null,
+    ag_s: mlx.mlx_array = .{ .ctx = null },
+    ag_b: mlx.mlx_array = .{ .ctx = null },
 };
 
 // ── MoE model per-layer weights ──
@@ -4533,6 +4539,10 @@ pub const Transformer = struct {
     self_cond: ?SelfCondWeights = null,
     ones_hidden: ?mlx.mlx_array = null,
 
+    // MuseGlimmer: bf16 output_multiplier scalar applied to logits BEFORE the
+    // tanh softcap (reference: T * tanh(logits * mult / T)). Null elsewhere.
+    output_mult: ?mlx.mlx_array = null,
+
     // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
     rope_freqs_global: ?mlx.mlx_array,
 
@@ -4702,8 +4712,20 @@ pub const Transformer = struct {
             final_norm = getWeightFmt(weights, &name_buf, "{s}.norm_f.weight", prefix);
         } else {
             const final_norm_raw = getWeightFmt(weights, &name_buf, "{s}.norm.weight", prefix);
-            final_norm = if (config.norm_has_offset) try addOne(final_norm_raw, s) else final_norm_raw;
-            if (config.norm_has_offset) try mlx.check(mlx.mlx_array_eval(final_norm));
+            const fold_final = config.norm_has_offset and !config.final_norm_plain;
+            if (fold_final) {
+                final_norm = try addOne(final_norm_raw, s);
+                try mlx.check(mlx.mlx_array_eval(final_norm));
+            } else if (config.norm_has_offset) {
+                // final_norm_plain (muse_glimmer): the final norm is plain-scale
+                // (ones-init) while the layer norms fold +1. owns_norms will
+                // free final_norm at deinit, so take our own +1 handle instead
+                // of aliasing the weights map's.
+                final_norm = mlx.mlx_array_new();
+                _ = mlx.mlx_array_set(&final_norm, final_norm_raw);
+            } else {
+                final_norm = final_norm_raw;
+            }
         }
 
         var lm_head_w: mlx.mlx_array = undefined;
@@ -4863,6 +4885,12 @@ pub const Transformer = struct {
             softcap_scalar = bf16Scalar(config.final_logit_softcapping, s);
         }
 
+        // MuseGlimmer: logits scale applied before the softcap.
+        var output_mult: ?mlx.mlx_array = null;
+        if (config.output_multiplier > 0) {
+            output_mult = bf16Scalar(config.output_multiplier, s);
+        }
+
         // Gemma 4: v_norm weights (parameter-free: ones vectors)
         var v_norm_weight: ?mlx.mlx_array = null;
         var v_norm_weight_global: ?mlx.mlx_array = null;
@@ -4885,6 +4913,15 @@ pub const Transformer = struct {
         // conditioning signal — i.e. they are always RMS-normalized pre-layer-0).
         var self_cond: ?SelfCondWeights = null;
         var ones_hidden: ?mlx.mlx_array = null;
+        // MuseGlimmer's normed embeddings share the diffusion path's
+        // ones(hidden_size) vector for their weight-less RMS norm.
+        if (config.normed_embeddings) {
+            const one_val = bf16Scalar(1.0, s);
+            defer _ = mlx.mlx_array_free(one_val);
+            const h_shape = [_]c_int{@intCast(config.hidden_size)};
+            ones_hidden = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, .bfloat16, s));
+        }
         if (config.isDiffusion()) {
             self_cond = .{
                 .pre_norm = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.pre_norm.weight", prefix),
@@ -5164,6 +5201,7 @@ pub const Transformer = struct {
             .ple_proj_norm = ple_proj_norm,
             .ple_proj_quantized = ple_proj_quantized,
             .softcap_scalar = softcap_scalar,
+            .output_mult = output_mult,
             .v_norm_weight = v_norm_weight,
             .v_norm_weight_global = v_norm_weight_global,
             .self_cond = self_cond,
@@ -5764,6 +5802,7 @@ pub const Transformer = struct {
         if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
         if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
+        if (self.output_mult) |m| _ = mlx.mlx_array_free(m);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
@@ -6408,6 +6447,15 @@ pub const Transformer = struct {
         return self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk, true);
     }
 
+    /// rmsNorm with an explicit epsilon — muse_glimmer's post-attention /
+    /// post-feedforward norms run at post_norm_eps (1e-8) while every other
+    /// norm keeps rms_norm_eps.
+    inline fn rmsNormEps(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, eps: f32) !mlx.mlx_array {
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, eps, self.s));
+        return result;
+    }
+
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, self.config.rms_norm_eps, self.s));
@@ -6486,6 +6534,16 @@ pub const Transformer = struct {
         var reshaped = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(reshaped);
         try mlx.check(mlx.mlx_reshape(&reshaped, emb, &out_shape, 3, self.s));
+
+        // MuseGlimmer: weight-less RMS norm on the looked-up embeddings (the
+        // reference's MuseGlimmerTextNormedEmbedding — deliberately NOT folded
+        // into the table). Mutually exclusive with emb_scale by construction
+        // (scale_embeddings is false whenever normed_embeddings is set).
+        if (self.config.normed_embeddings) {
+            var normed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_fast_rms_norm(&normed, reshaped, self.ones_hidden.?, self.config.rms_norm_eps, self.s));
+            return normed;
+        }
 
         if (self.emb_scale) |scale| {
             var scaled = mlx.mlx_array_new();
@@ -7560,12 +7618,9 @@ pub const Transformer = struct {
         const kv_h = cfg.num_key_value_heads;
         const hd = cfg.head_dim;
         const has_dual_hd = cfg.global_head_dim > 0 and cfg.global_head_dim != hd;
-        // Gemma 4: scale = 1.0 because QK-norm handles normalization
-        // Gemma 3 and others: 1/sqrt(query_pre_attn_scalar)
-        const attn_scale: f32 = if (std.mem.eql(u8, cfg.model_type, "gemma4"))
-            1.0
-        else
-            1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
+        // Gemma 4: 1.0 (QK-norm handles normalization); muse_glimmer:
+        // qk_scale_factor/sqrt(head_dim); others: 1/sqrt(query_pre_attn_scalar).
+        const attn_scale: f32 = cfg.attnScale();
 
         var h = try self.embedding(token_ids);
 
@@ -7706,7 +7761,10 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(q_t);
             try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed orelse q_r, &perm, 4, self.s));
 
-            // RoPE on Q (proportional for global layers when available)
+            // RoPE on Q (proportional for global layers when available).
+            // muse_glimmer NoPE layers (layer_rope_theta 0) skip rotation on
+            // BOTH Q and K — position enters only through the causal mask.
+            const skip_rope = cfg.layerSkipsRope(li);
             const use_prop_rope = is_global and self.rope_freqs_global != null;
             const rope_base_opt = mlx.mlx_optional_float{
                 .value = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq,
@@ -7718,7 +7776,11 @@ pub const Transformer = struct {
             const effective_rope_dims: c_int = if (use_prop_rope) @intCast(cur_hd) else rope_dims;
             var q_rope = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_rope);
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
+            if (skip_rope) {
+                _ = mlx.mlx_array_set(&q_rope, q_t);
+            } else {
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
+            }
 
             // K, V and cache — either compute or read from shared source.
             // `kv_view` is the lifetime owner: in dense mode it aliases the
@@ -7782,10 +7844,14 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_transpose_axes(&own_k_t, k_for_rope, &perm, 4, self.s));
                 try mlx.check(mlx.mlx_transpose_axes(&own_v_t, v_after_norm, &perm, 4, self.s));
 
-                // RoPE on K
+                // RoPE on K (NoPE layers store K un-rotated)
                 var own_k_rope = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(own_k_rope);
-                try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
+                if (skip_rope) {
+                    _ = mlx.mlx_array_set(&own_k_rope, own_k_t);
+                } else {
+                    try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
+                }
 
                 // Update KV cache
                 const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
@@ -7900,12 +7966,26 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(attn_flat);
             try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, cur_out_shape, 3, self.s));
 
-            const o_out = try self.qmatmul(attn_flat, lw.o_w, lw.o_s, lw.o_b);
+            // MuseGlimmer: elementwise sigmoid output gate from the SAME
+            // post-input-norm hidden the QKV projections read.
+            var attn_gated = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_gated);
+            const o_in = if (lw.ag_w) |agw| blk: {
+                const g_raw = try self.qmatmul(normed, agw, lw.ag_s, lw.ag_b);
+                defer _ = mlx.mlx_array_free(g_raw);
+                var g_sig = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(g_sig);
+                try mlx.check(mlx.mlx_sigmoid(&g_sig, g_raw, self.s));
+                try mlx.check(mlx.mlx_multiply(&attn_gated, attn_flat, g_sig, self.s));
+                break :blk attn_gated;
+            } else attn_flat;
+
+            const o_out = try self.qmatmul(o_in, lw.o_w, lw.o_s, lw.o_b);
             defer _ = mlx.mlx_array_free(o_out);
 
             // MLP with pre/post FF norms (Gemma 3/4 style) or simple residual (Llama style)
             if (cfg.has_pre_ff_norm) {
-                const attn_normed = try self.rmsNorm(o_out, lw.post_attn_norm);
+                const attn_normed = try self.rmsNormEps(o_out, lw.post_attn_norm, cfg.postNormEps());
                 defer _ = mlx.mlx_array_free(attn_normed);
                 var h_new = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
@@ -7924,7 +8004,7 @@ pub const Transformer = struct {
                 const down = try self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
                 defer _ = mlx.mlx_array_free(down);
 
-                const mlp_normed = try self.rmsNorm(down, lw.post_ff_norm.?);
+                const mlp_normed = try self.rmsNormEps(down, lw.post_ff_norm.?, cfg.postNormEps());
                 defer _ = mlx.mlx_array_free(mlp_normed);
                 var h_next = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_next, h, mlp_normed, self.s));
@@ -8002,6 +8082,15 @@ pub const Transformer = struct {
         var logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
         _ = mlx.mlx_array_free(final_normed);
 
+        // MuseGlimmer: pre-scale logits by output_multiplier BEFORE the softcap
+        // (reference: T * tanh(logits * mult / T)).
+        if (self.output_mult) |m| {
+            var scaled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&scaled, logits, m, self.s));
+            _ = mlx.mlx_array_free(logits);
+            logits = scaled;
+        }
+
         // Gemma 4: logit softcapping — tanh(logits / cap) * cap
         if (self.softcap_scalar != null) {
             const capped = try self.applySoftcap(logits);
@@ -8050,10 +8139,7 @@ pub const Transformer = struct {
         const has_dual_hd = cfg.global_head_dim > 0 and cfg.global_head_dim != hd;
         const ghd: u32 = if (has_dual_hd) cfg.global_head_dim else hd;
         const gkv_h: u32 = if (cfg.num_global_key_value_heads > 0) cfg.num_global_key_value_heads else kv_h;
-        const attn_scale: f32 = if (std.mem.eql(u8, cfg.model_type, "gemma4"))
-            1.0
-        else
-            1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
+        const attn_scale: f32 = cfg.attnScale();
 
         // 1. Build [N, 1] int32 token tensor from u32 input.
         var token_buf = try self.allocator.alloc(i32, next_tokens.len);
@@ -8106,6 +8192,7 @@ pub const Transformer = struct {
             const cur_kv_shape = [_]c_int{ N, 1, @intCast(cur_kv_h), @intCast(cur_hd) };
             const cur_out_shape = [_]c_int{ N, 1, @intCast(h_count * cur_hd) };
             // RoPE dims — same logic as forwardStandard's decode path.
+            const skip_rope = cfg.layerSkipsRope(li);
             const use_prop_rope = is_global and self.rope_freqs_global != null;
             const rope_dims_partial: c_int = if (is_global and cfg.partial_rotary_factor_global < 1.0)
                 @intCast(@as(u32, @intFromFloat(@as(f32, @floatFromInt(cur_hd)) * cfg.partial_rotary_factor_global)))
@@ -8140,7 +8227,11 @@ pub const Transformer = struct {
 
             var q_rope = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_rope);
-            try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, rope_offset_arr, rope_freqs, self.s));
+            if (skip_rope) {
+                _ = mlx.mlx_array_set(&q_rope, q_t);
+            } else {
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, rope_offset_arr, rope_freqs, self.s));
+            }
 
             const max_kv_per_layer: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
 
@@ -8193,7 +8284,11 @@ pub const Transformer = struct {
 
                 var own_k_rope = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(own_k_rope);
-                try mlx.check(mlx.mlx_fast_rope_dynamic(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, rope_offset_arr, rope_freqs, self.s));
+                if (skip_rope) {
+                    _ = mlx.mlx_array_set(&own_k_rope, own_k_t);
+                } else {
+                    try mlx.check(mlx.mlx_fast_rope_dynamic(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, rope_offset_arr, rope_freqs, self.s));
+                }
 
                 // Per-slot cache update at B=1 — slice axis 0 of stacked tensors.
                 const k_shape_full = mlx.getShape(own_k_rope);
@@ -8259,12 +8354,25 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(attn_flat);
             try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &cur_out_shape, 3, self.s));
 
-            const o_out = try self.qmatmul(attn_flat, lw.o_w, lw.o_s, lw.o_b);
+            // MuseGlimmer sigmoid output gate — mirrors forwardStandard.
+            var attn_gated = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_gated);
+            const o_in = if (lw.ag_w) |agw| blk: {
+                const g_raw = try self.qmatmul(normed, agw, lw.ag_s, lw.ag_b);
+                defer _ = mlx.mlx_array_free(g_raw);
+                var g_sig = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(g_sig);
+                try mlx.check(mlx.mlx_sigmoid(&g_sig, g_raw, self.s));
+                try mlx.check(mlx.mlx_multiply(&attn_gated, attn_flat, g_sig, self.s));
+                break :blk attn_gated;
+            } else attn_flat;
+
+            const o_out = try self.qmatmul(o_in, lw.o_w, lw.o_s, lw.o_b);
             defer _ = mlx.mlx_array_free(o_out);
 
             // MLP path — mirrors forwardStandard exactly.
             if (cfg.has_pre_ff_norm) {
-                const attn_normed = try self.rmsNorm(o_out, lw.post_attn_norm);
+                const attn_normed = try self.rmsNormEps(o_out, lw.post_attn_norm, cfg.postNormEps());
                 defer _ = mlx.mlx_array_free(attn_normed);
                 var h_new = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
@@ -8282,7 +8390,7 @@ pub const Transformer = struct {
                 const down = try self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
                 defer _ = mlx.mlx_array_free(down);
 
-                const mlp_normed = try self.rmsNorm(down, lw.post_ff_norm.?);
+                const mlp_normed = try self.rmsNormEps(down, lw.post_ff_norm.?, cfg.postNormEps());
                 defer _ = mlx.mlx_array_free(mlp_normed);
                 var h_next = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_next, h, mlp_normed, self.s));
@@ -8332,6 +8440,13 @@ pub const Transformer = struct {
 
         var logits = try self.lmHeadProject(final_normed, false);
         _ = mlx.mlx_array_free(final_normed);
+
+        if (self.output_mult) |m| {
+            var scaled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&scaled, logits, m, self.s));
+            _ = mlx.mlx_array_free(logits);
+            logits = scaled;
+        }
 
         if (self.softcap_scalar != null) {
             const capped = try self.applySoftcap(logits);
@@ -12224,6 +12339,20 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
                 const k_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight");
                 lw.k_norm = if (config.norm_has_offset) try addOne(k_norm_raw, s) else k_norm_raw;
             }
+        } else if (config.qk_norm_weightless) {
+            // MuseGlimmer: shared WEIGHT-LESS RMS norm on Q and K heads — the
+            // checkpoint ships no q_norm/k_norm tensors, so synthesize
+            // ones(head_dim) per layer (owned; freed under owns_norms). The
+            // (1+w) fold never applies to these.
+            const one_val = bf16Scalar(1.0, s);
+            defer _ = mlx.mlx_array_free(one_val);
+            const hd_shape = [_]c_int{@intCast(config.head_dim)};
+            var q_ones = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&q_ones, &hd_shape, 1, one_val, .bfloat16, s));
+            var k_ones = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&k_ones, &hd_shape, 1, one_val, .bfloat16, s));
+            lw.q_norm = q_ones;
+            lw.k_norm = k_ones;
         } else {
             lw.q_norm = null;
             lw.k_norm = null;
@@ -12269,6 +12398,18 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         lw.o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits);
         lw.o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config);
 
+        // MuseGlimmer sigmoid attention output gate. `layers` comes from a raw
+        // alloc, so the struct-default nulls never apply — set every field.
+        if (config.attn_sigmoid_gate) {
+            lw.ag_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.gate_proj.weight");
+            lw.ag_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.gate_proj.scales", config.quant_bits);
+            lw.ag_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.gate_proj.biases", &config);
+        } else {
+            lw.ag_w = null;
+            lw.ag_s = mlx.mlx_array_new();
+            lw.ag_b = mlx.mlx_array_new();
+        }
+
         lw.gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight");
         lw.gate_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.scales", config.quant_bits);
         lw.gate_b = getLayerBias(weights, name_buf, prefix, li, "mlp.gate_proj.biases", &config);
@@ -12289,6 +12430,11 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             try maybeTransposeForBf16(&lw.v_w, lw.v_s, &owned_bf16, allocator, s);
         }
         try maybeTransposeForBf16(&lw.o_w, lw.o_s, &owned_bf16, allocator, s);
+        if (lw.ag_w != null) {
+            var agw = lw.ag_w.?;
+            try maybeTransposeForBf16(&agw, lw.ag_s, &owned_bf16, allocator, s);
+            lw.ag_w = agw;
+        }
         try maybeTransposeForBf16(&lw.gate_w, lw.gate_s, &owned_bf16, allocator, s);
         try maybeTransposeForBf16(&lw.up_w, lw.up_s, &owned_bf16, allocator, s);
         try maybeTransposeForBf16(&lw.down_w, lw.down_s, &owned_bf16, allocator, s);

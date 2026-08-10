@@ -206,6 +206,24 @@ pub const ModelConfig = struct {
     num_attention_heads_per_layer: [128]u32 = @splat(0),
     has_per_layer_heads: bool = false,
 
+    // MuseGlimmer (muse_glimmer): weight-less shared QK RMS-norm with Q scaled
+    // by qk_scale_factor (folded into attnScale — a scalar commutes through
+    // RoPE and QK^T), elementwise sigmoid attention output gate from a
+    // separate self_attn.gate_proj read off the post-input-norm hidden,
+    // RMS-normed embeddings (NO sqrt(hidden) scale), Gemma2-centered sandwich
+    // norms whose POST norms use post_norm_eps while the FINAL norm is
+    // plain-scale (ones-init), logits scaled by output_multiplier before the
+    // tanh softcap, and NoPE on layers whose layer_rope_theta entry is 0
+    // (exactly the full-attention layers in the released checkpoint).
+    qk_scale_factor: f32 = 0.0, // 0 = off
+    output_multiplier: f32 = 0.0, // 0 = off
+    post_norm_eps: f32 = 0.0, // 0 = same as rms_norm_eps
+    final_norm_plain: bool = false, // final norm skips the (1+w) fold
+    qk_norm_weightless: bool = false, // param-free RMS on Q and K heads
+    normed_embeddings: bool = false, // param-free RMS after embedding lookup
+    attn_sigmoid_gate: bool = false, // attn_out *= sigmoid(gate_proj(normed))
+    layer_no_rope: [128]bool = @splat(false),
+
     // Laguna YaRN RoPE (full-attention layers only; sliding layers use default
     // RoPE at rope_local_base_freq). rope_yarn gates the freqs + mscale
     // precompute at model load; the sliding/full split is by isGlobalLayer.
@@ -619,6 +637,40 @@ pub const ModelConfig = struct {
         if (!self.isEosToken(106)) self.addEosToken(106);
     }
 
+    /// MuseGlimmer terminators: <|end_of_text|> = 200001 and <|eot|> = 200008
+    /// (the chat template's turn terminator; <|eom|> 200007 is deliberately
+    /// NOT an eos — generation continues across channel segments). Additive +
+    /// dedup-guarded like ensureGemmaTerminators.
+    pub fn ensureMuseTerminators(self: *ModelConfig) void {
+        if (!self.isEosToken(200001)) self.addEosToken(200001);
+        if (!self.isEosToken(200008)) self.addEosToken(200008);
+    }
+
+    /// NoPE layers (muse_glimmer: layer_rope_theta[i] == 0). The released
+    /// checkpoint's NoPE layers are exactly its full-attention layers, but the
+    /// two facts stay independently parsed — layer_types drives masking,
+    /// layer_rope_theta drives rotation.
+    pub fn layerSkipsRope(self: *const ModelConfig, layer_idx: u32) bool {
+        return layer_idx < 128 and self.layer_no_rope[layer_idx];
+    }
+
+    /// Post-attention / post-feedforward norm epsilon (muse_glimmer separates
+    /// it from rms_norm_eps; everyone else shares one value).
+    pub fn postNormEps(self: *const ModelConfig) f32 {
+        return if (self.post_norm_eps > 0) self.post_norm_eps else self.rms_norm_eps;
+    }
+
+    /// SDPA softmax scale for the standard dense forward. MuseGlimmer
+    /// multiplies the unit-RMS Q by qk_scale_factor on top of the standard
+    /// 1/sqrt(head_dim); Gemma 4's QK-norm handles normalization (scale 1.0);
+    /// everything else keys on query_pre_attn_scalar.
+    pub fn attnScale(self: *const ModelConfig) f32 {
+        if (self.qk_scale_factor > 0)
+            return self.qk_scale_factor / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+        if (std.mem.eql(u8, self.model_type, "gemma4")) return 1.0;
+        return 1.0 / @sqrt(@as(f32, @floatFromInt(self.query_pre_attn_scalar)));
+    }
+
     /// Hy3 (hy_v3) family terminator: <｜hy_eos:opensource｜> = 120025. Real
     /// MLX conversions (ox-ox 2-bit) ship NO eos in config.json and NO
     /// generation_config.json, so without this merge generation never halts.
@@ -651,8 +703,10 @@ pub const ModelConfig = struct {
     /// the shipped template agrees — never inferred from "the template mentions
     /// enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig) bool {
-        _ = self;
-        return false;
+        // muse_glimmer has no thinking-off switch — the model always opens a
+        // `to=self` reasoning segment, so default to delivering it as
+        // reasoning_content rather than silently dropping it.
+        return std.mem.eql(u8, self.model_type, "muse_glimmer");
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -1414,6 +1468,44 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // shouldKeepWeightKey) — never advertise vision for this arch.
         config.has_vision = false;
         config.ensureGemmaTerminators();
+    } else if (std.mem.eql(u8, model_type, "muse_glimmer") or
+        std.mem.eql(u8, model_type, "muse_glimmer_text"))
+    {
+        // Muse-Glimmer-30B (meta-models). Dense GQA trunk (32/2 heads, hd 128)
+        // with Gemma2-style sandwich-norm layers; every 4th layer counted
+        // backward from the last is full-attention AND NoPE (layer_rope_theta
+        // 0), the rest slide at 2048. "muse_glimmer_text" is the flat
+        // text-only sibling (bare "model" prefix, no text_config).
+        config.model_type = "muse_glimmer";
+        config.weight_prefix = if (root.get("text_config") != null) "model.language_model" else "model";
+        config.hidden_act = .silu;
+        config.norm_has_offset = true; // sandwich norms are Gemma2-centered (1+w)…
+        config.final_norm_plain = true; // …but model.norm is plain-scale (ones-init)
+        config.scale_embeddings = false; // embeddings are RMS-normed, not sqrt(hidden)-scaled
+        config.has_pre_ff_norm = true;
+        config.has_qk_norm = false; // no q_norm/k_norm tensors in the checkpoint —
+        config.qk_norm_weightless = true; // shared weight-less RMS on Q and K instead
+        config.normed_embeddings = true;
+        config.attn_sigmoid_gate = true;
+        // Reference-config class defaults, overridden by explicit keys below.
+        config.qk_scale_factor = 3.87;
+        config.output_multiplier = 0.19611613513818404;
+        config.post_norm_eps = 1e-8;
+        if (cfg_obj.get("qk_scale_factor")) |v| config.qk_scale_factor = jsonFloat(v);
+        if (cfg_obj.get("output_multiplier")) |v| config.output_multiplier = jsonFloat(v);
+        if (cfg_obj.get("post_norm_eps")) |v| config.post_norm_eps = jsonFloat(v);
+        if (cfg_obj.get("layer_rope_theta")) |lrt| {
+            if (lrt == .array) {
+                for (lrt.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    config.layer_no_rope[i] = jsonFloat(item) == 0;
+                }
+            }
+        }
+        // Vision tower/adapter/projection are not wired in v1 — weights are
+        // dropped at load (shouldKeepWeightKey); never advertise vision.
+        config.has_vision = false;
+        config.ensureMuseTerminators();
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
@@ -2347,6 +2439,11 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // pass multiplies by them instead of the decoder's layer_scalar.
     if (std.mem.startsWith(u8, key, "model.encoder.vision_tower.") or
         std.mem.startsWith(u8, key, "model.encoder.embed_vision.")) return false;
+    // Muse-Glimmer's vision tower/adapter/projection are not wired yet —
+    // always drop so a text load doesn't carry ~2 GB of dead tower weights.
+    if (std.mem.startsWith(u8, key, "model.vision_tower.") or
+        std.mem.startsWith(u8, key, "model.vision_adapter.") or
+        std.mem.startsWith(u8, key, "model.vision_projection.")) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -2606,12 +2703,16 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
 }
 
 test "defaultEnableThinking: opt-in per arch, and every existing arch stays off" {
-    // No arch opts in today — including the families whose templates merely
+    // No prior arch opts in — including the families whose templates merely
     // MENTION enable_thinking, which is not evidence of a thinking-on default.
     for ([_][]const u8{ "qwen3", "qwen3_5_moe", "gemma4", "gemma3_text", "laguna", "deepseek_v4", "inkling_mm_model", "llama", "hy_v3", "lfm2" }) |t| {
         const c = ModelConfig{ .model_type = t };
         try testing.expect(!c.defaultEnableThinking());
     }
+    // muse_glimmer opts IN: its template has no thinking-off switch and the
+    // model always opens a to=self reasoning segment.
+    const muse = ModelConfig{ .model_type = "muse_glimmer" };
+    try testing.expect(muse.defaultEnableThinking());
 }
 
 test "ModelConfig addEosToken" {
@@ -3117,6 +3218,106 @@ test "ModelConfig: laguna YaRN mscale is COMPUTED, never read from attention_fac
     try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
     // 0.1 * ln(32) + 1 — the same value S's config ships literally.
     try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-6);
+}
+
+test "ModelConfig parses muse_glimmer (Muse-Glimmer-30B): NoPE full layers, qk scale, mixed norm offsets" {
+    // Trimmed but faithful copy of meta-models/Muse-Glimmer-30B config.json.
+    // 8 layers = two sliding/full groups; full attention every 4th layer
+    // counted backward from the last (i%4==3 for 8 layers), and exactly those
+    // layers have layer_rope_theta 0 (NoPE).
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer",
+        \\  "image_token_id": 200092,
+        \\  "text_config": {
+        \\    "model_type": "muse_glimmer_text",
+        \\    "hidden_size": 6656,
+        \\    "intermediate_size": 19968,
+        \\    "num_hidden_layers": 8,
+        \\    "num_attention_heads": 32,
+        \\    "num_key_value_heads": 2,
+        \\    "head_dim": 128,
+        \\    "hidden_activation": "silu",
+        \\    "rms_norm_eps": 1e-05,
+        \\    "post_norm_eps": 1e-08,
+        \\    "qk_scale_factor": 3.87,
+        \\    "output_multiplier": 0.19611613513818404,
+        \\    "final_logit_softcapping": 20.0,
+        \\    "vocab_size": 202048,
+        \\    "max_position_embeddings": 131072,
+        \\    "tie_word_embeddings": false,
+        \\    "bos_token_id": 200000,
+        \\    "eos_token_id": 200001,
+        \\    "sliding_window": 2048,
+        \\    "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+        \\                    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\    "layer_rope_theta": [500000.0, 500000.0, 500000.0, 0, 500000.0, 500000.0, 500000.0, 0],
+        \\    "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"}
+        \\  },
+        \\  "vision_config": {"model_type": "muse_glimmer_vision"},
+        \\  "quantization": {"group_size": 64, "bits": 8}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("muse_glimmer", config.model_type);
+    try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 32), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 2), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 2048), config.sliding_window);
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(config.layer_is_global[3]);
+    try testing.expect(config.layer_is_global[7]);
+    try testing.expect(!config.layer_is_global[2]);
+    // NoPE: exactly the full-attention layers skip RoPE (layer_rope_theta 0).
+    try testing.expect(config.layerSkipsRope(3));
+    try testing.expect(config.layerSkipsRope(7));
+    try testing.expect(!config.layerSkipsRope(0));
+    try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_theta, 1e-3);
+    // Attention scale folds the post-qk-norm Q multiplier into 1/sqrt(head_dim).
+    try testing.expectApproxEqAbs(@as(f32, 3.87 / 11.313708), config.attnScale(), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.19611613513818404), config.output_multiplier, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 20.0), config.final_logit_softcapping, 1e-6);
+    // Sandwich norms are Gemma2-centered (1+w) at eps 1e-5 / post-norms 1e-8;
+    // the FINAL norm is plain-scale (Gemma4 style, ones-init).
+    try testing.expect(config.norm_has_offset);
+    try testing.expect(config.final_norm_plain);
+    try testing.expectApproxEqAbs(@as(f32, 1e-08), config.postNormEps(), 1e-12);
+    try testing.expect(config.has_pre_ff_norm);
+    // Weight-less shared qk-norm (no q_norm/k_norm tensors in the checkpoint),
+    // RMS-normed embeddings with NO sqrt(hidden) scale, sigmoid attn out gate.
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(config.qk_norm_weightless);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(config.normed_embeddings);
+    try testing.expect(config.attn_sigmoid_gate);
+    try testing.expect(!config.tie_word_embeddings);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    // <|end_of_text|>(200001) from config + <|eot|>(200008), the template's
+    // turn terminator, merged additively.
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expectEqual(@as(u32, 200001), config.eos_token_ids[0]);
+    try testing.expectEqual(@as(u32, 200008), config.eos_token_ids[1]);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "ModelConfig muse_glimmer_text flat sibling collapses onto muse_glimmer with bare prefix" {
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer_text",
+        \\  "hidden_size": 6656,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "vocab_size": 202048,
+        \\  "sliding_window": 2048
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("muse_glimmer", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
 }
 
 test "ModelConfig parses inkling_mm_model (Thinking Machines Inkling Small REAP25)" {

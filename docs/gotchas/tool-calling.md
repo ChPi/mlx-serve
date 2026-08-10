@@ -467,3 +467,53 @@ are load-bearing and each protects a case the other breaks:
 Only the `<tool_call` family is considered: it is the one whose bodies carry
 free-form argument text. Ordinary shapes (`<think>r</think>a`, and a think
 block followed by a real call) are untouched, pinned in the unit test.
+
+## Muse-Glimmer channel headers are ORDINARY text between single-token markers (2026-08-10)
+
+Muse-Glimmer (`muse_glimmer`) emits harmony-style segments after the prompt's
+bare `<|start|>assistant`:
+
+```
+ to=self<|message|>REASONING<|eom|><|start|>assistant to=user<|message|>ANSWER<|eot|>
+```
+
+`<|start|>`/`<|message|>`/`<|eom|>`/`<|eot|>` are single special tokens
+(200022/200023/200007/200008) and arrive atomically, like Inkling's markers.
+The trap is the `assistant to=<recipient>` HEADER between them: unlike every
+prior channel family it is ordinary BPE text, arriving over several deltas.
+Inkling's marker-token filtering can't cover it — a flushed header leaks
+` to=user` fragments into visible content.
+
+First live boot leaked exactly that: a thinking-off `/v1/messages` stream
+shipped a bare `" to"` text delta before the tool block, because both muse
+holds checked `startsWith(lead, "to=")` and the two-byte buffer `" to"` is
+SHORTER than the needle. A strict prefix of `to=` must hold too.
+
+The complete rules, shared by every streaming surface:
+
+- An UNRESOLVED header (no `<|message|>` yet, including sub-`to=` prefixes)
+  always holds (`museStreamVerdict` → `.hold_thinking`,
+  `museHeaderHoldsForTools` → true). Prose that merely starts with `to=` is
+  released at the first byte outside the recipient grammar
+  (`museIsRecipientChar`), so the false-positive cost is a transient
+  one-token hold.
+- Resolved `to=self` → reasoning (streams incrementally; closes at `<|eom|>`);
+  `to=user`/bare → ONE `.split_think` so the handler strips the header, then
+  content flows; anything else names a TOOL and the segment body is ATEM
+  payload — buffered to end-of-generation.
+- In the plain (post-think) arm, `<|start|>` arms a header skip and
+  `<|message|>` disarms it (`museHeaderSkipNext`) — the tokens between are
+  role+recipient text, never content.
+
+ATEM parse rules (`parseAtemToolCalls`): keys on `<atem:invoke` (a dropped
+`<atem:function_calls>` wrapper still parses — delimiter-drop class); string
+values are RAW bytes to the CONFIRMED `</atem:parameter>` close, never trimmed
+(the Hermes trim gap stays Hermes'); a value that parses as complete JSON
+keeps its spelled type, schema coercion gets the final word; truncation ships
+NAME + completed params, fragments dropped.
+
+Also load-bearing: the shipped chat template `raise_exception`s unless
+tool-call `arguments` are dict-shaped — `serializeMessagesJson`'s
+object-passthrough covers it — and the template renders through our jinja.cpp
+byte-identical to python jinja2 (pinned test), so no transcription template
+was needed for this family.

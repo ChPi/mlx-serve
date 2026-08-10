@@ -849,3 +849,36 @@ The class was every size sum, not just the preflight: `scheduler.modelDiskBytes`
 Fix: every entry filter also accepts `.sym_link` and stats through it (`Dir.statFile` FOLLOWS symlinks by default — all stat-RESULT checks already worked), plus a post-stat `st.kind == .file` check so a symlink-to-directory can't be summed; dangling links hit the existing `catch continue`. Zero now means a genuinely weightless dir, so the allow-on-zero semantic stands. Guards: `modelDiskBytes follows HF-cache symlinks` (scheduler.zig), `discovery measures a SYMLINKED (HF hub cache) model dir's real bytes` (model_discovery.zig).
 
 Same report, second item: the CLI bound `0.0.0.0` by default, putting a first-launch server on whatever network the laptop joins. Kept (the app and Agent Sandbox need wide binds they set EXPLICITLY) but serve mode now warns when the bind is non-loopback and nobody chose it — no `--host`, no `--lan-share` (`server.shouldWarnOpenBind`); the default flips to 127.0.0.1 in a future release, at which point the helper's host check silences the warning without a code change.
+
+## A combined Split regex hides the digit rule inside an alternation (muse "8 4" echo, 2026-08-10)
+
+First live boot of Muse-Glimmer-30B echoed "What is 8 4 * 3 / 2?" for a prompt
+containing "84" — the DSV4 echo-precision class on a new spelling. The
+tokenizer ships the Llama-3-style COMBINED Split regex: case-classed word
+branches with an attached `(?i:'s|'t|'re|'ve|'m|'ll|'d)` contraction group,
+`\p{N}{1,3}`, ` ?[^\s\p{L}\p{N}]+[\r\n/]*`, and the usual whitespace tail —
+all alternatives of ONE pattern. `digitGroupFromPreTokenizer`'s deliberate
+exact-match (`regex == "\p{N}{1,3}"`) never fires on it, so the model was
+served per-digit numbers.
+
+The fix is a grammar, not a wider digit match: `Tokenizer.pretok_style =
+.llama3` (selected by `llama3StyleFromSplitRegex` — contraction group AND the
+{1,3} digit branch present) runs `llama3PreTokenize`: greedy upper-class run
+then greedy lower-class run per word (reproduces the regex's backtracking for
+disjoint ASCII classes; non-ASCII letters are treated caseless — both classes
+— which coincides on every reachable match END except mid-word case
+transitions in non-Latin cased scripts, a documented gap), attached (?i)
+contractions, {1,3} digit groups, marks riding with punct, and `/` joining
+the punct tail.
+
+Two verification traps burned time:
+
+- HF ENCODE output is not pre-token boundaries. "cat's" encodes as
+  `cat` + `'s` and "don't" as one token — both have the contraction ATTACHED
+  at the pre-token level; the visible splits are BPE-internal merges. Pin the
+  pre-tokenizer against the raw regex `findall` (python `regex` module), and
+  end-to-end ids against HF `tokenizers`.
+- The live tell was subtle: generation was coherent (the model still solved
+  the math) — only the echo spelled the number with spaces. Cross-check
+  `/tokenize` vs HF at bring-up, per the standing rule; it found 8/8 diverse
+  cases byte-identical after the fix.
