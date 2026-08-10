@@ -1017,11 +1017,31 @@ pub const ModelRegistry = struct {
     /// layer answers with a named 503 instead of the generic "Model load
     /// failed" 500 (#144); everything else is `LoadFailed` with the name
     /// readable via `loadErrorNameDupe`.
+    /// `OutOfMemory` counts too: an allocator failure during a load is the same
+    /// actionable thing to the user as the preflight's own refusal, and it
+    /// reached the client as a generic "Model load failed" 500 before
+    /// (2026-08-08). Merge note: this arm came from the branch's
+    /// `scheduler.loadErrorFor`, which this function replaced — the name-based
+    /// half survived the refactor, the second name did not.
     pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
+            if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
         }
         return error.LoadFailed;
+    }
+
+    test "a memory refusal keeps its own error out to the client" {
+        // Live 2026-08-08: the image engine refused for memory, the name was
+        // freed, and the pane showed a generic "Model load failed" with an
+        // empty log — the one failure the user could have fixed, rendered
+        // unactionable. Both spellings of "out of memory" have to survive.
+        try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("InsufficientMemory"));
+        try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("OutOfMemory"));
+        // Everything else stays a load failure — guessing a diagnosis is worse
+        // than reporting the honest generic one.
+        try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
+        try std.testing.expectEqual(error.LoadFailed, loadErrorFromName(null));
     }
 
     /// Mark an entry as `.error_state` and store `error_name` (duped).

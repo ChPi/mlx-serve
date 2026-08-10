@@ -132,4 +132,9 @@ final class PerSessionUIStateTests: XCTestCase {
     func testNewSessionsStartWithNoAgent() {
         XCTAssertNil(ChatSession().agentId, "the default is still \"None (app defaults)\"")
     }
+
+    // (The composer's create mode — a third instance of this class, with its
+    // progress/held-prompt state view-local — was removed outright: media
+    // chips navigate to the Create pane, and in-chat generation is the agent
+    // tools' job.)
 }

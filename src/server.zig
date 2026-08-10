@@ -7980,9 +7980,17 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 /// STATIC cap, so on an idle server with nothing loaded there is nothing to
 /// retry after (#126). The counts are knowable only server-side and go to the
 /// log; what the client needs is the knob.
+///
+/// ONE gate reaches this arm: the resident-model budget with no evictable
+/// LRU victim (scheduler's `planEvictionsLocked` refusal). The free-memory
+/// PREFLIGHT refuses as `error.InsufficientMemory` and gets its own message
+/// below (#144) — blaming free memory here sends a user quitting apps when
+/// the fix is unloading a model or moving the cap.
 pub const not_enough_memory_message =
-    "Not enough memory to load model: it would exceed the resident-model budget and no loaded model could be evicted. " ++
-    "Raise or disable the cap with --max-resident-mem <size>|0 (the server log names the estimate and the current cap).";
+    "Not enough memory to load model: it would exceed the resident-model budget and no loaded model can be evicted. " ++
+    "Unload the model you are chatting with (tray > Models > eject), " ++
+    "or raise or disable the cap with --max-resident-mem <size>|0. " ++
+    "The server log names the exact figures and the current cap.";
 
 /// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
 /// headroom) is distinct from the resident-budget gate above and has a
@@ -14787,6 +14795,11 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const m = not_enough_memory_message;
     try testing.expect(std.mem.indexOf(u8, m, "--max-resident-mem") != null);
     try testing.expect(std.mem.indexOf(u8, m, "retry after current requests") == null);
+    // Only the resident-budget gate raises NotEnoughMemory; the free-memory
+    // preflight has its own arm (insufficient_free_memory_message). Blaming
+    // free memory here sends the user quitting apps when the fix is the cap.
+    try testing.expect(std.mem.indexOf(u8, m, "free memory") == null);
+    try testing.expect(std.mem.indexOf(u8, m, "resident-model budget") != null);
 
     const src = @embedFile("server.zig");
     const stale = "\"Not enough memory to load model; retry " ++ "after current requests complete\"";
