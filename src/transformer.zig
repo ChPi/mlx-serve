@@ -5824,6 +5824,9 @@ pub const Transformer = struct {
             self.allocator.free(entries);
         }
         if (self.moe_layers) |ml| self.allocator.free(ml);
+        // Hybrid layers own no arrays of their own — their weights are tracked
+        // by `moe_owned_bf16`/`ssm_entries` above — but the slice itself is ours.
+        if (self.hybrid_layers) |hl| self.allocator.free(hl);
         if (self.moe_owned_bf16) |arrs| {
             for (arrs) |a| _ = mlx.mlx_array_free(a);
             self.allocator.free(arrs);

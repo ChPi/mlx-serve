@@ -1,28 +1,58 @@
 # Changelog
 
-## v26.8.4 — Unreleased
+## v26.8.4 — One window, your own media models, hot model switching
 
-### Agents can pin their own sampling.
-- Top-p, top-k, repeat penalty, presence penalty and reasoning budget join temperature and max tokens in the agent editor. 
-- Each is an override: App default follows Settings, a set value wins for that agent's turns, and an off value (top-k 0, repeat penalty 1.0) clears your global default for that agent.
+### Highlights
+
+- **The app is one window now.** Models, Tasks, Settings and the media generators live inside the chat window as modes instead of scattered windows, behind a three-column layout with a proper Agents section in the sidebar.
+- **Switch chat models without restarting.** Picking a model in the app loads it into the running server and makes it the default, instead of tearing the server down and booting it again.
+- **Bring your own media models.** The image, video, voice, music and 3D panes list checkpoints you added yourself, and the Model Browser downloads community packs of those families.
+- **The Agent Sandbox is a normal Linux.** `apt-get install` works, and the agent CLIs that failed to install now install.
+- **Agents can pin their own sampling.** Top-p, top-k, repeat penalty, presence penalty and reasoning budget join temperature and max tokens per agent.
+
+### One-window app
+
+- One window, three columns: sidebar, content, detail. Models, Tasks, Settings and the media generators became chat modes rather than separate windows, and the persistent toolbar is gone — titles and create buttons moved into the native navigation bar.
+- The sidebar has a dedicated **Agents** section, and the agent editor was rebuilt: real cards instead of a cramped form, proper naming, threading and capabilities.
+- The welcome screen is a sheet on the chat window instead of a floating window, and creating a model-backed chat has its own Create pane with a single-row model picker.
+
+### Model switching without a restart
+
+- Changing the chat model used to restart the server. It now loads into the running one and takes over as the default, so requests that omit a model — the Claude Code launcher, plain `curl` — reach the model you just picked.
+- Over the API this is `POST /v1/load-model` with `"default": true`. Without the flag a model loads alongside the current one and the default is untouched, which is what media generation uses so it can never steal the chat model.
+- Known gap: Gemma 4 hot-loaded this way runs without its drafter speedup companion until the next restart.
 
 ### Use your own media models
-- The image, video, voice, music and 3D panes now list models you added yourself under "On This Mac". Anything in your model folders with a media architecture the server can run shows up in the picker and gets its family's settings and controls.
-- The Model Browser offers community packs of those families too. A repo's file layout is checked against the family's converted shape before the Download button appears, so only packs that will actually load are offered, and they download as a full bundle like the built-in ones.
-- Models downloaded while the server runs show up without a restart: new `POST /v1/models/rescan` re-walks the model folders, and the app calls it after every download.
+
+- The media panes list anything in your model folders with a family the server can run, under **On This Mac** — with that family's settings and controls.
+- The Model Browser offers community packs of those families. A repo's layout is checked against the family's converted shape before the Download button appears, so only packs that will actually load are offered, and they download as a full bundle.
+- Models downloaded while the server runs appear without a restart (`POST /v1/models/rescan`), and the app calls it after every download.
+- Mage-Flow moved to the `mage-flow-community` org; the bf16 build left the built-in list and shows under On This Mac if you have it.
+
+### Agent Sandbox
+
+- `apt-get install` works. Apple's file sharing made any file created without an owner-read bit unreachable from inside the guest, which broke every package install and the Node extract in the agent CLI installers. The sandbox now ships a patched kernel that fixes it, plus `xz-utils` and a newer npm baked in.
+- Agents no longer crash on launch on an M4. The old guest kernel advertised a CPU feature the chip does not have, and anything probing it — OpenSSL, Go binaries — died instantly.
+- The sandbox gets up to 4 GB of RAM instead of 1 GB, which is what killed new version of Hermes. It is committed lazily, so idle sandboxes stay small.
+
+### Agents pin their own sampling
+
+- Top-p, top-k, repeat penalty, presence penalty and reasoning budget join temperature and max tokens in the agent editor (#135).
+- Each is an override: App default follows Settings, a set value wins for that agent's turns, and an off value (top-k 0, repeat penalty 1.0) clears your global default for that agent.
 
 ### Fixes
-- A half-downloaded media pack can no longer take down the server. An interrupted H3 or LTX pull holds a valid config for the whole download, so it registered as a model, could hide your complete copy in another folder, and loading it killed the process. Incomplete packs stay invisible now, and loading one by path is a clear error instead.
-- The H3 Turbo adapter downloads into the pack's own folder instead of the default downloads folder, which used to create exactly such a broken fragment when the pack lived elsewhere. Untick Turbo while it fetches and only the adapter's partial file is removed, not the pack.
-- "Model load failed" now says why (issue #144). Every on-demand load failure answered with that bare 500 no matter the cause. A load refused by the memory check now comes back as a clear not-enough-free-memory error you can retry after closing other apps, and any other failure names its reason, like `Model load failed: FileNotFound`.
-- Picking a download folder no longer hides the models you already have. The server kept serving the built-in `~/.mlx-serve/models`, but the app's picker, delete and download checks stopped looking there the moment you set a custom location. Both are always scanned now.
-- Media packs in your extra model folders are recognized. A pack in the custom scan folder (or LM Studio's) was served by the server while the pane still showed a Download button for it, and Generate could not find it. The app's "is it on disk" checks now look in every folder the server scans; deleting stays limited to the app's own folders.
-- Long code blocks no longer make the chat stutter. A streaming reply re-renders many times a second, and each pass paid a full text layout plus a pile of color allocations on a big block; that work is done once now.
-- GGUF repos that ship the same quant for several releases now label each file with its build (`0731` and so on), so you can tell the new DeepSeek 0731 files from the older ones instead of staring at two identical rows in the quant picker.
-- The MiniMax-H3 time estimate stopped swinging. Under the fast recipe most steps are near-free cache hits, and depending on where those fell the estimate could read "about 0 sec" with minutes to go, or double the real remainder. Steps are priced at their average cost now.
-- The live "time left" during a video generation stopped under-promising. It was priced from the steps already done, which under the fast recipe are mostly cheap cache hits, while the closing steps always run at full cost and the video decode after the last step was not counted at all, so "2 min left" could take 4 or more. A remaining step is never priced below the estimate model's own figure now, and the decode time stays in the number. If anything it now errs a little long on heavily cached runs.
-- Models served straight from the HuggingFace cache no longer slip past the memory check. Those folders store weights as symlinks, and every size scan skipped symlinks, so a 121 GB model measured as 0 bytes and loaded a machine deep into swap. All size scans follow symlinks now, so the preflight refuses what does not fit and `/v1/models` sizes and the app's RAM column are right for those folders too.
-- Starting the server without `--host` now warns that it is reachable from the network you are on, since the default bind is still `0.0.0.0`. Pass `--host 127.0.0.1` to keep it local. A future version will make `127.0.0.1` the default; an explicit `--host` or `--lan-share` is unaffected and not nagged.
+
+- Generating a video from reference clips no longer fails with "Request body too large" (#151). Reference media rides as base64, so one clip alone is around 100 MB; the limit is per endpoint now — 512 MB for media, 64 MB elsewhere — and a refusal names both numbers.
+- "Model load failed" now says why (#144). A load refused by the memory check comes back as a clear not-enough-free-memory error you can retry after closing other apps; any other failure names its reason.
+- Picking a download folder no longer hides the models you already have, and a media pack in an extra model folder no longer shows a Download button for a copy already on disk. Every folder the server scans is checked; deleting stays limited to the app's own folders.
+- Models served from the HuggingFace cache no longer slip past the memory check. Those folders store weights as symlinks and every size scan skipped them, so a 121 GB model measured as 0 bytes and swapped the machine.
+- The Gemma 4 QAT speed-up companion loads again instead of crashing the model (#109). Quantized companion checkpoints are unpacked at load; the forward pass expects plain weights.
+- The MiniMax-H3 time estimate stopped swinging and the live "time left" stopped under-promising: cheap cached steps were pricing the expensive closing ones, and the video decode after the last step was not counted at all, so "2 min left" could take 4.
+- Long code blocks no longer make the chat stutter while a reply streams in.
+- GGUF repos that ship the same quant for several releases label each file with its build (`0731` and so on), so the new DeepSeek files are tellable from the old ones in the quant picker.
+- `--model-dir` is repeatable, and `~/.mlx-serve/models` is always served even when you set a custom download location.
+- Starting the server without `--host` now warns that it is reachable from the network you are on, since the default bind is still `0.0.0.0`. Pass `--host 127.0.0.1` to keep it local; a future version will make that the default.
+- Hybrid models (LFM2.5, Nemotron-H) leaked a little memory on every load and unload.
 - Internal docs reorganized and compacted.
 
 ## v26.8.3 — MiniMax-H3 references and Turbo, stacked LoRAs, model folders
