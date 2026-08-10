@@ -27,7 +27,7 @@ ROOTFS_DIGEST="${GUEST_ROOTFS_DIGEST:-sha256:72c09e9266d5a38478035fbc7a15b3726de
 
 # Expected kernel SHA256 (of the .gz release asset). The rootfs needs no
 # separate hash — the docker digest IS content-addressed.
-KERNEL_SHA256="${GUEST_KERNEL_SHA256:-038e297dacc5652d250777a0dd7f7bdbf79ac5b0802f29f08834e60ac1eed12e}"
+KERNEL_SHA256="${GUEST_KERNEL_SHA256:-cf3569bcda8d4c699c04581d16c3375e8fa86b00e81627a5a1421d837255c82f}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

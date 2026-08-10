@@ -24,7 +24,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 HERE="$PWD"
 
-VER="${KVER:-6.6.58}"
+# 6.6.151: ≥6.6.69 is load-bearing on M4 — earlier kernels derive SVE hwcaps
+# from the SME registers Apple exposes without checking FEAT_SVE, so guests
+# advertise sve2 they can't execute and OpenSSL/Go SIGILL on the probe
+# ("arm64: Filter out SVE hwcaps when FEAT_SVE isn't implemented").
+VER="${KVER:-6.6.151}"
 IMG="contain-kbuild:bookworm"
 KBUILD="$HERE/.kbuild"          # source + object cache (gitignored)
 OUT="$HERE/artifacts"
