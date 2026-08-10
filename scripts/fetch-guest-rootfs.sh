@@ -2,7 +2,8 @@
 # Stage the bundled Agent Sandbox guest (kernel + rootfs) 
 #
 # Two assets:
-#   * kernel        — contain's prebuilt kernel (GH release, pinned by tag + SHA256)
+#   * kernel        — our prebuilt guest kernel (containers/guest-kernel/, GH
+#                     release on THIS repo, pinned by tag + SHA256)
 #   * rootfs.tar.gz — `docker export` of the SAME Docker Hub image the Developer
 #                     ID build's sandbox pulls at runtime (ddalcu/agent-shell-mlxserve),
 #                     pinned by CONTENT DIGEST so a re-tagged `:latest` can't
@@ -16,8 +17,8 @@
 # tag/digest to upgrade; the App Store build re-stages automatically.
 set -euo pipefail
 
-KERNEL_TAG="${GUEST_KERNEL_TAG:-kernels-v3}"
-KERNEL_REPO="${GUEST_KERNEL_REPO:-ddalcu/contain}"
+KERNEL_TAG="${GUEST_KERNEL_TAG:-kernels-v4}"
+KERNEL_REPO="${GUEST_KERNEL_REPO:-ddalcu/mlx-serve}"
 ROOTFS_IMAGE="${GUEST_ROOTFS_IMAGE:-ddalcu/agent-shell-mlxserve}"
 # Manifest-list digest of the pinned image (docker buildx imagetools inspect).
 # Empty = pull `:latest` unpinned — first-bring-up escape hatch only; a build
@@ -26,7 +27,7 @@ ROOTFS_DIGEST="${GUEST_ROOTFS_DIGEST:-sha256:a46f6170612a29828cc2567f337e2c28a85
 
 # Expected kernel SHA256 (of the .gz release asset). The rootfs needs no
 # separate hash — the docker digest IS content-addressed.
-KERNEL_SHA256="${GUEST_KERNEL_SHA256:-d312d9cd9d18c9dfeebe87a9b8441742b1595e664c1ddf59c9096be544b6d0f1}"
+KERNEL_SHA256="${GUEST_KERNEL_SHA256:-038e297dacc5652d250777a0dd7f7bdbf79ac5b0802f29f08834e60ac1eed12e}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -60,7 +61,7 @@ verify() { # path expected-sha256 name
 
 echo "→ Fetching guest kernel ($KERNEL_REPO@$KERNEL_TAG)..."
 curl -fL --retry 3 --retry-delay 2 -o "$DEST/kernel.gz" \
-    "https://github.com/$KERNEL_REPO/releases/download/$KERNEL_TAG/kernel-contain-arm64.gz"
+    "https://github.com/$KERNEL_REPO/releases/download/$KERNEL_TAG/kernel-arm64.gz"
 verify "$DEST/kernel.gz" "$KERNEL_SHA256" "kernel.gz"
 gunzip -f "$DEST/kernel.gz" # -> $DEST/kernel
 

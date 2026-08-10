@@ -10,6 +10,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 - `app/CLAUDE.md` — Swift app layout + rules. Auto-loads when working in app/.
 - Skills: `/release` (pre-release validation checklist, CalVer, CHANGELOG style), `/bench` (llmprobe bench methodology + comparison-trap rules).
 - `containers/agent-shell-mlxserve/` — Agent Sandbox guest OCI image source (`make push` publishes, `make export` builds the MAS rootfs tarball). Ships dropbear — the sandbox terminal's ssh transport (cross-pinned by `SandboxSSHTests`).
+- `containers/guest-kernel/` — Agent Sandbox guest kernel (6.6 + fuse owner-read clamp — Apple's virtiofs makes owner-read-less inodes guest-unreachable; broke apt + tar dangling symlinks, issue #150). `build.sh` → release asset `kernel-arm64.gz` on THIS repo; tag pinned by `AgentSandbox.kernelTag` + `scripts/fetch-guest-rootfs.sh` (bump together).
 - `website/` — GitHub Pages marketing site + `llm-tier-list/` interactive page (quant playground, roofline fit, voting). Full design + invariants: `docs/reference.md` "Website & LLM tier list". Guards: `tests/test_website_pages.sh`, `tests/website_tier_list_logic.mjs`.
 - **Growth policy (ENFORCED)**: root CLAUDE.md must stay under the cap of 100k. New gotcha = 1–3-line rule in `## Rules` + full story appended to the matching `docs/gotchas/*.md`. New subsystem = one Layout row + a `docs/reference.md` section. App-side content → `app/CLAUDE.md`. Never paste war stories or measurements here — link them.
 

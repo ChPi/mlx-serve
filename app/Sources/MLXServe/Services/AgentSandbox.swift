@@ -1279,16 +1279,26 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
 
     // MARK: Provisioning
 
-    /// contain's prebuilt minimal guest kernel (6.6, virtio-pci + virtiofs +
-    /// virtio-console + virtio-vsock, ~37 MB raw / ~12 MB gz). Same asset the
-    /// contain CLI fetches; pinned by tag, bumped only when the kernel is rebuilt.
+    /// Our prebuilt minimal guest kernel (6.6, virtio-pci + virtiofs +
+    /// virtio-console + virtio-vsock, ~37 MB raw / ~12 MB gz), built by
+    /// `containers/guest-kernel/build.sh` and published as a release asset on
+    /// THIS repo; pinned by tag, bumped only when the kernel is rebuilt.
+    /// (`kernels-v2`/`v3` came from the contain repo and stay published there.)
     ///
     /// `kernels-v3` added `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`, which the
     /// guest agent needs. A `kernels-v2` cache still boots — it just falls back
     /// to the legacy console shell (see `chooseTransport`).
-    static let kernelTag = "kernels-v3"
+    ///
+    /// `kernels-v4` patches fuse so no virtiofs inode ever lacks owner-read
+    /// (issue #150): Apple's host-side server runs unprivileged, making any
+    /// owner-read-less file a black hole the guest can't create, stat, open,
+    /// or unlink — which broke `apt-get install` (dpkg's mode-000 .dpkg-new
+    /// staging) and hermes's Node extraction (GNU tar's mode-000 dangling-
+    /// symlink placeholders). Creates, mkdir and chmod are clamped; see
+    /// `containers/guest-kernel/patches/`.
+    static let kernelTag = "kernels-v4"
     static let kernelURL = URL(string:
-        "https://github.com/ddalcu/contain/releases/download/\(kernelTag)/kernel-contain-arm64.gz")!
+        "https://github.com/ddalcu/mlx-serve/releases/download/\(kernelTag)/kernel-arm64.gz")!
 
     /// Cache filename. Tag-versioned rather than sniffed, so bumping the kernel
     /// invalidates every old cache by construction instead of by remembering to
