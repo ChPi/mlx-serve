@@ -32,59 +32,71 @@ class AppState: ObservableObject {
             // something the user went shopping for. `drafterOptOut` is what
             // makes an explicit off stick.
             syncDrafterPairing()
-            // Plan 05 Phase G — when hot-switch is enabled AND the server is
-            // already running, ask the server to load the new model in-place
-            // instead of restarting. Falls back to restart on failure (404
-            // because the new path isn't in --model-dir, 503 if out of
-            // memory, etc.). Restart path remains the default for clients
-            // that don't opt in.
-            if (server.status == .running || server.status == .starting) {
-                if hotSwitchEnabled, server.status == .running {
-                    let id = (selectedModelPath as NSString).lastPathComponent
-                    // The decision `syncDrafterPairing()` just made, not a
-                    // second read of the disk: a hot-switch that ignores the
-                    // user's off switch loads a drafter the restart path
-                    // wouldn't, and only one of the two would be reproducible.
-                    let drafterPath: String? = serverOptions.drafterPath.isEmpty ? nil : serverOptions.drafterPath
-                    let mgr = server
-                    // Tracked so `useModelAndAwaitReady` can await this exact
-                    // switch — hot-switch never moves `server.status` off
-                    // `.running` (the process itself never restarts), so
-                    // polling status alone can't tell "old model still
-                    // resident" from "new model resident".
-                    pendingModelLoadTask = Task { @MainActor in
-                        do {
-                            _ = try await mgr.loadModel(id: id, drafterPath: drafterPath)
-                        } catch {
-                            // Hot-switch failed (likely 404 if the model isn't
-                            // under --model-dir on the running server). Fall
-                            // back to a full restart so the user's choice still
-                            // takes effect.
-                            print("[AppState] hot-switch failed (\(error)) — falling back to restart")
-                            mgr.stop()
-                            mgr.start(modelPath: self.selectedModelPath, options: self.serverOptions)
-                        }
+            switch Self.modelSwitchAction(forStatus: server.status, path: selectedModelPath) {
+            case .hotSwitch(let id):
+                // The decision `syncDrafterPairing()` just made, not a
+                // second read of the disk: a hot-switch that ignores the
+                // user's off switch loads a drafter the restart path
+                // wouldn't, and only one of the two would be reproducible.
+                let drafterPath: String? = serverOptions.drafterPath.isEmpty ? nil : serverOptions.drafterPath
+                let mgr = server
+                // Tracked so `useModelAndAwaitReady` can await this exact
+                // switch — hot-switch never moves `server.status` off
+                // `.running` (the process itself never restarts), so
+                // polling status alone can't tell "old model still
+                // resident" from "new model resident".
+                pendingModelLoadTask = Task { @MainActor in
+                    do {
+                        _ = try await mgr.loadModel(id: id, drafterPath: drafterPath, setDefault: true)
+                    } catch {
+                        // Register-by-path failed (unsupported arch, partial
+                        // download) or the load 503'd (memory) — a full
+                        // restart with only the new model is the net.
+                        print("[AppState] hot-switch failed (\(error)) — falling back to restart")
+                        mgr.stop()
+                        mgr.start(modelPath: self.selectedModelPath, options: self.serverOptions)
                     }
-                } else {
-                    pendingModelLoadTask = nil
-                    server.stop()
-                    server.start(modelPath: selectedModelPath, options: serverOptions)
                 }
-            } else {
+            case .restart:
+                pendingModelLoadTask = nil
+                server.stop()
+                server.start(modelPath: selectedModelPath, options: serverOptions)
+            case .leaveStopped:
                 pendingModelLoadTask = nil
             }
+        }
+    }
+
+    /// How `selectedModelPath`'s `didSet` makes the server serve the new pick.
+    /// A RUNNING server is hot-switched in place via /v1/load-model — no
+    /// restart. The id is the model's ABSOLUTE PATH, never the dir basename:
+    /// registry ids are two-level `org/name`, so a basename 404s, while
+    /// register-by-path resolves either shape (and models outside every
+    /// `--model-dir`). `setDefault` rides along so the server re-points the
+    /// "mlx-serve" alias and /v1/models' default-first sort — without it a
+    /// hot-load leaves every aliased request on the OLD model.
+    /// (The old `hotSwitchEnabled` gate shipped default-off with no UI, so
+    /// every picker change restarted the server, for everyone, forever.)
+    enum ModelSwitchAction: Equatable {
+        case hotSwitch(id: String)
+        /// Mid-boot: the process is still loading the OLD pick — restart
+        /// with the new one.
+        case restart
+        /// Stopped/error: nothing to switch; explicit starts
+        /// (`useModelAndAwaitReady`, the launch gate) own that.
+        case leaveStopped
+    }
+
+    nonisolated static func modelSwitchAction(forStatus status: ServerStatus, path: String) -> ModelSwitchAction {
+        switch status {
+        case .running: return .hotSwitch(id: path)
+        case .starting: return .restart
+        case .stopped, .error: return .leaveStopped
         }
     }
     /// Set only while a hot-switch triggered by `selectedModelPath`'s `didSet`
     /// is in flight — see `useModelAndAwaitReady`.
     private var pendingModelLoadTask: Task<Void, Never>?
-    /// Plan 05 Phase G — when true, model picker changes call /v1/load-model
-    /// on the running server instead of restarting. Falls back to restart on
-    /// failure. Defaults off so existing behavior is unchanged for users who
-    /// haven't opted in.
-    @Published var hotSwitchEnabled: Bool {
-        didSet { UserDefaults.standard.set(hotSwitchEnabled, forKey: "hotSwitchEnabled") }
-    }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
     /// Set when a task notification is tapped — the Tasks window observes this to
@@ -347,7 +359,6 @@ class AppState: ObservableObject {
         // users who never touched the toggle get it turned on, which is the
         // intent.
         self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
-        self.hotSwitchEnabled = UserDefaults.standard.bool(forKey: "hotSwitchEnabled")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated

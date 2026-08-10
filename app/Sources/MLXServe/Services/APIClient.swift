@@ -189,15 +189,27 @@ class APIClient {
     /// Plan 05 Phase G — POST /v1/load-model. Returns the resulting
     /// `ModelInfo` after the load completes (blocks for seconds on a cold
     /// load). Throws if the id is unknown (404) or load fails (500).
-    func loadModel(port: UInt16, id: String, drafterPath: String? = nil) async throws -> ModelInfo {
+    /// The /v1/load-model request body. `setDefault` rides only on a model
+    /// SWITCH: it re-points the server's default (requests that omit `model`,
+    /// the "mlx-serve" alias, /v1/models' default-first sort). A media-gen
+    /// side-load must NOT carry it — it loads BESIDE the chat model, and
+    /// stealing the default would re-route every aliased chat request to a
+    /// model that 400s them.
+    static func loadModelBody(id: String, drafterPath: String?, setDefault: Bool) -> [String: Any] {
+        var body: [String: Any] = ["model": id]
+        if let drafterPath { body["drafter_path"] = drafterPath }
+        if setDefault { body["default"] = true }
+        return body
+    }
+
+    func loadModel(port: UInt16, id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/load-model")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // Load can take 10–60 s on a fresh model; raise above the default.
         request.timeoutInterval = 180
-        var body: [String: Any] = ["model": id]
-        if let drafterPath { body["drafter_path"] = drafterPath }
+        let body = Self.loadModelBody(id: id, drafterPath: drafterPath, setDefault: setDefault)
         // withoutEscapingSlashes: `id` may be an absolute path (the
         // auto-downloaded encoder registers by path) — keep it readable in
         // logs. The server unescapes either form.

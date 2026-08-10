@@ -669,8 +669,12 @@ pub const ModelRegistry = struct {
     /// Set the default model id used for requests that omit `model` or
     /// pass the literal "mlx-serve". The id must already exist (via
     /// `registerStub`); caller borrows the entry's own `id` slice so the
-    /// pointer is stable for the registry's lifetime.
+    /// pointer is stable for the registry's lifetime. Locked: besides the
+    /// single-threaded boot callers, `/v1/load-model` `"default": true`
+    /// re-points this from conn threads while others read it.
     pub fn setDefault(self: *ModelRegistry, id: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const entry = self.entries.get(id) orelse return error.UnknownModelId;
         self.default_id = entry.id;
     }

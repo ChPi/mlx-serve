@@ -3453,6 +3453,11 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     // scanner slice would read "\/Users\/…" — missing the absolute-path
     // branch below and 404ing on the mangled id (live failure 2026-06-12).
     var requested_id: []const u8 = "";
+    // `"default": true` — promote the loaded model to the server default
+    // (requests that omit `model` / the "mlx-serve" alias, and /v1/models'
+    // default-first sort). Explicit opt-in: the app's model SWITCH sends it;
+    // media-gen side-loads must never steal the chat default.
+    var make_default = false;
     var parsed_body: ?std.json.Parsed(std.json.Value) = null;
     defer if (parsed_body) |*p| p.deinit();
     if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
@@ -3460,6 +3465,9 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         if (parsed.value == .object) {
             if (parsed.value.object.get("model")) |m| {
                 if (m == .string) requested_id = m.string;
+            }
+            if (parsed.value.object.get("default")) |d| {
+                if (d == .bool) make_default = d.bool;
             }
         }
     } else |_| {
@@ -3542,6 +3550,14 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         },
     };
     defer scheduler.release(lm);
+    // Promotion happens only past ensureLoaded's error switch: a load that
+    // FAILED must never steal the default from a model that answers.
+    if (make_default) {
+        if (global_registry) |registry| {
+            registry.setDefault(lm.id) catch {};
+            log.info("[registry] default model -> {s} (load-model request)\n", .{lm.id});
+        }
+    }
     const config = lm.config orelse {
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_not_ready", "Loaded model has no parsed config", 500);
         return;
