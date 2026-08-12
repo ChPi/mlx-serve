@@ -227,6 +227,9 @@ pub const SubmitParams = struct {
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
     has_tools: bool = false,
+    /// The server's final resolved thinking mode after request overrides and
+    /// model defaults. DFlash economics key off this, not tool presence.
+    enable_thinking: bool = false,
     sampling: SamplingParams,
     eos_token_ids: []const u32,
     max_tokens: u32,
@@ -356,6 +359,7 @@ pub const Slot = struct {
     max_tokens: u32,
     timeout_ns: u64,
     has_tools: bool,
+    enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
     drafter: ?*DrafterModel,
@@ -524,11 +528,19 @@ pub const Slot = struct {
             .max_tokens = params.max_tokens,
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
+            .enable_thinking = params.enable_thinking,
             .enable_pld = params.enable_pld,
-            // The external drafter does not yet carry Qwen3-VL M-RoPE
-            // positions. Native Qwen MTP does: its prompt-history KV uses the
-            // explicit image positions and generated text uses offset+delta.
-            .enable_drafter = params.enable_drafter and params.vision_embeddings == null,
+            // Qwen's external drafter does not yet carry M-RoPE positions.
+            // Muse DFlash is different: it consumes captures from the same
+            // vision-conditioned trunk forward and Muse has no M-RoPE table,
+            // so image requests may keep that sidecar armed.
+            .enable_drafter = assistantSidecarEnabledForRequest(
+                params.enable_drafter,
+                params.vision_embeddings != null,
+                params.mrope_pos != null,
+                params.dflash != null,
+                config.muse_vision,
+            ),
             .drafter = params.drafter,
             .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
@@ -2650,12 +2662,12 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Needles are ++-split so this test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
     inline for (.{
-        "kv_quant_config", "prefix_cache_capacity", "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes", "ssm_checkpoint_stride", "ssm_checkpoint_max",
-        "mtp_enabled",     "mtp_depth",              "llama_cache_entries",
-        "llama_kv_type_k", "llama_kv_type_v",        "ds4_mtp",
-        "ds4_dspark",      "ds4_ssd_streaming",      "no_drafter",
-        "draft_block_size", "draft_block_size_explicit",
+        "kv_quant_config",         "prefix_cache_capacity",     "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes", "ssm_checkpoint_stride",     "ssm_checkpoint_max",
+        "mtp_enabled",             "mtp_depth",                 "llama_cache_entries",
+        "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
+        "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
+        "draft_block_size",        "draft_block_size_explicit",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3179,7 +3191,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 params.draft_block_size_explicit,
                 wide_lane,
             );
-            log.info("DFlash drafter ready (block_size={d}{s}, targets={any}).\n", .{
+            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
                 sch.drafter_block_size,
                 if (params.draft_block_size_explicit)
                     ", user-clamped"
@@ -3187,6 +3199,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     ", capped (no wide verify lane)"
                 else
                     "",
+                wide_lane,
                 d.config.target_layer_ids,
             });
         }
@@ -3987,6 +4000,10 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     req.done_mu.unlock(sch.io);
 }
 
+fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
+    return context_len == prefix_len;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -4022,11 +4039,15 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
-    // The assistant context grew with every committed token this turn, so it
-    // covers exactly the same span as the trunk snapshot — store it beside
-    // the KV so the next reuse of this prefix drafts with real context.
+    // A runtime fallback leaves the dormant assistant context at its last
+    // speculative boundary while serial decode continues growing the trunk.
+    // Only pair the assistant payload with this prefix when both end at the
+    // exact same absolute position; otherwise the next turn must rebuild it.
     const dflash_commit: ?prefix_cache_mod.DflashCommit = if (gen_ptr.dflash_ctx) |*dc|
-        .{ .cache = &dc.cache, .base_pos = dc.base_pos }
+        if (dflashContextCoversPrefix(dc.absLen(), total_len))
+            .{ .cache = &dc.cache, .base_pos = dc.base_pos }
+        else
+            null
     else
         null;
     hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt, dflash_commit) catch |err| {
@@ -4479,6 +4500,20 @@ fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.R
     }
 }
 
+/// Scale the measured M5/block-16 break-even to the effective number of
+/// draft positions. `block_size` includes the always-emitted anchor. Thinking
+/// is the actual resolved request mode; tools are neither necessary nor
+/// sufficient for a reasoning preamble.
+fn dflashGateMinimum(block_size: u32, enable_thinking: bool) f32 {
+    const drafts = block_size -| 1;
+    if (drafts == 0) return 0;
+    const calibrated_min = if (enable_thinking)
+        generate_mod.Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND
+    else
+        generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND;
+    return calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+}
+
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
@@ -4565,7 +4600,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const use_pld = wiring.use_pld;
     const dsv4_spec_intent = wiring.native_intent;
     log.debug("[spec-wiring] mtp={} dflash={} drafter={} pld={} (slot: drafter_flag={} dflash_handle={} drafter_handle={})\n", .{
-        use_mtp, use_dflash, use_drafter, use_pld,
+        use_mtp,             use_dflash,          use_drafter,          use_pld,
         slot.enable_drafter, slot.dflash != null, slot.drafter != null,
     });
 
@@ -4662,6 +4697,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .dflash = if (use_dflash) slot.dflash else null,
             // The dflash-resolved block rides the shared drafter_block_size.
             .dflash_block_size = slot.drafter_block_size,
+            // Use the resolved thinking mode and normalize the M5/block-16
+            // calibration to this machine's effective assistant width.
+            .dflash_min_accepted_per_round = dflashGateMinimum(
+                slot.drafter_block_size,
+                slot.enable_thinking,
+            ),
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
             .mtp_depth = slot.mtp_depth,
@@ -4851,6 +4892,37 @@ pub fn specInitWiring(
     };
 }
 
+/// Resolve the request-level switch shared by the classic external drafter
+/// and DFlash. Vision stays guarded by default: placeholder ids alone do not
+/// tell an external sidecar how to position image tokens. Muse DFlash is the
+/// measured exception because it drafts from captures produced by Muse's own
+/// vision-conditioned trunk and Muse does not use Qwen's M-RoPE table.
+pub fn assistantSidecarEnabledForRequest(
+    requested: bool,
+    has_vision: bool,
+    has_mrope: bool,
+    has_dflash: bool,
+    is_muse_vision: bool,
+) bool {
+    if (!requested) return false;
+    if (!has_vision) return true;
+    return has_dflash and is_muse_vision and !has_mrope;
+}
+
+test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-RoPE" {
+    // Text requests keep the existing shared sidecar behavior.
+    try testing.expect(assistantSidecarEnabledForRequest(true, false, false, false, false));
+    // A request opt-out always wins.
+    try testing.expect(!assistantSidecarEnabledForRequest(false, true, false, true, true));
+    // Image requests remain guarded for classic external drafters.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, false));
+    // Muse DFlash consumes vision-conditioned trunk captures and may engage.
+    try testing.expect(assistantSidecarEnabledForRequest(true, true, false, true, true));
+    // Qwen's explicit M-RoPE table is never admitted through this exception.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, true));
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, false));
+}
+
 /// Which spec mode a decode tick drives for a slot.
 pub const SpecTickMode = enum { dspark, mtp, dflash, drafter, pld, regular };
 
@@ -4889,6 +4961,28 @@ pub fn specTickMode(
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
 /// stopping the slot but NOT being emitted.
+fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
+    // The Generator has already committed the whole block internally. Publish
+    // it incrementally so streaming, cancellation, EOS and usage all observe
+    // the same per-token boundary. The generator-side cap guarantees max_tokens
+    // cannot land before the returned block ends.
+    for (tokens) |t| {
+        if (slot.cancelled.load(.acquire)) return;
+        if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+            finishSlot(sch, slot, "stop");
+            return;
+        }
+        slot.pushToken(t);
+        slot.completion_tokens += 1;
+        if (t != 0) slot.was_pad_only = false;
+        if (slot.completion_tokens >= slot.max_tokens) {
+            finishSlot(sch, slot, "length");
+            return;
+        }
+    }
+    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+}
+
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // ds4-backed slot: drive the engine's session forward by one token. No
     // PLD / drafter / batched paths apply — ds4 has its own internal MTP
@@ -4920,7 +5014,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         // different diagnosis from one, and the trim is what breaks the chain.
         log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
             gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
-            @tagName(stop.tier),          stop.trim_start,
+            @tagName(stop.tier),         stop.trim_start,
         });
         slot.finish_details = stop.finish_details;
         if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
@@ -4950,20 +5044,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
     if (tick_mode == .mtp) {
@@ -4973,20 +5054,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -4997,20 +5065,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -5021,20 +5076,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -5045,20 +5087,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -5084,6 +5113,75 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     slot.pushTokenWithLogprob(t, lp_take);
     if (t != 0) slot.was_pad_only = false;
     slot.completion_tokens = gen.completion_tokens;
+}
+
+test "all speculative blocks publish through one per-token accounting loop" {
+    // Class guard for block-returning decoders. The Generator has already
+    // advanced by the whole accepted block when the scheduler receives it;
+    // copying that final count while publishing token 1 truncates the stream
+    // and over-reports usage. Every mode must use the shared incremental loop.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn runSingleDecodeTick(") orelse return error.MissingDecodeTick;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\n}\n\ntest \"all speculative blocks") orelse return error.MissingDecodeTickEnd;
+    const body = source[start..end];
+    const shared_call = "publishSpeculativeBlock(sch, slot, gen, result.?.tokens);";
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, body, shared_call));
+    // The one remaining final-count assignment belongs to the scalar regular
+    // path, after every speculative arm. It must never reappear in a block.
+    const final_assign = "slot.completion_tokens = gen.completion_tokens;";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, final_assign));
+    try testing.expect(std.mem.lastIndexOf(u8, body, shared_call).? < std.mem.indexOf(u8, body, final_assign).?);
+}
+
+test "DFlash cache payload is committed only when it spans the trunk prefix" {
+    try testing.expect(dflashContextCoversPrefix(128, 128));
+    try testing.expect(!dflashContextCoversPrefix(96, 128));
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "DFlash gate policy follows effective block width and resolved thinking" {
+    // block_size includes the always-emitted anchor, so block 16 has 15 draft
+    // positions and block 7 has 6. The M5 calibration is normalized to that
+    // actual draft width instead of being imposed as an absolute threshold on
+    // machines without the wide verification lane.
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false));
+}
+
+test "every server scheduler path forwards resolved thinking to the DFlash gate" {
+    const source = @embedFile("server.zig");
+
+    // All direct streaming submissions, plus the shared non-streaming submit,
+    // must populate the field. Text completions resolve it explicitly false.
+    var submit_pos: usize = 0;
+    var submits: usize = 0;
+    while (std.mem.indexOfPos(u8, source, submit_pos, "sch.submit(.{")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, "});") orelse return error.UnclosedSchedulerSubmit;
+        try testing.expect(std.mem.indexOf(u8, source[start..end], ".enable_thinking =") != null);
+        submits += 1;
+        submit_pos = end + 3;
+    }
+    try testing.expectEqual(@as(usize, 5), submits);
+
+    // Positional calls into the non-streaming wrapper must pass the resolved
+    // value; the raw text-completion path is the sole explicit false arm.
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var calls: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "nonStreamingViaScheduler(") == null) continue;
+        if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
+        calls += 1;
+        try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
+            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
+    }
+    try testing.expectEqual(@as(usize, 4), calls);
 }
 
 /// Batched decode kernel for >=2 active slots. All slots must have already
@@ -5751,4 +5849,3 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, false, false, false));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
 }
-
