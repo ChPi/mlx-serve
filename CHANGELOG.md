@@ -1,5 +1,35 @@
 # Changelog
 
+## v26.8.6 — Faster at long context
+
+### Highlights
+
+- **Long chats got faster on sliding-window models.** These models keep the whole conversation but only attend to a recent slice of it. The server was reading the whole thing anyway on every speculative step and every prompt chunk, and now reads only the part the model can actually see. Muse-Glimmer 30B decodes 61% faster at 16k of context, and Inkling Small and Laguna XS chew through prompts 30% and 23% faster.
+
+### Long-context speedup
+
+- A sliding-window model looks back over a fixed window, not the whole conversation. The server trimmed its read down to that window on single-token steps only, so anything wider went back to reading everything: every speculative verify, every chunk of a long prompt. On a model where 3 layers in 4 slide, that was full attention on most of the network, on every round.
+- Nothing to turn on, and nothing to tune. The gain grows with the length of the conversation, so short prompts are unchanged, and below roughly 8k there is nothing to trim yet.
+
+Measured against v26.8.5 on an M4 Max at **16k of context**, same models and same settings on both:
+
+| Model | | v26.8.5 (16k ctx) | v26.8.6 (16k ctx) |
+|---|---|---|---|
+| Muse-Glimmer 30B 4-bit | decode | 24.6 tok/s | **39.6 tok/s** |
+| Inkling Small 2-bit | prompt | 142 tok/s | **185 tok/s** |
+| Laguna XS 2.1 NVFP4 | prompt | 648 tok/s | **798 tok/s** |
+
+- Gemma 4 is covered by the same fix but gains less: its prompt processing already ran a kernel that applies the window itself, so only its speculative steps get quicker.
+
+### Vision chats keep their speedup
+
+- Sending Muse-Glimmer an image quietly switched its draft companion off, so vision chats ran at serial speed while text chats stayed fast. Images keep the speedup now (thanks @cerebralcoding, #160).
+
+### Fixes
+
+- A speculative round could push a reply past the token limit you asked for. Every block decoder now trims the block before it commits, so `max_tokens` is respected exactly (thanks @cerebralcoding, #160).
+- Picking up an earlier conversation kept the drafter speedup instead of quietly falling back to drafting blind, and the draft size now adapts correctly on Macs without the widest verify path.
+
 ## v26.8.5 — Muse-Glimmer 
 
 ### Highlights
