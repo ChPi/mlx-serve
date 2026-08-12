@@ -1,5 +1,39 @@
 # Changelog
 
+## v26.8.5 — Muse-Glimmer 
+
+### Highlights
+
+- **Meta's Muse-Glimmer-30B runs on your Mac.** Chat, tools and thinking all work, with 4-bit and 8-bit ddalcu builds on the Hub with DFlash built in (up to **75 tok/s on M4Max**).
+- **Speculative decoding you don't have to set up.** A model can carry its own draft companion, and the server picks it up whenever that model loads. Muse-Glimmer decodes about twice as fast with it.
+- **Thinking got quicker and more visible.** Thinking off no longer waits on a hidden reasoning pass, thinking that does happen is shown instead of thrown away, and you can pick how hard the model thinks right in the composer.
+
+### Muse-Glimmer
+
+- The 30B model runs natively, its chat and tool format handled end to end. Vision isn't served yet.
+- Ships with its own draft companion, so it's fast out of the box.
+- Expect between 30-75 tok/s on 4-bit, and 16-52 tok/s on 8-bit on M4Max
+
+### Drafters that ship with the model
+
+- A model folder can include a `drafter/` companion; the server loads it with the model, and switching models keeps the speedup. `--no-drafter` turns it off.
+- The draft size adapts to your Mac, and reused conversations keep their speedup instead of restarting it cold.
+- https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit
+- https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit
+
+### Thinking
+
+- Thinking off means no thinking: the reply starts right away instead of after an invisible reasoning pass — on Muse-Glimmer that pass was half a minute of silence.
+- Right-click the thinking icon to pick the effort; click still toggles it. Tool chats keep thinking by default, plain chats skip it, and the "thinking with Tools" warning is gone.
+
+### Fixes
+
+- The "stopped repeating itself" notice showed twice on a cut reply and could be sent back to the model as chat text. It now shows once, under the reply, and never reaches the model (#147) thanks @justinluque for your PR.
+- GGUF models downloaded with the Hugging Face CLI load again (#158).
+- Big video renders no longer get cancelled after 15 minutes of quiet work (#152, #157).
+- Fix bugs related to model hot swap / changing models.
+- Homebrew now learns about a release when it's published, not while it's still a draft, so `brew upgrade` can't offer a version whose download isn't up yet.
+
 ## v26.8.4 — One window, your own media models, hot model switching
 
 ### Highlights
