@@ -2575,17 +2575,34 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         //   2. Canonical Hermes JSON ({"name":"X","arguments":{...}}).
         //   3. Hermes function-tag format (parseHermesToolCall).
         var parsed_ok = false;
-        if (attr_name) |an| {
-            if (std.json.parseFromSlice(std.json.Value, allocator, balanced, .{})) |parsed| {
-                defer parsed.deinit();
-                if (parsed.value == .object) {
-                    const name_owned = try allocator.dupe(u8, an);
-                    errdefer allocator.free(name_owned);
-                    const args_owned = try allocator.dupe(u8, balanced);
-                    try calls.append(allocator, .{ .name = name_owned, .arguments = args_owned });
-                    parsed_ok = true;
-                }
-            } else |_| {}
+        // 0. Function-tag form FIRST when the body actually carries a
+        // `<function=` opener. The dialect qwen 3.5/3.6's own template
+        // mandates rides inside the SAME `<tool_call>` wrapper the JSON form
+        // uses, and a `<parameter=…>` VALUE is arbitrary bytes — a written
+        // package.json made `balancedJsonObject` snap the FILE CONTENT, whose
+        // "name" key then became the tool name (live 2026-08-12: pi answered
+        // "Tool voxel-pagoda-garden not found" and the model looped on it).
+        // The JSON shapes below can never contain that opener, so this only
+        // reorders the case that was being read wrong.
+        if (std.mem.indexOf(u8, content, "<function=") != null) {
+            if (parseHermesToolCall(allocator, content)) |tc| {
+                try calls.append(allocator, tc);
+                parsed_ok = true;
+            }
+        }
+        if (!parsed_ok) {
+            if (attr_name) |an| {
+                if (std.json.parseFromSlice(std.json.Value, allocator, balanced, .{})) |parsed| {
+                    defer parsed.deinit();
+                    if (parsed.value == .object) {
+                        const name_owned = try allocator.dupe(u8, an);
+                        errdefer allocator.free(name_owned);
+                        const args_owned = try allocator.dupe(u8, balanced);
+                        try calls.append(allocator, .{ .name = name_owned, .arguments = args_owned });
+                        parsed_ok = true;
+                    }
+                } else |_| {}
+            }
         }
         if (!parsed_ok) {
             if (tryParseJsonToolCall(allocator, balanced)) |tc| {
@@ -6731,6 +6748,53 @@ test "parseToolCalls DSV4 plural-tag with attribute: <tool_calls name=\"X\">{arg
     }
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("webSearch", calls[0].name);
+}
+
+test "qwen xml: the live <function=…>/<parameter=…> capture (package.json class)" {
+    // Verbatim from ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via pi (2026-08-12).
+    // Qwen 3.5/3.6's OWN template dictates this dialect ("ONLY reply in the
+    // following format"), so it is the checkpoint's contract, not a mangle.
+    // The JSON-only reader mined the first balanced object out of the body —
+    // the file CONTENT — and promoted its "name" key to the tool name, so pi
+    // answered "Tool voxel-pagoda-garden not found" and the model looped.
+    const allocator = testing.allocator;
+    const text =
+        "<tool_call>\n<function=write>\n<parameter=path>\n" ++
+        "/Users/d/pi-lfm/package.json\n</parameter>\n<parameter=content>\n" ++
+        "{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}\n" ++
+        "</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings("/Users/d/pi-lfm/package.json", o.get("path").?.string);
+    // The value is RAW BYTES: a JSON file stays a STRING (typing by spelling
+    // is what turned this call into `{"name": "voxel-pagoda-garden", …}`).
+    // Types come from the schema at the request chokepoint, never from here.
+    try testing.expectEqualStrings(
+        "{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}",
+        o.get("content").?.string,
+    );
+}
+
+test "qwen xml: truncated mid-parameter ships NAME + the completed params only" {
+    const allocator = testing.allocator;
+    const text =
+        "<tool_call>\n<function=write>\n<parameter=path>\n/tmp/a.ts\n</parameter>\n" ++
+        "<parameter=content>\nexport const half = ";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/a.ts", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
 }
 
 test "pythonic: the real LFM2.5 capture, with every literal type" {

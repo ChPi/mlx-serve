@@ -173,6 +173,23 @@ const corpus = [_]Expect{
         .tool_arg_key = "timezone",
         .tool_arg_value = "UTC",
     },
+    .{
+        // LIVE capture 2026-08-12 (ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via
+        // pi). Qwen 3.5/3.6's OWN template mandates this `<function=` dialect,
+        // and it rides inside the SAME `<tool_call>` wrapper the JSON form
+        // uses — so the JSON branch snapped the first balanced object in the
+        // body, which was the package.json being WRITTEN, and shipped its
+        // "name" key as the tool name. A parameter VALUE is arbitrary bytes:
+        // the class is "never let a value decide the call".
+        .family = "qwen",
+        .name = "function-tag call whose parameter value is itself a JSON object",
+        .raw = "<tool_call>\n<function=write>\n<parameter=path>\n/tmp/package.json\n</parameter>\n" ++
+            "<parameter=content>\n{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}\n" ++
+            "</parameter>\n</function>\n</tool_call>",
+        .tool_name = "write",
+        .tool_arg_key = "content",
+        .tool_arg_value = "{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}",
+    },
     // ── Qwen 3.6 MoE (broken-JSON repair paths) ─────────────────────────────
     .{
         // Real broken output from Qwen3.6-35B-A3B-6bit: `, {` instead of
