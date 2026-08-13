@@ -423,9 +423,21 @@ fi
 # Sign frameworks first (inside-out) — no entitlements. Skipped only when the
 # staging block above skipped them too: untouched files keep the signature the
 # previous build gave them, and the whole-bundle seal below is re-taken either
-# way. Signing them is minutes on the metallib alone.
+# way.
+
+# The metallib is signed on BOTH paths. It is not Mach-O, so codesign stores its
+# signature in the com.apple.cs.CodeDirectory EXTENDED ATTRIBUTE — which the
+# `xattr -cr` strip above wipes on every build. The dylibs (embedded
+# LC_CODE_SIGNATURE) and the .framework bundles (_CodeSignature) survive it; the
+# metallib does not, and an unsigned nested code object fails the whole-bundle
+# seal ("code object is not signed at all"), leaving an .app that will not open.
+# Costs ~0.1s, so the FAST_DEV skip below has nothing to gain by covering it.
+for mlib in "$CONTENTS/Frameworks/"*.metallib; do
+    [ -f "$mlib" ] && codesign "${SIGN_OPTS[@]}" "$mlib" && echo "  Signed: $(basename "$mlib")"
+done
+
 if [ "$STAGE_FRAMEWORKS" = "1" ]; then
-    for fw in "$CONTENTS/Frameworks/"*.metallib "$CONTENTS/Frameworks/"*.dylib; do
+    for fw in "$CONTENTS/Frameworks/"*.dylib; do
         [ -f "$fw" ] && codesign "${SIGN_OPTS[@]}" "$fw" && echo "  Signed: $(basename "$fw")"
     done
 

@@ -24,6 +24,15 @@ pub const ImageData = struct {
     // pixel_values and the encoder is QwenVision (see src/qwen_vision.zig).
     grid_h: u32 = 0,
     grid_w: u32 = 0,
+    /// LFM2-VL tiling: a source image past the single-tile budget is split into
+    /// a `tile_rows` x `tile_cols` grid plus a thumbnail, and EACH piece is its
+    /// own entry here — separate patch grid, separate encoder call. `tile_index`
+    /// runs row-major over the tiles, and `tile_index == rows*cols` is the
+    /// thumbnail. All three stay 0 for an untiled image, which is every other
+    /// tower we serve.
+    tile_rows: u16 = 0,
+    tile_cols: u16 = 0,
+    tile_index: u16 = 0,
 };
 
 /// Per-request image preprocessing selector, derived from the loaded model's
@@ -32,14 +41,24 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
     min_pixels: u32 = 0,
     max_pixels: u32 = 0,
-    /// muse: the resize cap is on MERGED tokens, not pixels.
+    /// muse/lfm2: the resize cap is on MERGED tokens, not pixels.
     max_tokens: u32 = 0,
+    /// lfm2: the budget has a FLOOR too — a small image is upscaled to it.
+    min_tokens: u32 = 0,
+    /// lfm2 tiling. A source past `max_tokens * pixels_tolerance` is split into
+    /// a grid of `tile_size` tiles (plus a thumbnail) and encoded piece by
+    /// piece. `tile_size == 0` disables splitting, which is every other tower.
+    tile_size: u32 = 0,
+    min_tiles: u32 = 0,
+    max_tiles: u32 = 0,
+    use_thumbnail: bool = false,
+    pixels_tolerance: f32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -97,6 +116,22 @@ fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
     return mt == .string and std.mem.eql(u8, mt.string, want);
 }
 
+/// Is this `chat_template` entry just an `{% include %}` POINTER at the
+/// sidecar file? transformers >= 5 saves the real template to
+/// `chat_template.jinja` and writes that one-liner into tokenizer_config.json
+/// (mlx-community's Laguna-S-2.1-oQ4e-fast / -oQ5e, issue #169). jinja.cpp has
+/// no `include` statement, so rendering the pointer fails and drops SILENTLY to
+/// the generic format — the model then answers in another family's markers.
+/// The file it names is always the sidecar the caller already falls back to.
+fn isIncludeStub(template: []const u8) bool {
+    const t = std.mem.trim(u8, template, " \t\r\n");
+    if (!std.mem.startsWith(u8, t, "{%") or !std.mem.endsWith(u8, t, "%}")) return false;
+    const body = std.mem.trim(u8, t[2 .. t.len - 2], " \t\r\n-");
+    if (!std.mem.startsWith(u8, body, "include")) return false;
+    // Exactly one statement: a second `{%` would make it a real template.
+    return std.mem.indexOf(u8, t[2..], "{%") == null;
+}
+
 /// The `chat_template` entry of tokenizer_config.json, as a string.
 ///
 /// HF allows TWO shapes and we only handled one: a bare string, or a LIST of
@@ -114,7 +149,7 @@ fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 fn chatTemplateFromValue(v: ?std.json.Value) ?[]const u8 {
     const val = v orelse return null;
     switch (val) {
-        .string => |s| return s,
+        .string => |s| return if (isIncludeStub(s)) null else s,
         .array => |arr| {
             var first: ?[]const u8 = null;
             for (arr.items) |entry| {
@@ -168,6 +203,33 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
     try std.testing.expect(chatTemplateFromValue(null) == null);
+
+    {   // transformers >= 5 saves the template to chat_template.jinja and leaves
+        // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
+        // Laguna-S-2.1-oQ4e-fast, issue #169). jinja.cpp has no `include`, so
+        // taking the pointer literally fails the render and SILENTLY drops to
+        // the generic fallback — wrong-family markers the model then echoes.
+        // Read it as "no inline template" so the sidecar file is used.
+        const json = \\{"chat_template":"{% include 'chat_template.jinja' %}"}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
+    }
+    {   // whitespace/dash variants are the same pointer
+        const json = \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
+    }
+    {   // a real template that merely CONTAINS the word include is untouched
+        const json = \\{"chat_template":"{% if x %}include{% endif %}"}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) != null);
+    }
 }
 
 /// Load chat template configuration from tokenizer_config.json.

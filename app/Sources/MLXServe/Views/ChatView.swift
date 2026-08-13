@@ -991,6 +991,45 @@ struct ChatDetailView: View {
     /// Generation state for THIS chat. The engine runs one turn at a time, so a
     /// chat that doesn't own the active turn must show Send (idle), not the Stop
     /// button — and its Send is disabled while another chat is mid-turn.
+    // MARK: - "/" skill menu
+
+    /// Highlighted row; Escape hides the menu without clearing what was typed.
+    @State private var slashSelection: Int = 0
+    @State private var slashDismissed: Bool = false
+
+    /// Skills answering the half-typed command, or none when the menu is
+    /// closed. Guarded by `SlashCommands.query` FIRST: the skills folder is
+    /// stat-ed on read, and this property is evaluated on every body pass
+    /// (including ~20 Hz while a reply streams).
+    private var slashMatches: [SkillSummary] {
+        guard !slashDismissed, let q = SlashCommands.query(in: inputText) else { return [] }
+        return SlashCommands.matches(query: q, in: AgentPrompt.skillManager.summaries)
+    }
+
+    /// Up/Down/Return/Tab/Escape while the menu is open. Returns false when
+    /// it is closed, so the composer keeps every key it owns today.
+    private func handleSlashKey(_ command: ComposerKeyCommand) -> Bool {
+        let matches = slashMatches
+        guard !matches.isEmpty else { return false }
+        switch command {
+        case .up:
+            slashSelection = (slashSelection - 1 + matches.count) % matches.count
+        case .down:
+            slashSelection = (slashSelection + 1) % matches.count
+        case .accept:
+            pickSlashSkill(matches[min(slashSelection, matches.count - 1)])
+        case .cancel:
+            slashDismissed = true
+        }
+        return true
+    }
+
+    private func pickSlashSkill(_ skill: SkillSummary) {
+        inputText = SlashCommands.accept(skill.name, in: inputText)
+        slashSelection = 0
+        inputFocused = true
+    }
+
     private var composerState: ChatTurnEngine.ComposerState {
         chatEngine.composerState(for: sessionId)
     }
@@ -1580,6 +1619,22 @@ struct ChatDetailView: View {
                     RoundedRectangle(cornerRadius: 18)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
                 )
+                // "/" skill menu — FLOATS over the transcript rather than
+                // sitting in the bar: as a sibling it grew the composer and
+                // shoved the conversation up on every keystroke. An overlay
+                // past the clip, its own bottom guide pinned to the
+                // container's top, so it needs no height to position itself.
+                // Not an NSPopover — that takes first responder, and the menu
+                // has to stay open while you keep typing.
+                .overlay(alignment: .topLeading) {
+                    if !slashMatches.isEmpty {
+                        SlashSkillMenu(matches: slashMatches,
+                                       selection: min(slashSelection, max(0, slashMatches.count - 1)),
+                                       onPick: { pickSlashSkill($0) })
+                            .alignmentGuide(.top) { $0[.bottom] + 8 }
+                            .shadow(color: .black.opacity(0.28), radius: 14, y: 4)
+                    }
+                }
                 // Hover cards for the row's bare glyphs. Drawn HERE, past the
                 // clip: an overlay on the control itself is cut off at the
                 // container's rounded edge and lands over the text field.
@@ -1773,7 +1828,8 @@ struct ChatDetailView: View {
                           isFocused: $inputFocused,
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
-                          onSend: { sendMessage() })
+                          onSend: { sendMessage() },
+                          onKeyCommand: { handleSlashKey($0) })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
             .disabled(server.status != .running)
@@ -1781,6 +1837,12 @@ struct ChatDetailView: View {
             // has to sit exactly where that character lands — which is three
             // insets in, not one (`ComposerTextMetrics`). It was a literal 9
             // against a real 14, so the caret overlapped its own placeholder.
+            // Escape closes the menu for the text as it stands; the next
+            // keystroke is a new query, so it opens again.
+            .onChange(of: inputText) { _, _ in
+                if slashDismissed { slashDismissed = false }
+                slashSelection = 0
+            }
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
                     Text(composerPlaceholder)
@@ -3762,6 +3824,9 @@ enum ComposerLayout {
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
 enum ComposerReturnAction: Equatable { case send, newline, ignore }
 
+/// A key the composer offers to the "/" menu before handling it itself.
+enum ComposerKeyCommand { case up, down, accept, cancel }
+
 enum ComposerKey {
     static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
         if shift { return .newline }
@@ -3783,6 +3848,9 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var maxLines: Int = 15
     var isIdle: Bool
     var onSend: () -> Void
+    /// Keys the "/" menu wants first. Returns true when it consumed one — the
+    /// editor's own Return handling only runs when nothing above claimed it.
+    var onKeyCommand: (ComposerKeyCommand) -> Bool = { _ in false }
 
     /// Read from the SAME constants the placeholder overlay reads — the two
     /// are related only by arithmetic nobody's type system checks.
@@ -3855,7 +3923,22 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            switch commandSelector {
+            case #selector(NSResponder.moveUp(_:)):
+                if parent.onKeyCommand(.up) { return true }
+            case #selector(NSResponder.moveDown(_:)):
+                if parent.onKeyCommand(.down) { return true }
+            case #selector(NSResponder.insertTab(_:)):
+                if parent.onKeyCommand(.accept) { return true }
+            case #selector(NSResponder.cancelOperation(_:)):
+                if parent.onKeyCommand(.cancel) { return true }
+            default:
+                break
+            }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
+            // Return picks the highlighted command when the menu is open —
+            // it must not send a half-typed "/mus".
+            if parent.onKeyCommand(.accept) { return true }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
             switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle) {
             case .newline:

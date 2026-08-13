@@ -1155,3 +1155,41 @@ has been sent, so this is a suppression, never a retraction.
    symptom, now caused by the fix instead of the bug.
 
 Interior whitespace is untouched: `'line one\n\nline two'` streams intact.
+
+### A thinking-enabled STREAM that answers into an empty content field
+
+LFM2-VL, live 2026-08-13. The app shows a Thinking block containing a complete,
+correct answer — and nothing under it. Same request non-streaming: the answer is
+in `content`, `reasoning_content` is null. Two surfaces, one prompt, different
+bytes.
+
+All three streaming handlers seeded their think state as
+`enable_thinking OR prompt_opened_think`. The OR is the bug. It encodes an
+assumption — "a thinking-enabled model opens `<think>` as its first token" —
+that is true for Qwen and Gemma and irrelevant for them: their templates RENDER
+the opener when thinking is on, so `promptOpensThink` already sees it in the
+rendered bytes and the flag adds nothing. It is false for LFM2-VL, whose
+generation prompt is a bare `<|im_start|>assistant\n` and whose model answers
+directly. So the stream opened a block nobody opened, every token routed to
+`reasoning_content`, no `</think>` ever arrived to close it, and `content`
+finished empty.
+
+The existing rule (`in_think_block` starts from the PROMPT, not the request
+flag) was written for the end-of-stream FLUSH, and `streamTailIsReasoning`
+enforces it there — positive evidence required, `prompt_opened_think` or
+`saw_think_open`. The SEED was never covered, so the per-token routing did the
+damage before the flush's guard could matter. A rule that names one site is a
+rule about one site.
+
+Signature to recognize it: the whole answer arrives as reasoning, `content` is
+empty, the non-streaming request is fine, and nothing in the log looks wrong —
+`thinking=true` is exactly what was asked for. It also is not vision-specific,
+even though a VL checkpoint is what surfaced it: any model whose template does
+not render the opener is in the class, text requests included.
+
+The guard is a source scan (`a stream never starts inside a think block because
+the REQUEST asked for thinking`) with the needle `++`-split so the test's own
+comment cannot satisfy it — the first version of this scan passed green against
+the broken build for exactly that reason. The integration bar is the
+stream-vs-non-stream byte invariant rather than a phrasing check, because the
+broken build produced perfectly good prose; it just filed it under the wrong key.

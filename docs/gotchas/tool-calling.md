@@ -677,3 +677,33 @@ is luck, not evidence.
 Guards: `chat.zig` "qwen xml: the live `<function=…>/<parameter=…>` capture
 (package.json class)" + the truncation sibling, and the corpus entry
 "function-tag call whose parameter value is itself a JSON object".
+
+## A `chat_template` can be a POINTER to the sidecar file, and taking it literally is a silent fallback (issue #169)
+
+With the laguna router fixed, `Laguna-S-2.1-oQ4e-fast` loaded and then answered
+in Gemma markers — `</start_of_turn>\n<start_of_turn>model` spliced into
+`content`, the whole reasoning pass delivered as content, no `<think>` split.
+One line in the log said why:
+`jinja render failed (Unknown statement: include), falling back to generic chat format`.
+
+transformers >= 5 saves the real template to `chat_template.jinja` and writes
+`{% include 'chat_template.jinja' %}` into `tokenizer_config.json` as the
+`chat_template` value. We read `tokenizer_config.json` FIRST and only fall back
+to the sidecar when that key is absent — so a pack carrying both got the
+one-line pointer, jinja.cpp has no `include` statement, the render failed, and
+`fallbackFormatChat` served a wrong-family prompt. The model was fine; the
+prompt was not. poolside's own pack ships no `chat_template` key at all, which
+is why the same byte-identical template worked there.
+
+Fix: `isIncludeStub` reads a `chat_template` that is exactly one `{% include %}`
+statement as "no inline template" and returns null, so the existing sidecar
+fallback loads the file the stub was pointing at. Scoped tight — a template
+containing an include AND anything else is left alone (it cannot render either
+way, and guessing a different file would be worse than a named failure).
+
+Class lesson: the silent-fallback class again (control bytes, missing template,
+now an unsupported statement) — every one of them presents as MODEL misbehavior,
+and the tell is always the same single log line plus wrong-family markers in the
+output. When a checkpoint answers in another family's tags, grep the log for
+`jinja` before touching anything in the arch. Guard: the include-stub cases in
+chat.zig's `chat_template accepts HF's list-of-named-templates shape`.
