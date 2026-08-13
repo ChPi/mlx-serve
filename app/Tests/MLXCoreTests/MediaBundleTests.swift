@@ -197,6 +197,43 @@ final class MediaBundleTests: XCTestCase {
                           VideoModelPreset.ltx23Q4.approxFirstRunDownloadGB)
     }
 
+    /// Every LTX resolution must survive every QUALITY TIER, and two of the
+    /// four tiers run a two-stage pipeline whose stage 1 is HALF resolution —
+    /// so the server needs both edges divisible by 64 (the latent grid is /32,
+    /// halved). 704x480 and 480x704 are only /32, so picking Quality or Super
+    /// Quality on them earned a 400 with no way to tell from the pane which
+    /// combination was the bad one. The default was one of them.
+    ///
+    /// A resolution offered on a tier that refuses it is the dead-control
+    /// class: the pane must not present a combination the server rejects.
+    func testEveryLtxResolutionSurvivesTheTwoStagePipelines() {
+        // The server gates on the PIPELINE, not the backend, so this asks every
+        // video preset the same question and only holds those that actually
+        // offer a two-stage tier to the /64 rule. A future backend that adopts
+        // two-stage is covered the day it does; H3 (one-stage only) is not
+        // constrained by a rule that cannot apply to it.
+        var checked = 0
+        for preset in VideoModelPreset.all {
+            let twoStageTiers = QualityPreset.allCases.filter {
+                preset.settings($0).mode != .oneStage
+            }
+            guard !twoStageTiers.isEmpty else { continue }
+            checked += 1
+            // Every resolution offered must be legal for those tiers.
+            for r in preset.resolutions {
+                XCTAssertEqual(r.width % 64, 0,
+                               "\(preset.id): \(r.label) width \(r.width) is not /64 — 400s on \(twoStageTiers.map(\.label))")
+                XCTAssertEqual(r.height % 64, 0,
+                               "\(preset.id): \(r.label) height \(r.height) is not /64 — 400s on \(twoStageTiers.map(\.label))")
+            }
+            XCTAssertEqual(preset.defaultResolution.width % 64, 0, "\(preset.id) default resolution is not /64")
+            XCTAssertEqual(preset.defaultResolution.height % 64, 0, "\(preset.id) default resolution is not /64")
+        }
+        // Both LTX presets offer two-stage; a zero here means the loop went
+        // vacuous and the guard stopped guarding anything.
+        XCTAssertGreaterThanOrEqual(checked, 2, "no video preset offers a two-stage tier — guard is vacuous")
+    }
+
     /// The published repo's ACTUAL file tree (ddalcu/LTX-2.5-MLX-Serve-4bit),
     /// run through the real bundle selection. A 2.5 pack is only useful if the
     /// download brings the whole engine AND the in-pack text encoder — and a

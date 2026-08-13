@@ -478,12 +478,23 @@ struct VideoModelPreset: Identifiable, Hashable {
         return frameOptions.first(where: { $0 >= needed }) ?? cap
     }
 
-    /// LTX-2.3 trained resolutions. README default is 480×704 (portrait).
+    /// LTX trained resolutions, every edge divisible by **64**.
+    ///
+    /// Not cosmetic: the Quality and Super Quality tiers run two-stage
+    /// pipelines whose first stage is HALF resolution, and the latent grid is
+    /// /32 — so a full-resolution edge that is only /32 leaves stage 1 on a
+    /// fractional grid and the server refuses it by name. The list used to
+    /// carry 704×480 and 480×704 (and defaulted to one of them), so picking
+    /// Quality on a fresh install was an immediate 400.
+    ///
+    /// 448 replaces 480 as the short edge: it is the nearest /64 value, so the
+    /// two landscape/portrait pairs keep their place in the list. Pinned by
+    /// `testEveryLtxResolutionSurvivesTheTwoStagePipelines`.
     private static let ltxResolutions: [ResolutionOption] = [
-        .init(width: 704,  height: 480, label: "704 × 480 (landscape 3:2)"),
-        .init(width: 480,  height: 704, label: "480 × 704 (portrait 3:4) — default"),
-        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2)"),
+        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2) — default"),
         .init(width: 512,  height: 768, label: "512 × 768 (portrait 2:3)"),
+        .init(width: 704,  height: 448, label: "704 × 448 (landscape 14:9)"),
+        .init(width: 448,  height: 704, label: "448 × 704 (portrait 9:14)"),
     ]
 
     /// LTX-2.3 frame ladder — every valid `8N+1` count from 9 up to
