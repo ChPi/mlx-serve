@@ -1,25 +1,37 @@
 # Changelog
 
-## v26.8.6 — Faster at long context
+## v26.8.6 — LTX-Video 2.5, and way faster decode and prefill at long context
 
 ### Highlights
 
-- **Long chats got faster on sliding-window models.** These models keep the whole conversation but only attend to a recent slice of it. The server was reading the whole thing anyway on every speculative step and every prompt chunk, and now reads only the part the model can actually see. Muse-Glimmer 30B decodes 61% faster at 16k of context, and Inkling Small and Laguna XS chew through prompts 30% and 23% faster.
+- **LTX-Video 2.5 runs on your Mac.** Lightricks' newest video model, joint audio+video like 2.3, with a 4-bit ddalcu build on the Hub (36 GB, down from 110). Text-to-video, image-to-video, audio-to-video and the two-stage pipelines all work; 704x480 at 97 frames takes about two minutes on an M4 Max, soundtrack included.
+- **Long chats got faster on sliding-window models.** These models keep the whole conversation but only attend to a recent slice of it. The server was reading the whole thing anyway on every speculative step and every prompt chunk, and now reads only the part the model can actually see. Muse-Glimmer 30B decodes 63% faster at 16k and 144% faster at 64k, and Laguna XS chews through a 64k prompt at more than twice the speed.
 
 ### Long-context speedup
 
 - A sliding-window model looks back over a fixed window, not the whole conversation. The server trimmed its read down to that window on single-token steps only, so anything wider went back to reading everything: every speculative verify, every chunk of a long prompt. On a model where 3 layers in 4 slide, that was full attention on most of the network, on every round.
 - Nothing to turn on, and nothing to tune. The gain grows with the length of the conversation, so short prompts are unchanged, and below roughly 8k there is nothing to trim yet.
 
-Measured against v26.8.5 on an M4 Max at **16k of context**, same models and same settings on both:
+Measured against v26.8.5 on an M4 Max, median of three runs per point, same models and same settings on both:
 
-| Model | | v26.8.5 (16k ctx) | v26.8.6 (16k ctx) |
+| Model | | 16k context | 64k context |
 |---|---|---|---|
-| Muse-Glimmer 30B 4-bit | decode | 24.6 tok/s | **39.6 tok/s** |
-| Inkling Small 2-bit | prompt | 142 tok/s | **185 tok/s** |
-| Laguna XS 2.1 NVFP4 | prompt | 648 tok/s | **798 tok/s** |
+| Muse-Glimmer 30B 4-bit | decode | 24.7 -> **40.2 tok/s** | 8.6 -> **21.0 tok/s** |
+| Laguna XS 2.1 NVFP4 | prompt | 609 -> **774 tok/s** | 236 -> **540 tok/s** |
+| Laguna XS 2.1 NVFP4 | decode | 62.7 -> **77.7 tok/s** | 34.9 -> **46.8 tok/s** |
 
+- The gain climbs the whole way: Muse-Glimmer decodes 15% faster at 4k, 63% at 16k and 144% at 64k, so the longer you talk to it the further ahead it gets. Inkling Small gains the same way on prompt processing.
 - Gemma 4 is covered by the same fix but gains less: its prompt processing already ran a kernel that applies the window itself, so only its speculative steps get quicker.
+
+### LTX-Video 2.5
+
+- Pick **LTX-Video 2.5** in the Video window, or point the server at the pack. It brings its own text encoder, so unlike 2.3 there is no separate 8 GB download on first use.
+- 2.5 is the same size and shape of model as 2.3 and takes the same settings — resolutions, frame lengths and quality tiers are unchanged, so anything you had dialled in for 2.3 carries over.
+- 2.3 keeps working exactly as before, and both can sit side by side; the server tells them apart from the model's own files.
+
+### Better prompt following on LTX (2.3 and 2.5)
+
+- LTX prompts were being padded to a quarter of the length the model expects, which gave it less of your prompt's context to work with than it was trained on. Both versions now use the full length. Nothing to change — prompts are simply followed more closely, and long ones are no longer cut short.
 
 ### Vision chats keep their speedup
 

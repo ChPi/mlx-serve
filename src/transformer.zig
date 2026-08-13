@@ -4130,6 +4130,23 @@ pub const ForwardCtx = struct {
     /// refuses non-standard-path targets so this can never be silently
     /// ignored on an engaged path.
     capture_layers: ?*CaptureLayers = null,
+    /// An additive attention term composed into the standard PREFILL path's
+    /// mask, `[1, 1, q_len, kv_len]` bf16. It must ALREADY be causal: a
+    /// "causal"-mode layer swaps to an array mask carrying this verbatim, so
+    /// a term that only masked padding would drop causality on the
+    /// full-attention layers. Sliding layers ADD it to their band mask.
+    ///
+    /// Entries must be FINITE (the reference's -1e9, not -inf): a left-padded
+    /// prompt has query rows whose every visible key is padding, and an
+    /// all -inf row softmaxes to NaN.
+    ///
+    /// Set only by the LTX text encoder (`ltx_video.gemmaCapture4`), whose
+    /// prompts are left-padded to a fixed width the reference masks out. Null
+    /// everywhere else — and null is what keeps the fused prefill kernels,
+    /// which mask from geometry alone and cannot carry an extra term, on
+    /// their normal path. One-shot forwards only: a chunked prefill would
+    /// need a per-chunk slice of it.
+    prefill_mask_add: ?mlx.mlx_array = null,
     /// PLD spec-decode: when true, the GatedDeltaNet trunk records per-position
     /// SSM/conv state during the verify forward (see `SSMCacheEntry.spec_*`),
     /// so partial-accept rollback needs no re-forward. Set only by `nextPld`
@@ -4164,9 +4181,11 @@ pub const ForwardCtx = struct {
     /// ENCODER layer scalar instead of the decoder's. Set by the diffusion
     /// runner for prompt prefill and committed-canvas re-encode passes.
     use_encoder_scalars: bool = false,
-    /// DiffusionGemma encoder pass: the encoder only exists to fill the KV
-    /// cache — skip the 262K-vocab lm_head projection and return the
-    /// post-final-norm hidden instead of logits (caller frees either way).
+    /// Return the post-final-norm hidden instead of logits (caller frees
+    /// either way), skipping the 262K-vocab lm_head projection. Set by the
+    /// DiffusionGemma encoder pass (which exists only to fill the KV cache)
+    /// and by the LTX text encoder (which wants the residual stream, not a
+    /// next token).
     skip_lm_head: bool = false,
     /// Set by the Generator when this request consumes ONLY the argmax of
     /// the logits (greedy or top-1 sampling, no logit-modifying penalties,
@@ -6748,7 +6767,7 @@ pub const Transformer = struct {
         return reshaped;
     }
 
-    fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    pub fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const raw = try self.rawEmbedding(token_ids);
 
         // MuseGlimmer: weight-less RMS norm on the looked-up embeddings (the
@@ -7898,7 +7917,10 @@ pub const Transformer = struct {
         const sliding = slidingViewFor(cfg, total_kv, seq_len);
         const sliding_span = sliding.span;
         const sliding_kv_len = sliding.kv_len;
-        const band_in_kernel = sliding.band_in_kernel;
+        // An extra additive term has to reach the scores, and the fused band
+        // kernel masks from geometry alone — so pads bring the band back to
+        // an explicit array. `prefill_mask_add` is null on every serving path.
+        const band_in_kernel = sliding.band_in_kernel and ctx.prefill_mask_add == null;
 
         if (cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
@@ -7915,6 +7937,16 @@ pub const Transformer = struct {
                 // During decode, K view has min(total_kv, sw) entries.
                 const local_kv_len: c_int = @min(total_kv, sw);
                 local_decode_mask = try self.createSlidingWindowDecodeMask(local_kv_len, sw);
+            }
+        }
+
+        // Sliding layers need the band AND the caller's term; build the sum
+        // once (it is layer-independent) rather than per layer.
+        var banded_extra_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(banded_extra_mask);
+        if (ctx.prefill_mask_add) |extra| {
+            if (is_prefill and cfg.has_sliding_window and local_prefill_mask.ctx != null) {
+                try mlx.check(mlx.mlx_add(&banded_extra_mask, local_prefill_mask, extra, self.s));
             }
         }
 
@@ -8133,6 +8165,24 @@ pub const Transformer = struct {
                 }
             }
 
+            // Caller-supplied additive term (LTX text encoder's left-padding).
+            // "causal" carries no array, so it becomes one — which is why the
+            // term is required to be causal itself.
+            if (ctx.prefill_mask_add) |extra| {
+                if (is_prefill) {
+                    if (std.mem.eql(u8, sel_mode, "array")) {
+                        // The band build is eager whenever a term is present
+                        // (`band_in_kernel` is forced off above), so the sum
+                        // exists — but a null mlx_array reaching SDPA kills the
+                        // request, and dropping the band is the survivable half.
+                        sel_mask = if (banded_extra_mask.ctx != null) banded_extra_mask else extra;
+                    } else {
+                        sel_mode = "array";
+                        sel_mask = extra;
+                    }
+                }
+            }
+
             // Fused-attn opt-in: consume the cache's quant triples directly
             // via mlx_quantized_matmul. Only when the request opts in AND
             // `kvAttnFusedEligible` passes (scheme .affine with triples,
@@ -8179,7 +8229,11 @@ pub const Transformer = struct {
                 }
             } else if (std.mem.eql(u8, sel_mode, "array")) {
                 var fused_done = false;
-                if (is_prefill and cfg.has_sliding_window) {
+                // `prefill_mask_add` declines the fused band: it masks from
+                // geometry and would drop the caller's term (and, on a
+                // full-attention layer that this term just moved off "causal",
+                // would band-mask a layer that has no band at all).
+                if (is_prefill and cfg.has_sliding_window and ctx.prefill_mask_add == null) {
                     // Sliding-window prefill: the band mask runs in-kernel.
                     if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, @intCast(cfg.sliding_window))) |fused| {
                         _ = mlx.mlx_array_free(attn_out);
