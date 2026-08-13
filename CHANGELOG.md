@@ -41,6 +41,8 @@ Measured against v26.8.5 on an M4 Max, median of three runs per point, same mode
 
 - A speculative round could push a reply past the token limit you asked for. Every block decoder now trims the block before it commits, so `max_tokens` is respected exactly (thanks @cerebralcoding, #160).
 - Picking up an earlier conversation kept the drafter speedup instead of quietly falling back to drafting blind, and the draft size now adapts correctly on Macs without the widest verify path.
+- Streaming and non-streaming replies could differ by a couple of blank lines at the very start of an answer. The same question now gives the same text either way, on chat completions and on the Anthropic endpoint. It showed up on models whose prompt template opens a thinking block on every turn, like LFM2.5.
+- A tool call named after the wrong tool when one of its arguments happened to contain something that looked like a tool call, such as a package.json being written to a file. Qwen 3.5 and 3.6 models allow two ways of writing a call and the server was reading the wrong one first, so the file's own contents could decide which tool ran.
 
 ## v26.8.5 — Muse-Glimmer 
 

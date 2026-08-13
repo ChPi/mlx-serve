@@ -6401,6 +6401,10 @@ fn handleStreamingGeneration(
     // is enforced prompt-side (chat.noThinkTailSuffix commits the channel).
     var in_think_block = enable_thinking or prompt_opened_think;
     var think_closed = false; // a complete think block was already split+emitted this stream
+    // Leading whitespace is suppressed until the first visible byte, so the
+    // stream reaches the same content bytes as splitThinkBlock's own
+    // trimStart (chat.streamContentLead).
+    var content_started = false;
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>"; // will be updated if Gemma 4 format detected
@@ -6583,6 +6587,7 @@ fn handleStreamingGeneration(
                         // re-opened later in the turn starts counting from zero.
                         reasoning_streamed = 0;
                         if (split.content.len > 0) {
+                            content_started = true;
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = split.content }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
                     },
@@ -6593,7 +6598,13 @@ fn handleStreamingGeneration(
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
-                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null, null, .{ .logprobs_json = try lps.take() });
+                            const vis = chat_mod.streamContentLead(tt, content_started);
+                            // Suppressed lead: nothing pending describes text the
+                            // client received, so retire it rather than letting it
+                            // ride the next chunk (logprobs.content ↔ content).
+                            if (vis.len == 0) { lps.dropPending(); continue; }
+                            content_started = true;
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis }, null, null, null, .{ .logprobs_json = try lps.take() });
                         }
                         token_texts.clearRetainingCapacity();
                     },
@@ -6775,7 +6786,11 @@ fn handleStreamingGeneration(
                     // The reasoning above this point never reaches the client,
                     // so its entries stop here rather than riding the answer.
                     lps.skipToContent(think_buf.items, content_after);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    const vis_content_after = chat_mod.streamContentLead(content_after, content_started);
+                    if (vis_content_after.len > 0) {
+                        content_started = true;
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_content_after }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    }
                 } else {
                     lps.dropPending();
                 }
@@ -6812,7 +6827,13 @@ fn handleStreamingGeneration(
             if (chat_mod.isChannelMarkerToken(token_text)) {
                 continue;
             }
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = token_text }, null, null, null, .{ .logprobs_json = try lps.take() });
+            const vis_token_text = chat_mod.streamContentLead(token_text, content_started);
+            if (vis_token_text.len == 0) {
+                lps.dropPending();
+            } else {
+                content_started = true;
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_token_text }, null, null, null, .{ .logprobs_json = try lps.take() });
+            }
         }
 
         // Every branch above may have written NOTHING (tool-call detection and
@@ -6840,7 +6861,11 @@ fn handleStreamingGeneration(
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
         } else {
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_buf.items }, null, null, null, .{ .logprobs_json = try lps.take() });
+            const vis_tail = chat_mod.streamContentLead(think_buf.items, content_started);
+            if (vis_tail.len > 0) {
+                content_started = true;
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null, .{ .logprobs_json = try lps.take() });
+            }
         }
     }
 
@@ -10272,6 +10297,7 @@ fn handleAnthropicStreaming(
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
     var think_closed = false;
+    var content_started = false;
     // Muse-Glimmer plain-arm segment-header skip (<|start|>…<|message|>).
     var muse_skip_header = false;
     var think_buf = std.ArrayList(u8).empty;
@@ -10417,6 +10443,7 @@ fn handleAnthropicStreaming(
                                 try sendAnthropicEvent(stream, "content_block_start", sd);
                                 text_block_open = true;
                             }
+                            content_started = true;
                             try emitAnthropicTextDelta(allocator, stream, block_index, split.content);
                         }
                         for (token_texts.items) |tt| allocator.free(tt);
@@ -10432,6 +10459,9 @@ fn handleAnthropicStreaming(
                             if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
+                            const vis = chat_mod.streamContentLead(tt, content_started);
+                            if (vis.len == 0) continue;
+                            content_started = true;
                             if (!text_block_open) {
                                 const sd = try std.fmt.allocPrint(allocator,
                                     \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -10440,7 +10470,7 @@ fn handleAnthropicStreaming(
                                 try sendAnthropicEvent(stream, "content_block_start", sd);
                                 text_block_open = true;
                             }
-                            try emitAnthropicTextDelta(allocator, stream, block_index, tt);
+                            try emitAnthropicTextDelta(allocator, stream, block_index, vis);
                         }
                         token_texts.clearRetainingCapacity();
                     },
@@ -10632,6 +10662,7 @@ fn handleAnthropicStreaming(
                 if (std.mem.indexOf(u8, content_after, "<|eot|>")) |et| content_after = content_after[0..et];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
+                    content_started = true;
                     if (!text_block_open) {
                         const sd = try std.fmt.allocPrint(allocator,
                             \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -10667,6 +10698,9 @@ fn handleAnthropicStreaming(
             muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
             if (was_skipping or muse_skip_header) continue;
             if (chat_mod.isChannelMarkerToken(token_text)) continue;
+            const vis_token = chat_mod.streamContentLead(token_text, content_started);
+            if (vis_token.len == 0) continue;
+            content_started = true;
             if (!text_block_open) {
                 const sd = try std.fmt.allocPrint(allocator,
                     \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -10675,7 +10709,7 @@ fn handleAnthropicStreaming(
                 try sendAnthropicEvent(stream, "content_block_start", sd);
                 text_block_open = true;
             }
-            try emitAnthropicTextDelta(allocator, stream, block_index, token_text);
+            try emitAnthropicTextDelta(allocator, stream, block_index, vis_token);
         }
 
         // See the chat-completions loop: a buffered tool call / thinking block
@@ -10810,6 +10844,7 @@ fn handleAnthropicStreaming(
                     block_index += 1;
                 }
                 if (think_split.content.len > 0) {
+                    content_started = true;
                     if (!text_block_open) {
                         const sd2 = try std.fmt.allocPrint(allocator,
                             \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}

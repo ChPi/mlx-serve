@@ -2272,6 +2272,35 @@ pub fn streamTailIsReasoning(in_think_block: bool, prompt_opened_think: bool, sa
 ///
 /// The tools streaming path emits reasoning INCREMENTALLY (see the
 /// `.hold_thinking` arm), so every later site that emits reasoning for the same
+/// Streaming counterpart to the leading `trimStart(content, "\n ")` every
+/// non-streaming split already applies.
+///
+/// The two surfaces disagreed on the BYTES of the same answer: LFM2.5's template
+/// opens `<think>` unconditionally, so its first generated token is the newline
+/// pair that follows the closer, and `splitThinkBlock` drops it while a stream
+/// flushing tokens verbatim shipped it — `'One, two…'` non-streaming,
+/// `'\n\nOne, two…'` streaming (live 2026-08-13). Any model whose first visible
+/// token is whitespace is in this class, not just LFM2.5.
+///
+/// Leading whitespace is the ONE thing a stream can still withhold: nothing
+/// visible has been sent yet, so this is a suppression, never a retraction.
+///
+/// It suppresses a chunk that is ENTIRELY whitespace, never a prefix of one. A
+/// partial trim would ship a logprobs entry whose `token` no longer appears in
+/// `content` — the collector describes whole tokens and cannot split one — so
+/// the two contracts are kept consistent by never cutting inside a token. A
+/// single token mixing leading whitespace with visible text is the residual
+/// case, and it keeps its whitespace on both surfaces' terms: the stream ships
+/// it, and the caller flips `content_started` so nothing later is touched.
+///
+/// `content_started` must flip on the first NON-EMPTY emission, so a suppressed
+/// whitespace token leaves the next one still eligible.
+pub fn streamContentLead(chunk: []const u8, content_started: bool) []const u8 {
+    if (content_started) return chunk;
+    if (std.mem.trimStart(u8, chunk, "\n ").len == 0) return "";
+    return chunk;
+}
+
 /// turn must send only the remainder or the client sees the thought twice.
 ///
 /// `already >= reasoning.len` returns null rather than underflowing: the split
@@ -11399,4 +11428,36 @@ test "bench: streaming think gate scans BYTES, memoized vs fresh" {
     // Linear-in-total, not quadratic: the memoized scan reads each byte a
     // bounded number of times.
     try testing.expect(memo_bytes < buf.items.len * 4);
+}
+
+test "streaming content agrees with the non-streaming split on leading whitespace" {
+    // LFM2.5 class: the template opens <think> unconditionally, so the first
+    // generated token is the newline pair after the closer. The non-streaming
+    // split drops it; the stream must reach the same bytes.
+    const out = "\n\nOne, two, three.";
+    const expected = splitThinkBlock(out, true, false).content;
+    try testing.expectEqualStrings("One, two, three.", expected);
+
+    const tokens = [_][]const u8{ "\n\n", "One", ", two", ", three." };
+    var streamed: std.ArrayList(u8) = .empty;
+    defer streamed.deinit(testing.allocator);
+    var content_started = false;
+    for (tokens) |tt| {
+        const emit = streamContentLead(tt, content_started);
+        if (emit.len == 0) continue;
+        content_started = true;
+        try streamed.appendSlice(testing.allocator, emit);
+    }
+    try testing.expectEqualStrings(expected, streamed.items);
+}
+test "streamContentLead never touches whitespace inside the answer" {
+    // Only the LEAD is suppressed: once anything visible has been sent, a
+    // newline token is ordinary content (markdown paragraphs, code blocks).
+    try testing.expectEqualStrings("\n\n", streamContentLead("\n\n", true));
+    try testing.expectEqualStrings("  x", streamContentLead("  x", true));
+    // And a lead that is not whitespace is untouched.
+    try testing.expectEqualStrings("Hello", streamContentLead("Hello", false));
+    // A token is never cut in half: one carrying whitespace AND text rides
+    // whole, so its logprobs entry still describes bytes that reached content.
+    try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
 }
