@@ -4305,11 +4305,19 @@ const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 
 /// strings still enable). "none" is an explicit off (the gpt-5.1 default
 /// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
 /// stays in charge and existing clients see zero behavior change.
-fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32) ?ReasoningEffort {
+fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
     if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget, .effort = v.string };
-    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget), .effort = v.string };
+    // Where the TEMPLATE reads the effort word, the word is the behavioral
+    // lever and a budget derived from the same string is pure display
+    // truncation on top of it (`chat.templateConsumesEffort`). An explicit
+    // `--reasoning-budget` still rides `default_budget`.
+    const budget = if (template_consumes_effort)
+        default_budget
+    else
+        responses_mod.effortBudget(v.string, default_budget);
+    return .{ .enable = true, .budget = budget, .effort = v.string };
 }
 
 /// Resolve thinking for a chat request. An EXPLICIT client signal always wins —
@@ -4722,7 +4730,7 @@ fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget);
+    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
     const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
@@ -14909,7 +14917,7 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const got = parseReasoningEffort(parsed.value.object, -1);
+        const got = parseReasoningEffort(parsed.value.object, -1, false);
         if (case.expect) |want| {
             try std.testing.expectEqual(want.enable, got.?.enable);
             try std.testing.expectEqual(want.budget, got.?.budget);
@@ -14920,6 +14928,43 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
         } else {
             try std.testing.expect(got == null);
         }
+    }
+}
+
+test "parseReasoningEffort: a template that READS the effort word gets no budget from it" {
+    // Two levers, one word. Where the template acts on `reasoning_effort` the
+    // word already shortens the THOUGHT; deriving a token budget from the same
+    // string only truncates what the client is SHOWN, so pi asking Qwen3.8 for
+    // `medium` got the model's unguided (long) thinking AND a 2048-token cut,
+    // followed by 25.9k tokens of invisible generation (live 2026-08-14).
+    // An EXPLICIT cap is someone asking on purpose and still applies — that is
+    // `default_budget` here, which carries `--reasoning-budget`.
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, consumes: bool, default_budget: i32, want: i32 }{
+        // Consuming template (qwen3.8 / dsv4 / inkling): no effort-derived cap.
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = -1, .want = -1 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = true, .default_budget = -1, .want = -1 },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = true, .default_budget = -1, .want = -1 },
+        // ...but `--reasoning-budget` still binds there.
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = 4096, .want = 4096 },
+        // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse, laguna,
+        // Ling): the effort word reaches no template, so the budget is the ONLY
+        // thing it does and every mapping stays exactly as it shipped.
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 128 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 512 },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = false, .default_budget = -1, .want = 2048 },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = false, .default_budget = -1, .want = 8192 },
+        .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .consumes = false, .default_budget = -1, .want = -1 },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = parseReasoningEffort(parsed.value.object, case.default_budget, case.consumes).?;
+        try std.testing.expect(got.enable);
+        try std.testing.expectEqual(case.want, got.budget);
+        // The raw string rides along either way — the template still renders it.
+        try std.testing.expectEqualStrings(
+            parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
     }
 }
 
@@ -14946,7 +14991,7 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const effort = parseReasoningEffort(parsed.value.object, -1);
+        const effort = parseReasoningEffort(parsed.value.object, -1, false);
         try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
     }
 }

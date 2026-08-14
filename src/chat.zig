@@ -537,8 +537,20 @@ fn renderChatTemplate(
     defer if (fallback_arena) |*a| a.deinit();
     var effective_messages = messages;
     var effective_tools_json = tools_json;
+    // Optional keys a template may dump blindly (see fillOptionalToolDefKeys).
+    // Arena-owned, so the rewritten bytes outlive the render with no free path
+    // of their own.
+    if (tools_json) |tj| {
+        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+        if (try fillOptionalToolDefKeys(fallback_arena.?.allocator(), tj)) |filled| {
+            effective_tools_json = filled;
+        }
+    }
     if (needs_inject_tools or needs_rewrite_tool_role) {
-        fallback_arena = std.heap.ArenaAllocator.init(allocator);
+        // NEVER re-init: the tool-def fill above may already own this arena,
+        // and clobbering it orphans everything allocated there (a leak here, a
+        // use-after-free the moment `effective_tools_json` points into it).
+        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
         const arena_alloc = fallback_arena.?.allocator();
         effective_messages = try synthesizeToolFallbackMessages(
             arena_alloc,
@@ -866,6 +878,70 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
     try buf.append(allocator, ']');
 
     return buf.toOwnedSlice(allocator);
+}
+
+/// Fill the OPTIONAL tool-definition keys a template may dump blindly.
+///
+/// `description` is optional in OpenAI's function schema and a no-arg tool
+/// needs no `parameters`, but a template that renders `fn.description | tojson`
+/// (muse) or `tool | tojson` wholesale hits `tojson` on Undefined, which is a
+/// jinja RAISE — i.e. a silent `fallbackFormatChat` with no tools preamble at
+/// all, for a request that was perfectly legal. Returns null when every
+/// function already carries both keys, so the common path re-emits nothing and
+/// the caller keeps the client's own bytes (provenance, not content, decides
+/// ownership).
+///
+/// Defaults are the empty ones: `""` says the client supplied no description,
+/// and an empty-properties object is what a no-argument tool means. Neither
+/// invents a capability the client did not declare.
+pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const u8) !?[]u8 {
+    // Own the intermediates: growing a parsed ObjectMap allocates OUTSIDE the
+    // parse's arena, so mutating with the caller's allocator leaks unless the
+    // caller happens to be an arena too. Only the returned bytes are theirs.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, a, tools_json, .{}) catch return null;
+    if (parsed.value != .array) return null;
+
+    var changed = false;
+    for (parsed.value.array.items) |*tool| {
+        if (tool.* != .object) continue;
+        const fn_val = tool.object.getPtr("function") orelse continue;
+        if (fn_val.* != .object) continue;
+        if (fn_val.object.get("description") == null) {
+            try fn_val.object.put(a, "description", .{ .string = "" });
+            changed = true;
+        }
+        if (fn_val.object.get("parameters") == null) {
+            var params: std.json.ObjectMap = .empty;
+            try params.put(a, "type", .{ .string = "object" });
+            try params.put(a, "properties", .{ .object = .empty });
+            try fn_val.object.put(a, "parameters", .{ .object = params });
+            changed = true;
+        }
+    }
+    if (!changed) return null;
+
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+/// Whether the template READS `reasoning_effort` — i.e. the word is a
+/// BEHAVIORAL lever on this checkpoint (dsv4's preamble, Qwen3.8's and
+/// Inkling's effort arms) rather than a string we hand over and it ignores.
+/// Where it is, the server must NOT also derive a token budget from the same
+/// word: the budget only truncates what the client is shown, so the two
+/// levers fight — pi asking for `medium` on Qwen3.8 got the model's default
+/// (unguided, long) thinking AND a 2048-token display cut, then 25.9k tokens
+/// of invisible generation (live 2026-08-14). An explicit
+/// `reasoning_budget_tokens` or `--reasoning-budget` is someone asking for a
+/// cap on purpose and still applies.
+///
+/// Substring on the KEY, so a family reading a different one is untouched:
+/// muse's `reasoning_strength` is a near-miss the corpus pins.
+pub fn templateConsumesEffort(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
 }
 
 /// OpenAI's effort vocabulary → DeepSeek's low|high|max. `medium` maps to
@@ -8262,6 +8338,73 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_text|>Rayleigh scattering.<|end_message|>") != null);
         try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
     }
+}
+
+test "templateConsumesEffort: the real templates that READ the effort word" {
+    // The three families whose templates act on `reasoning_effort`. For these
+    // the word is the lever and an effort-derived TOKEN budget on top is pure
+    // truncation (see the fn doc).
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_27b_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/dsv4_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/inkling_chat_template.jinja")));
+
+    // Muse reads `reasoning_strength` — the near-miss. Matching it would strip
+    // the budget from a family the word never reaches, silently uncapping it.
+    try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
+    // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
+    // Nemotron, llama, mistral) reads neither: thinking is a bool there.
+    try testing.expect(!templateConsumesEffort(
+        "{%- if enable_thinking %}<think>\n{%- endif %}"));
+    try testing.expect(!templateConsumesEffort(""));
+}
+
+test "renderChatTemplate: a tool with no description/parameters still renders (no silent fallback)" {
+    // OpenAI's schema makes `description` optional and a no-arg tool needs no
+    // `parameters`, but muse's template dumps all three through `tojson`, and
+    // `tojson` RAISES on Undefined — so a description-less tool killed the
+    // render and fell back to ChatML with no tools preamble at all (found
+    // 2026-08-14 by a sweep whose own test tool omitted the key). Every family
+    // that dumps `tool | tojson` wholesale is one missing key from the same
+    // class, so the defaults are filled for ALL templates, not just this one.
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = @embedFile("fixtures/muse_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|eot|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+
+    // No `description`, no `parameters` — both legal over the wire.
+    const bare =
+        \\[{"type":"function","function":{"name":"note"}}]
+    ;
+    const rendered = try renderChatTemplate(allocator, &messages, &config, bare, null, true, null);
+    defer allocator.free(rendered);
+    // The muse tools preamble proves the REAL template ran; the fallback emits
+    // ChatML markers instead and would carry no tools text at all.
+    try testing.expect(std.mem.indexOf(u8, rendered, "In this environment you have access to a set of tools") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"note\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+
+    // A COMPLETE declaration re-emits nothing: null means the caller keeps the
+    // client's own bytes, so no request that works today is re-serialized
+    // (key order, number formatting and unicode escaping all stay theirs).
+    const complete =
+        \\[{"type":"function","function":{"name":"note","description":"d","parameters":{"type":"object","properties":{}}}}]
+    ;
+    try testing.expect(try fillOptionalToolDefKeys(allocator, complete) == null);
+    // Only the missing keys are added, and only to the function that lacks them.
+    const partial =
+        \\[{"type":"function","function":{"name":"a","description":"d"}},{"type":"function","function":{"name":"b","description":"e","parameters":{"type":"object"}}}]
+    ;
+    const filled = (try fillOptionalToolDefKeys(allocator, partial)).?;
+    defer allocator.free(filled);
+    try testing.expect(std.mem.indexOf(u8, filled, "\"parameters\"") != null);
+    try testing.expect(std.mem.indexOf(u8, filled, "\"description\":\"d\"") != null);
+    try testing.expect(std.mem.indexOf(u8, filled, "\"description\":\"e\"") != null);
 }
 
 test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallback (hermetic)" {
