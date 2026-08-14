@@ -2696,23 +2696,70 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     return if (max_pos > 0) @min(memory_ctx, max_pos) else memory_ctx;
 }
 
+/// The process-wide KV width a request gets when it names none — the same
+/// expression `checkAttentionMemory` falls back to, so the sizer and the
+/// admission guard read one answer.
+fn defaultKvBits() u64 {
+    const cfg: transformer_mod.KVQuantConfig =
+        if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense;
+    return if (cfg.scheme == .off) 16 else cfg.bits;
+}
+
+/// The prefill working set that is NOT the KV cache: score scratch, the
+/// quantized-KV dequant, and the QKV/MLP transient envelope — all bounded by
+/// the prefill CHUNK, at the widest chunk any prompt on this model can run.
+///
+/// It is a one-off reserve, not a per-token cost. `computeMemoryContext` used
+/// to bill the MLP envelope (`8 × max(hidden, ffn) × 2`) against every token of
+/// CONTEXT: 272 KB/token beside a 64 KB/token KV cache on a qwen3_5 27B, i.e.
+/// 81% of the budget spent on a transient that never scales with the context
+/// length, which caps a 16 GB Mac under 4k tokens whatever the weights cost.
+/// Measured on the shipped 4-bit 27B (2026-08-14): the peak above steady state
+/// is flat in prompt length and tracks the chunk — 3.34 GB at chunk 2048 for
+/// prompts from 3k to 51k tokens.
+///
+/// Same estimator as the admission guard with the KV term zeroed, because the
+/// KV cache is exactly what the sizer is solving for.
+pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
+    return prefillMemoryNeeded(
+        chunk,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        0,
+        config.head_dim,
+        config.prefillScoreHeadDim(),
+        config.hidden_size,
+        prefillFfnWidth(config),
+        kv_bits,
+        chunk,
+        config.prefillAttnKeys(chunk),
+    );
+}
+
 /// The largest context this model's per-token footprint fits into RAM right
 /// now, IGNORING the checkpoint's own maximum. Reads live memory.
 fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
 
-    const hidden: u64 = config.hidden_size;
-    const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
+    //   KV cache: config.kvBytesPerToken() — the arch's own count of CACHING
+    //   layers and its own K/V widths, not a uniform layers × 2 × kv_heads ×
+    //   head_dim — billed at the width the ACTIVE kv-quant scheme stores, not
+    //   an unconditional fp16. A `--kv-quant 4` server otherwise reports (and
+    //   serves) under a third of the context it can actually hold.
+    const kv_bits: u64 = defaultKvBits();
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
 
-    //   KV cache (fp16):   config.kvBytesPerToken() — the arch's own count of
-    //                      CACHING layers and its own K/V widths, not a
-    //                      uniform layers × 2 × kv_heads × head_dim
-    //   Working (fp16):    ~8 × max(hidden, ffn) × 2 bytes per token (per-layer tensors,
-    //                      bounded by EVAL_EVERY_N_LAYERS in transformer.zig)
-    const kv_per_tok: u64 = config.kvBytesPerToken();
-    const work_per_tok: u64 = 8 * @max(hidden, ffn) * 2;
-    const per_tok: u64 = kv_per_tok + work_per_tok;
+    // `total_ctx = 0` asks boundedPrefillChunk for the UNSHRUNK cap: every
+    // branch that narrows the chunk does so for longer contexts, so this is the
+    // widest forward any prompt can run and therefore the honest reserve.
+    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
+        config.prefillScoreHeadDim(),
+        config.num_attention_heads,
+        0,
+        config.has_sliding_window,
+        config.isMoe(),
+    ));
 
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
@@ -2723,9 +2770,9 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         // memory, instead of oversubscribing into an uncatchable Metal OOM (#64).
         currentGpuMemoryCeiling(active_mem),
         active_mem,
-        // The hot prefix cache fills to this cap over a session — reserve it so
-        // auto-context doesn't oversubscribe once the cache is full.
-        prefix_cache_mem_bytes,
+        // The hot prefix cache fills to this cap over a session, and a prefill
+        // has to land on top of whatever context we report — reserve both.
+        prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
         // cap AFTER the safety margin, so a model whose own max is the binding
@@ -2770,6 +2817,20 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// kernel exists — MLA scores over 192 while storing values at 128, and billing
 /// the score term against `head_dim` 128 declared it fused and billed ZERO for
 /// a composed path that really does materialize [heads, chunk, seq].
+/// KV bytes for ONE token at the width the cache actually STORES. `dense` is
+/// `ModelConfig.kvBytesPerToken()` — the arch's own caching-layer count and its
+/// own K and V widths, at fp16. A quantized cache stores `kv_bits` per element
+/// plus the group scale/bias pair, which is the `+1` in `(2·bits + 1)/32`
+/// (~0.5 bit/elem at group 64 with bf16 params).
+///
+/// Both the auto-context sizer and the prefill admission guard bill through
+/// here. The sizer used to bill fp16 unconditionally, so a `--kv-quant 4`
+/// server reported — and served — under a third of the context it can hold.
+pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
+    if (kv_bits >= 16) return dense;
+    return dense * (2 * kv_bits + 1) / 32;
+}
+
 pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64) u64 {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
@@ -2777,10 +2838,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // 31-token prompt for "needing" 6.2 GB on a memory-squeezed hy_v3 host
     // (live 2026-07-14). No-op for prompts >= one chunk.
     const fwd: u64 = @min(chunk, @max(seq, 1));
-    const kv_bytes: u64 = if (kv_bits >= 16)
-        seq * kv_per_tok
-    else
-        seq * kv_per_tok * (2 * kv_bits + 1) / 32;
+    const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
     const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
     const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
     const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
@@ -13929,6 +13987,92 @@ test "safeContextForBudget floors when memory is exhausted and caps at max_pos" 
     try testing.expectEqual(@as(u32, 1024), safeContextForBudget(8 * GB, 0, 0, 0, 0));
 }
 
+test "kvBytesPerTokenAtBits: the KV bill follows the CONFIGURED quant width" {
+    const t = std.testing;
+    // qwen3_5 27B dense: 16 caching layers x 4 kv heads x 256 head_dim x (K+V) x 2 B.
+    const dense: u64 = 16 * 4 * 256 * 2 * 2; // 65536
+
+    // Dense/off bills fp16 verbatim — no change for anyone not using --kv-quant.
+    try t.expectEqual(dense, kvBytesPerTokenAtBits(dense, 16));
+    try t.expectEqual(dense, kvBytesPerTokenAtBits(dense, 32));
+
+    // Quantized widths carry the group scale/bias overhead (+0.5 bit/elem), the
+    // SAME expression prefillMemoryNeeded bills — the sizer and the admission
+    // guard must not disagree about what one token costs.
+    try t.expectEqual(dense * 9 / 32, kvBytesPerTokenAtBits(dense, 4)); // 18432
+    try t.expectEqual(dense * 17 / 32, kvBytesPerTokenAtBits(dense, 8));
+    // 4-bit is what makes the 16 GB tier reachable: under a third of dense.
+    try t.expect(kvBytesPerTokenAtBits(dense, 4) * 3 < dense);
+}
+
+test "auto-context on a 16 GB profile: activations are a chunk reserve, not a per-token multiplier" {
+    const t = std.testing;
+    // Qwen3.8-27B on a 16 GB Mac: ~10.6 GB reachable Metal working set, an
+    // 8.6 GB iQ-MLX pack resident, --kv-quant 4, and the small prefill chunk
+    // the machine can actually afford.
+    const ceiling: u64 = 10_600 * 1000 * 1000;
+    const weights: u64 = 8_600 * 1000 * 1000;
+    const dense_kv: u64 = 16 * 4 * 256 * 2 * 2;
+    const per_tok = kvBytesPerTokenAtBits(dense_kv, 4);
+
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+
+    const reserve = prefillTransientReserve(&cfg, 4, 512);
+    const got = safeContextForBudget(ceiling, weights, reserve, per_tok, 262144);
+
+    // The pre-fix formula billed 8 x max(hidden, ffn) x 2 = 272 KB PER TOKEN on
+    // top of a 64 KB/token dense KV — 344 KB/token, which caps this machine at
+    // under 4k tokens no matter what the weights cost.
+    const old_per_tok: u64 = dense_kv + 8 * 17408 * 2;
+    const old = safeContextForBudget(ceiling, weights, 0, old_per_tok, 262144);
+    try t.expect(old < 4096);
+
+    // Corrected, the same machine holds a real working context.
+    try t.expect(got > 35_000);
+    try t.expect(got < 60_000);
+
+    // The reserve is a CONSTANT of the chunk, so halving the chunk buys context
+    // back rather than being invisible.
+    const narrow = safeContextForBudget(ceiling, weights, prefillTransientReserve(&cfg, 4, 256), per_tok, 262144);
+    try t.expect(narrow > got);
+}
+
+test "auto-context never sizes past the ceiling as weights grow" {
+    const t = std.testing;
+    const ceiling: u64 = 10_600 * 1000 * 1000;
+    const dense_kv: u64 = 16 * 4 * 256 * 2 * 2;
+    const per_tok = kvBytesPerTokenAtBits(dense_kv, 4);
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 4;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 5120;
+    cfg.intermediate_size = 17408;
+    cfg.intermediate_size_declared = true;
+    const reserve = prefillTransientReserve(&cfg, 4, 512);
+
+    // Under-billing here ends in an uncatchable Metal OOM, not a 400: at every
+    // weight size the reported context plus what is already spoken for has to
+    // stay inside the ceiling, and the reported figure must fall as the pack
+    // grows rather than staying pinned to the checkpoint's max.
+    var prev: u32 = std.math.maxInt(u32);
+    var weights: u64 = 2_000 * 1000 * 1000;
+    while (weights < ceiling) : (weights += 1_000 * 1000 * 1000) {
+        const ctx = safeContextForBudget(ceiling, weights, reserve, per_tok, 262144);
+        try t.expect(weights + reserve + @as(u64, ctx) * per_tok <= ceiling or ctx == 1024);
+        try t.expect(ctx <= prev);
+        prev = ctx;
+    }
+    // Squeezed to nothing it floors rather than reporting a context that cannot exist.
+    try t.expectEqual(@as(u32, 1024), safeContextForBudget(ceiling, ceiling, reserve, per_tok, 262144));
+}
+
 test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback otherwise" {
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
@@ -15466,8 +15610,19 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     const end = std.mem.indexOfScalar(u8, tail, ')') orelse return error.CallSiteMoved;
     try t.expectEqualStrings(" config.prefillAttnKeys(seq", tail[0..end]);
 
-    // Auto-context sizing reads the same helper — the two must not drift.
-    try t.expect(std.mem.indexOf(u8, src, "const kv_per_tok: u64 = config.kvBytesPerToken();") != null);
+    // Auto-context sizing reads the same helpers — the two must not drift.
+    // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
+    // `--kv-quant 4` server cannot size its context against fp16 while the
+    // guard admits against 4-bit (that mismatch reported a third of what fits).
+    try t.expect(std.mem.indexOf(u8, src,
+        "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src,
+        "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
+    // The prefill transient: the sizer RESERVES it once at the chunk width
+    // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
+    // never as a per-token multiplier on the context it is solving for.
+    try t.expect(std.mem.indexOf(u8, src,
+        "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "prefillFfnWidth: a declared MoE width beats the struct default, which is only a fallback" {
