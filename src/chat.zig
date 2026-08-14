@@ -889,7 +889,18 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
 /// template never reads the key on that arm, so the value is inert.
 fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (!enable_thinking) return "low";
-    const e = effort orelse return "xhigh";
+    // An ABSENT effort takes OUR default, not the checkpoint's. The template
+    // defaults to xhigh, whose preamble asks the model to validate assumptions
+    // and consider alternatives, and nothing bounds the result: a pi agent turn
+    // that sent no effort ran 16803 reasoning tokens before the client gave up
+    // (live 2026-08-14). The server-side `reasoning_effort` budget is NOT the
+    // answer to that — it truncates rather than shortens, and on exhaustion the
+    // model is still inside its block, so the rest of the thought streams as
+    // CONTENT. Low is the only lever that makes the model itself stop early
+    // ("keep your thinking brief and focused, moving directly to the
+    // conclusion"). A client that wants the checkpoint default still gets it by
+    // asking for it; only silence changed meaning.
+    const e = effort orelse return "low";
     if (std.mem.eql(u8, e, "medium")) return "medium";
     if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
     return "xhigh";
@@ -8287,11 +8298,14 @@ test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallb
         .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
     };
 
-    // Thinking ON, no client effort: the template's own default (xhigh).
+    // Thinking ON, no client effort: OUR default, which is deliberately NOT
+    // the checkpoint's (see qwen38EffortFor) — xhigh reasons without a bound
+    // and a client that sends nothing gets no bound either.
     {
         const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
         defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to xhigh.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
         try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<function=get_time>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<parameter=timezone>\nUTC\n</parameter>") != null);
@@ -8363,6 +8377,13 @@ test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" 
         try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
         try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n"));
         try testing.expect(promptTailOpensThink(rendered));
+    }
+    // Absent client effort takes OUR default (low), not the template's xhigh.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
     }
     // Thinking OFF renders the template's OWN no-think prompt: closed block,
     // no reasoning preamble, and nothing appended after it.

@@ -6443,6 +6443,7 @@ fn handleStreamingGeneration(
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
+    var reasoning_tokens_sent: usize = 0; // reasoning deltas actually emitted (the budget is counted in these)
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
 
@@ -6571,15 +6572,27 @@ fn handleStreamingGeneration(
                         // with the thought) while the no-tools path is already
                         // streaming at 0.05 s.
                         //
-                        // A reasoning BUDGET keeps the old buffering: capping what
-                        // the client is allowed to see cannot be reconciled with
-                        // having already sent it.
-                        if (reasoning_budget < 0) {
+                        // A reasoning BUDGET is a cap, not a reason to hide the
+                        // thought: you never exceed a cap you STOP emitting at.
+                        // This was gated on `reasoning_budget < 0`, so a capped
+                        // tools request showed nothing for the whole generation
+                        // and got one dump at the end — a capped agent session
+                        // looked frozen (live 2026-08-14, pi on Qwen3.8-27B).
+                        // Each loop iteration is one model token, so an
+                        // iteration that produced fresh reasoning IS one
+                        // reasoning token; at the cap the latch stops every
+                        // later emitter from shipping the remainder.
+                        if (!budget_exhausted) {
                             const so_far = chat_mod.splitThinkBlock(buf, true, opens_think);
                             if (so_far.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                     reasoning_streamed = rc.len;
+                                    reasoning_tokens_sent += 1;
+                                    if (reasoning_budget >= 0 and reasoning_tokens_sent >= @as(usize, @intCast(reasoning_budget))) {
+                                        budget_exhausted = true;
+                                        log.info("  reasoning budget exhausted ({d}/{d} tokens, streamed)\n", .{ reasoning_tokens_sent, reasoning_budget });
+                                    }
                                 }
                             }
                         }
@@ -6600,9 +6613,15 @@ fn handleStreamingGeneration(
                         text_buf.clearRetainingCapacity();
                         think_scan.reset();
                         think_closed = true;
-                        if (split.reasoning_content) |rc| {
-                            if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
-                                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
+                        // Past the cap the tail is exactly what the budget
+                        // exists to withhold. This arm applied no budget at all,
+                        // so a capped request received the WHOLE thought the
+                        // moment the block closed.
+                        if (!budget_exhausted) {
+                            if (split.reasoning_content) |rc| {
+                                if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
+                                }
                             }
                         }
                         // Block done and `text_buf` was just cleared — a thought
@@ -6932,7 +6951,8 @@ fn handleStreamingGeneration(
             // generated is delivered, thinking flag or not.
             {
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
-                if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
+                // `budget_exhausted` means the cap was already streamed in full.
+                if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
@@ -6993,7 +7013,8 @@ fn handleStreamingGeneration(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
-                if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
+                // `budget_exhausted` means the cap was already streamed in full.
+                if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
