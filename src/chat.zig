@@ -883,9 +883,10 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
 /// raise_exception's on any other string and its own default is xhigh, so an
 /// absent or unrecognized effort keeps the checkpoint default. Thinking-off
-/// maps to low: this family refuses to disable thinking (the render raises),
-/// so the request is served on the cheapest arm with the think block closed
-/// in the prompt by `noThinkTailSuffix`.
+/// maps to low for the variants that REFUSE it (2.4T-A95B): the request is
+/// served on the cheapest arm with the think block closed in the prompt by
+/// `noThinkTailSuffix`. On a variant that accepts thinking-off (27B) the
+/// template never reads the key on that arm, so the value is inert.
 fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (!enable_thinking) return "low";
     const e = effort orelse return "xhigh";
@@ -915,16 +916,23 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try appendJsonString(allocator, &buf, eos);
         need_comma = true;
     }
-    // Qwen3.8's template RAISES on `enable_thinking is false` ("Disabling
-    // thinking is not supported") — the checkpoint always thinks. Thinking-off
-    // is served by closing the block the template opens (`noThinkTailSuffix`),
-    // never by the flag, so the flag never reaches this family as false.
-    // Sniffed on the jinja STRING LITERAL 'xhigh' — it appears in both the
-    // `reasoning_effort|default('xhigh')` line and the accepted-values tuple,
-    // so a reworded raise message can't drift the detection.
+    // Qwen3.8's effort vocabulary, sniffed on the jinja STRING LITERAL 'xhigh'
+    // — it appears in both the `reasoning_effort|default('xhigh')` line and the
+    // accepted-values tuple, so a reworded raise message can't drift the
+    // detection. EVERY 3.8 template raises on OpenAI's "high", so this keys the
+    // mapping for the whole family.
     const qwen38_style = std.mem.indexOf(u8, chat_config.chat_template, "'xhigh'") != null;
+    // Whether the template REFUSES thinking-off is a SEPARATE question from the
+    // effort vocabulary, and the two split inside one family: 2.4T-A95B raises
+    // ("Disabling thinking is not supported"), the 27B answers that arm the 3.6
+    // way with a closed `<think>\n\n</think>` and NO reasoning preamble. Keying
+    // the override on the shared 'xhigh' literal forced the 27B's thinking-off
+    // requests onto the thinking-on arm, injecting a system line the checkpoint
+    // never renders there. Only a refusing template gets the flag withheld;
+    // thinking-off is then committed in the prompt by `noThinkTailSuffix`.
+    const refuses_nothink = std.mem.indexOf(u8, chat_config.chat_template, "Disabling thinking is not supported") != null;
     if (need_comma) try buf.append(allocator, ',');
-    if (enable_thinking or qwen38_style) {
+    if (enable_thinking or refuses_nothink) {
         try buf.appendSlice(allocator, "\"enable_thinking\":true");
     } else {
         try buf.appendSlice(allocator, "\"enable_thinking\":false");
@@ -8312,6 +8320,58 @@ test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallb
         try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
         try testing.expect(std.mem.endsWith(u8, rendered, "</think>"));
+        try testing.expect(!promptTailOpensThink(rendered));
+    }
+}
+
+test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" {
+    // Same family, DIFFERENT gates: `qwen38_chat_template.jinja` (2.4T-A95B)
+    // raises on `enable_thinking is false`, while the 27B's template answers
+    // that arm the 3.6 way — a CLOSED `<think>\n\n</think>\n\n` and no
+    // reasoning-instructions preamble at all (its effort validation lives
+    // INSIDE the thinking-on branch). Sniffing the shared `'xhigh'` literal
+    // for both decisions forced every thinking-off request onto the
+    // thinking-on arm at effort low, which injects a system line the
+    // checkpoint never renders for that arm and leaves the block to be closed
+    // by `noThinkTailSuffix` instead of by the template. The effort mapping is
+    // still keyed on `'xhigh'` (both templates raise on OpenAI's "high"); only
+    // the enable_thinking override is keyed on the refusal itself.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What time is it?" },
+    };
+
+    // Thinking ON is unchanged: OpenAI's "high" still has to become this
+    // family's "xhigh" or the render raises and silently falls back.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high");
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to xhigh.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n"));
+        try testing.expect(promptTailOpensThink(rendered));
+    }
+    // Thinking OFF renders the template's OWN no-think prompt: closed block,
+    // no reasoning preamble, and nothing appended after it.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
         try testing.expect(!promptTailOpensThink(rendered));
     }
 }

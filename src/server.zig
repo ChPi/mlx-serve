@@ -9271,7 +9271,7 @@ fn appendLfm2Tiles(
     const thumb_tokens = (thumb.h / vp.patch / vp.merge) * (thumb.w / vp.patch / vp.merge);
 
     if (!split) {
-        const chw = lfm2Canvas(allocator, src, thumb.h, thumb.w) orelse return;
+        const chw = lfm2Canvas(allocator, src, thumb.h, thumb.w, vp) orelse return;
         defer allocator.free(chw);
         const img = lfm2Region(allocator, chw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w) orelse return;
         list.append(allocator, img) catch {
@@ -9295,7 +9295,7 @@ fn appendLfm2Tiles(
     // all of them, so any failure drops the whole image rather than some of it.
     var ok = true;
     {
-        const chw = lfm2Canvas(allocator, src, canvas_h, canvas_w) orelse return;
+        const chw = lfm2Canvas(allocator, src, canvas_h, canvas_w, vp) orelse return;
         defer allocator.free(chw);
         outer: for (0..grid.rows) |row| {
             for (0..grid.cols) |col| {
@@ -9332,7 +9332,7 @@ fn appendLfm2Tiles(
 
     var thumb_note: []const u8 = "";
     if (vp.use_thumbnail and n_tiles != 1) {
-        if (lfm2Canvas(allocator, src, thumb.h, thumb.w)) |tchw| {
+        if (lfm2Canvas(allocator, src, thumb.h, thumb.w, vp)) |tchw| {
             defer allocator.free(tchw);
             if (lfm2Region(allocator, tchw, thumb.h, thumb.w, vp, 0, 0, thumb.h, thumb.w)) |t| {
                 var img = t;
@@ -9354,9 +9354,24 @@ fn appendLfm2Tiles(
 
 /// Resize `src` onto a `canvas_h` x `canvas_w` normalized CHW buffer, owned by
 /// the caller. One resample serves every tile cut from it.
-fn lfm2Canvas(allocator: std.mem.Allocator, src: DecodedRgb, canvas_h: u32, canvas_w: u32) ?[]f32 {
+/// The resample filter belongs to the ARCH's reference processor, not to the
+/// resampler it shares: muse smart-resizes with Lanczos, LFM2-VL with PIL
+/// BILINEAR (`Lfm2VlImageProcessor` uses it at all three sites — tile canvas,
+/// thumbnail, single view), Qwen with bicubic. Reusing a neighbouring tower's
+/// filter is silent: the geometry and token counts still match, the pixels do
+/// not (measured 2026-08-14: bicubic loses 3 of 144 ScreenSpot-v2 items on
+/// LFM2.5-VL and never wins one).
+fn resampleFilterFor(vp: chat_mod.VisionPreproc) qwen_vision.Filter {
+    return switch (vp.mode) {
+        .muse => .lanczos,
+        .lfm2 => .bilinear,
+        else => .bicubic,
+    };
+}
+
+fn lfm2Canvas(allocator: std.mem.Allocator, src: DecodedRgb, canvas_h: u32, canvas_w: u32, vp: chat_mod.VisionPreproc) ?[]f32 {
     const chw = allocator.alloc(f32, 3 * @as(usize, canvas_h) * canvas_w) catch return null;
-    qwen_vision.resizeRgbNormalizedChw(allocator, chw, src.rgb, src.h, src.w, canvas_h, canvas_w, .bicubic) catch {
+    qwen_vision.resizeRgbNormalizedChw(allocator, chw, src.rgb, src.h, src.w, canvas_h, canvas_w, resampleFilterFor(vp)) catch {
         allocator.free(chw);
         return null;
     };
@@ -9476,7 +9491,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
             src_w,
             rh,
             rw,
-            if (vp.mode == .muse) .lanczos else .bicubic,
+            resampleFilterFor(vp),
         ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
