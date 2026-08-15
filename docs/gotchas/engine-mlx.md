@@ -2259,3 +2259,193 @@ Failure now leaves the live cache exactly as it was — same scheme, same conten
 Two things make this a class rather than a bug. First, the symptom is maximally misleading: the stack names `mlx_array_free`, several frames and one full load-path unwind away from the refusal that caused it, so the natural first suspect is the MLA cache geometry or mlx's refcounting — anything but the four-line caller that printed the correct error message immediately before. Second, the shape recurs on its own: any future scheme that refuses an arch, at any of these sites, reopens it. So the guard is a source scan (`.cache = try` appears nowhere in transformer/scheduler/main, and `reinit`'s build precedes its free) rather than only the behavioral test, and the behavioral test is written against the testing allocator so the pre-fix order trips a double free on its own `defer` — verified red exactly that way, and red again with the helper's two statements transposed.
 
 The general rule: **when a fallible call sits after a `deinit` of the thing it replaces, the error path is a use-after-free.** Build, then swap — and when several call sites share the pattern, the ordering belongs inside one helper they all use, not repeated correctly four times.
+
+## The verify-qmm plain-SIMD tiles were a 4-bit specialization, and shape-gating is where the win lives (2026-08-15)
+
+`transformer.verifyQmm`'s split-K and msg tiles read weights as
+`w_q[(n0+j) * K_by_p + pack]` — one uint32, eight nibbles — so every non-4-bit
+pack fell through to stock MLX on the whole M1-M4 line. Only the NAX m16 tile
+(M5-class, `applegpu_g17`) handled 5/6-bit. The Qwen3.8-27B 6-bit pack is the
+best quality-per-byte build for a 36 GB Mac (95.0% top-1 against bf16 vs the
+4-bit pack's 83.6%) and paid the full lane-off penalty on every MTP round.
+
+Both tiles are now `BITS`-templated with the same byte-addressed unpack the NAX
+tile already validated: one `pack` iteration always covers 8 K values (that is
+the Vec8 activation load), so its weights are exactly BITS bytes at
+`w_q + n * K_bytes + pack * BITS` — 4 values per 3 bytes at 6 bits, 8 per 5
+bytes at 5, one byte per value at 8. 4-bit keeps its original aligned uint32
+read verbatim.
+
+### Three things that were not obvious
+
+**The kernel-cache key was a false alarm, and the reason is worth knowing.**
+`getVerifyQmmKernel(m, bn)` is not keyed by bits, which looks exactly like the
+`ShapeKey` collision class. It is not: MLX names its JIT'd custom kernel
+`custom_kernel_<name>_<template_hash>_<input dtypes>_<output dtypes>`
+(`backend/common/metal_kernel.cpp`), so template args ARE the cache key. That is
+the same mechanism that already lets one cached `mlx_fast_metal_kernel` handle
+serve GS 32/64/128. `BITS` rides in as a template arg and needs no key change —
+and the parity test drives every width through one cached handle in one process,
+which is the test that would have caught it.
+
+**Hoisting the POINTER is not hoisting the LOAD.** The tile's shape is "issue
+every column's weight word, then run one sequential chain per column", and the
+first cut hoisted only `const device uchar* wp{j}` — leaving the actual byte
+reads inside each chain, serialized behind the previous column's arithmetic.
+The widened arms hoist the WORDS, at the widest load each width's alignment
+allows: 8-bit takes two uints (`pack * 8`; not one ulong — 4-byte alignment is
+all the shipped 4-bit path assumes of this buffer), 6-bit three ushorts
+(`pack * 6` is only 2-aligned) re-assembled into two 3-byte words, 5-bit bytes.
+
+**Shape-gating is most of the result, not a detail.** Measured on an M4 Max
+(no NAX lane, so the plain-SIMD tiles are all this machine has), Qwen3.8-27B,
+MTP on, decode tok/s from the server's own `timings`, per-prompt medians over
+two passes with the CELL order reversed on the second:
+
+| arm | code | prose | agentish |
+|---|---|---|---|
+| 6-bit, every shape forced on (`MIXED_PLAIN=1`) | 1.03x | 1.05x | 1.03x |
+| 6-bit, `N >= 5120` (`mixedPlainShapeEnabled`) | **1.10x** | **1.22x** | **1.17x** |
+| 8-bit, `N >= 5120` | 1.03x | 1.04x | 1.01x |
+
+Adopting the 1024-wide K/V projections gives back ~10 of the ~20 points — the
+same split `mixedNaxShapeEnabled` encodes for the NAX tile, and the reason
+adoption is a measured predicate rather than a width list. For scale: killing
+the 4-bit lane outright on this box costs 1.09-1.12x, so the 6-bit lane is worth
+MORE than the 4-bit one it was modelled on.
+
+8-bit ships default OFF at 1.01-1.04x — inside what the harness resolves, and a
+lane that only adds dispatch surface for that is not worth defaulting. 5-bit has
+the kernel arm and the parity test but no pack on the measuring box, so it does
+not get to ride 6-bit's number either. `MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0|1`
+forces both arms.
+
+**Cell ORDER is a real bias in a paired sweep.** The first cell of a pass reads
+~2% fast; a control pack that ignores the lever entirely measured a 1.8-2.8%
+"gain" between two cells that differ in nothing. Reversing the cell order on the
+second pass (not just the pack order) cancels it — before that fix the 6-bit win
+read as +1 to +5%.
+
+### The end-to-end bar the plan asked for is not achievable, and the control says so
+
+"Greedy temp-0 continuation must be byte-identical with the lane on and off" is
+not a property this lane family has. The verify tile accumulates the fp32
+reduction in a different order than stock qmm, so near-tie argmaxes flip — the
+documented INT4-divergence class. The SHIPPED, unchanged 4-bit lane diverges
+from stock under exactly that test and diverges EARLIER (char 322 against the
+6-bit lane's 557), both continuations fluent and on-topic.
+
+The bars that do hold, and that this change is pinned against:
+- parity against an fp32 DEQUANT reference at real shapes, per width, never
+  kernel-vs-kernel (`verifyQmm: the plain-SIMD tiles match stock qmm at
+  5/6/8-bit affine too`, red-verified by flipping the 6-bit mask to 0x1F and by
+  reversing the 8-bit byte order);
+- **4-bit bit-identity across the refactor**: same binary except the kernel
+  generator, same 4-bit pack, MTP engaged in both arms, 250 greedy tokens
+  identical to the byte.
+
+## Fused kv-quant reads under spec decode: the verify widths were the whole bill (2026-08-15)
+
+**Symptom.** With `--kv-quant 8` (or 4) and `--kv-attn-mode auto`, decode on MTP
+models collapsed past 8k context: 28 tok/s where the dense read does 60
+(Qwen3.6-27B-oQ4e and Qwen3.8-27B, M4 Max). It read as a "long context
+regression" in llmprobe. It was NOT a regression — byte-identical behavior on
+fc6b5ce, 5d10cb7 and v26.8.6; the old llmprobe cards it was compared against
+had run kv-quant OFF. The repro needs all three legs: kv-quant on, ≥8K prompt,
+PREDICTABLE content (deep MTP rounds). Random filler shows no cliff because
+acceptance collapses and rounds stay cheap. Harness kept at
+`~/claude-tmp/kv8-cliff-20260815/`.
+
+**Mechanism.** `kvAttnFusedEligible` admitted `t_q <= 32` once the context
+passed the auto crossover. Inside the fused arm, decode width (t_q == 1) rides
+`qkvAttnDecodeKernel` — the measured +10..+56% serial win — but verify widths
+(T_q 2..7 under MTP) fell to `kv_quant.quantAttention`: a composed chain of
+quantized matmuls against the PACKED K and V, per layer, per spec round. qmm at
+M 2..7 over an 8k+ contraction is the exact dead zone the verifyQmm weight
+lanes exist for, except here it ran 16 attention layers x 2 packed matmuls
+every round. Round time measured 63 ms at 4k (below the crossover, dense path)
+vs 158 ms at 8k (composed packed path), flat to 16k. Under MTP nearly every
+trunk forward IS a verify, so the fused win case barely ran. The composed
+verify chain was a deliberate choice that predated deep-MTP defaults and was
+never A/B'd at spec depth.
+
+**Fix.** `kvAttnFusedEligible` requires `t_q == 1`. Verify and small-prefill
+widths fall through to the dense dequant + SDPA path — the reference semantics
+anyway. Decode-width eligibility is unchanged, so the serial fused win is
+untouched by construction; bits-agnostic, so kv4 and kv8 are both covered. Side
+effect, documented: a forced per-request `kv_attn_mode:"fused"` at verify width
+now gets the dense read too — honest, since the composed chain it used to get
+is the slow path this fix removes. The lazy sliding sel_mask null guard inside
+the fused arm stays (only t_q == 1 reaches it now, but the live failure it
+fixed was real and it costs nothing).
+
+**Guards.** `kvAttnFusedEligible` unit test (red-verified: pre-fix admits
+t_q == 2) + `tests/test_kv_quant_fused_equivalence.sh`, which gained a spec-on
+arm: PLD engagement (`[spec-stats] mode=pld`), fused engagement with the
+one-shot `[kv-attn]` line's `Tq=1` (no other width is eligible now), and greedy
+first-N equivalence vs the dense spec arm. The decode-rate recovery is NOT a
+shell-test assertion — a one-run spec cell is variance per /bench rules; it is
+pinned by same-boot interleaved perf A/Bs.
+
+**What Phase 2 would be (not built).** The dense fallback still pays a full-KV
+dequant transient per verify round. A real packed verify-attention kernel for
+M 2..8 (the verifyQmm move applied to attention) is the prize IF the dense-arm
+rate ever matters vs serial. Bars if attempted: fp32-dequant-reference parity
+per width, no-worse-than-dense same-boot A/B at 8k/16k/32k per arch,
+engagement log per width, kill switch, per-shape eligibility A/B. Non-goals,
+decided: the 8192 auto crossover stays (fine for the path that remains); no
+resident dense-KV cache to amortize verify dequants (it re-spends the memory
+kv-quant exists to save, exactly on the machines that need kv-quant).
+
+### Phase 2 follow-through: the verify widths got their own packed kernel, and two pre-existing losses surfaced on the way (2026-08-15)
+
+Sizing the prize before building (dense-fallback vs kv-off, spec-on,
+Qwen3.6-27B-oQ4e-mtp, same boot): −2% @ 8k, −7% @ 16k, −12.6% @ 32k — the
+full-KV dequant transient per verify round grows with context, so the plan's
+"only if it matters" bar was met.
+
+**`qkvAttnVerifyKernel`** (T_q 2..8, `MLX_SERVE_KV_ATTN_VERIFY=0` kills):
+QKV_DEC's two-phase block-parallel layout generalized to TQ query rows per
+head. q is read from DEVICE, not staged (LQ=GQA·TQ rows of DK f32 is up to
+49 KB of tg memory; the reads are lockstep-coalesced and L1-scale); the
+causal TAIL is applied from geometry (`gpos < Tk - TQ + 1 + tq`, the same
+end-aligned contract as SDPA "causal", which is what the dense path serves
+these widths — mutation-checked: dropping it fails parity at max_err 0.076);
+"array" (sliding) masks decline; scale folds at score write. Partials merge
+through the SAME `qkvMergePartials` carry (extracted from the decode wrapper,
+pure code motion), rows (head-major, tq inner) so [Hq·TQ, DV] reshapes
+straight to [1, Hq, TQ, DV]. Config cache is one slot per TQ — verify widths
+alternate round to round, a single-entry cache would rebuild per call.
+
+Measured (M4 Max, kv8, spec-on, same-boot per-request interleave, medians):
+qwen3.6-27B auto 60.7/49.1/40.5 vs dense 58.4/46.1/38.4 vs kv-off
+60.9/49.3/41.9 at 8k/16k/32k; qwen3.8-27B 66.0 vs 64.3 vs 67.2 at 8k. The
+kernel recovers most of the dense-fallback tax — kv8 now decodes ≈ kv-off at
+every rung with HALF the KV bytes. Engaged at Tq 5-7 live (auto-depth MTP).
+
+**Two pre-existing t_q==1 losses found by the gemma4 sanity pass** (auto was
+a 1.45x decode LOSS on gemma4-12B kv8 at 11k — 21.1 vs 30.5 tok/s, present
+before Phase 1):
+- gemma4's full-attention layers (gqa 16 × dk 512) overflow the decode
+  kernel's threadgroup q-staging budget, so EVERY decode step fell to the
+  composed chain: −17% alone. Fix: the fused arms are kernel-or-DENSE now;
+  `kv_quant.quantAttention` never serves (scan-pinned to its one parity
+  caller). A declined kernel falls through to the dense arms.
+- gemma4's window-1024 sliding layers sat exactly AT the 1024 per-layer kv
+  floor and engaged the masked kernel at ~1k KV: another ~4 tok/s. Fix:
+  `KV_ATTN_FUSED_MIN_TK` 1024 → 2048 (Laguna's 512-window calibration point
+  stays excluded either way).
+After both: gemma4 auto == dense (30.4/30.4), zero engagements — correct,
+its shapes are outside every measured adoption set. The verify kernel's
+gqa16×dk512 cell measured −1% at Tq 2, so the wrapper gates dk ≤ 256 — the
+mixedNaxShapeEnabled rule again: adoption is what was measured, per shape.
+
+Guards: `qkvVerParityCase` (TQ 2..8 × bits × GQA incl. the 24/4/256 live
+geometry, strided views, multi-block merge, vs dense SDPA over the SAME
+dequantized view), the decline test, the kernel-or-DENSE source scan, the
+verify-eligibility unit arms, and the shell script's third arm (qwen-shaped
+model, PLD on): verify-kernel ENGAGEMENT is the assertion — the dense
+fallback is output-equivalent, so a dispatch hole is invisible to equality.
+gemma-4-e4b deliberately has NO verify-engagement assertion: its shapes are
+outside the adoption set, and asserting one would be a checkpoint
+expectation.
