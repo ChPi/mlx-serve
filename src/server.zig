@@ -4563,7 +4563,14 @@ const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 
 fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
-    if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget, .effort = v.string };
+    return reasoningEffortFromWord(v.string, default_budget, template_consumes_effort);
+}
+
+/// One effort word → one thinking config, whatever field carried the word —
+/// OpenAI's flat `reasoning_effort` and Anthropic's `output_config.effort`
+/// must not drift on what "low" means.
+fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consumes_effort: bool) ReasoningEffort {
+    if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
     // Where the TEMPLATE reads the effort word, the word is the behavioral
     // lever and a budget derived from the same string is pure display
     // truncation on top of it (`chat.templateConsumesEffort`). An explicit
@@ -4571,8 +4578,37 @@ fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_
     const budget = if (template_consumes_effort)
         default_budget
     else
-        responses_mod.effortBudget(v.string, default_budget);
-    return .{ .enable = true, .budget = budget, .effort = v.string };
+        responses_mod.effortBudget(word, default_budget);
+    return .{ .enable = true, .budget = budget, .effort = word };
+}
+
+/// Anthropic `output_config` — the 2026 spelling Claude Code sends: `effort`
+/// in place of the older `thinking` budget object, and `format` where this
+/// surface previously had no structured-output request at all. Ignored, it
+/// served every Claude Code request at the arch default with an UNLIMITED
+/// thinking budget (live 2026-08-16: 8-minute retries at 16k thinking tokens
+/// each) and answered `json_schema` requests with markdown prose the client
+/// rejects — which is what fed the retry loop.
+const AnthropicOutputConfig = struct {
+    effort: ?[]const u8 = null,
+    /// `format.schema` when `format.type == "json_schema"`; null otherwise.
+    schema: ?std.json.Value = null,
+};
+
+fn parseAnthropicOutputConfig(root: std.json.ObjectMap) AnthropicOutputConfig {
+    var out: AnthropicOutputConfig = .{};
+    const oc = root.get("output_config") orelse return out;
+    if (oc != .object) return out;
+    if (oc.object.get("effort")) |e| {
+        if (e == .string) out.effort = e.string;
+    }
+    if (oc.object.get("format")) |f| {
+        if (f == .object) {
+            const ftype = if (f.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+            if (std.mem.eql(u8, ftype, "json_schema")) out.schema = f.object.get("schema");
+        }
+    }
+    return out;
 }
 
 /// Resolve thinking for a chat request. An EXPLICIT client signal always wins —
@@ -10504,6 +10540,7 @@ fn handleAnthropicMessages(
     else
         false;
     var reasoning_budget: i32 = server_config.default_reasoning_budget;
+    var budget_explicit = false;
     if (root.get("thinking")) |think_val| {
         if (think_val == .object) {
             const think_type = if (think_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
@@ -10511,10 +10548,40 @@ fn handleAnthropicMessages(
                 enable_thinking = true;
             }
             if (think_val.object.get("budget_tokens")) |bt| {
-                if (bt == .integer) reasoning_budget = @intCast(bt.integer);
+                if (bt == .integer) {
+                    reasoning_budget = @intCast(bt.integer);
+                    budget_explicit = true;
+                }
             }
         }
     }
+
+    // `output_config` (Claude Code's spelling; see parseAnthropicOutputConfig).
+    // The effort word is an explicit thinking signal, so it displaces the arch
+    // default and OR's with a present `thinking` object — the OpenAI surface's
+    // resolveEnableThinking rule. An explicit `budget_tokens` outranks the
+    // budget derived from the word; the word itself rides through to templates
+    // that read it (qwen3.8's preamble, dsv4's).
+    const output_cfg = parseAnthropicOutputConfig(root);
+    var effort_word: ?[]const u8 = null;
+    if (output_cfg.effort) |word| {
+        const cfg = reasoningEffortFromWord(
+            word,
+            server_config.default_reasoning_budget,
+            if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false,
+        );
+        effort_word = cfg.effort;
+        if (!budget_explicit) reasoning_budget = cfg.budget;
+        enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
+    }
+    // A grammar mask constrains from token 0 — it cannot express "think
+    // first, then JSON", so a schema request is a content-only contract and
+    // thinking is enforced OFF in the prompt (the noThinkTailSuffix
+    // machinery). Without this the mask pushes the JSON into the template's
+    // open think block and `content` ships EMPTY (live: qwen3.5, effort high
+    // + schema). Tools present = no mask (see the grammar block below), so
+    // thinking stays whatever the request resolved.
+    if (output_cfg.schema != null and !has_tools) enable_thinking = false;
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
@@ -10547,6 +10614,34 @@ fn handleAnthropicMessages(
         defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
+    // `output_config.format` json_schema — the same two-layer enforcement as
+    // chat-completions' `response_format`: a schema instruction in the system
+    // prompt (so the model aims at the shape) plus the grammar mask below (so
+    // the shape is guaranteed). Before the render, or the instruction never
+    // reaches the prompt.
+    if (output_cfg.schema != null) {
+        var schema_instruction = std.ArrayList(u8).empty;
+        defer schema_instruction.deinit(allocator);
+        try schema_instruction.appendSlice(allocator, "Respond with valid JSON only. No other text, no markdown, no explanation. ");
+        {
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+            output_cfg.schema.?.jsonStringify(&jws) catch {};
+            try schema_instruction.appendSlice(allocator, "Your response MUST conform to this JSON schema:\n");
+            try schema_instruction.appendSlice(allocator, out.written());
+        }
+        if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
+            const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, schema_instruction.items });
+            try content_allocs.append(allocator, combined);
+            messages.items[0].content = combined;
+        } else {
+            const instruction = try allocator.dupe(u8, schema_instruction.items);
+            try content_allocs.append(allocator, instruction);
+            try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
+        }
+    }
+
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
     const preview_len = @min(last_msg.content.len, 80);
@@ -10576,9 +10671,10 @@ fn handleAnthropicMessages(
     const continue_final = chat_mod.continuationRequested(messages.items) and
         continuationRejectReason(lm.ds4_engine != null) == null;
     var tokenize_sw = Stopwatch.init(stream.io);
-    // Anthropic's thinking opt-in is a budget object — it carries no
-    // OpenAI-style effort string, so dsv4 templates get their default.
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, null, continue_final);
+    // The `thinking` budget object carries no effort string, but
+    // `output_config.effort` does — templates that read the word (dsv4,
+    // qwen3.8) get it; requests without one still render their default.
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
     const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
@@ -10637,7 +10733,7 @@ fn handleAnthropicMessages(
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     const eos_slice = config.eosTokenSlice();
-    const sampling = generate_mod.SamplingParams{
+    var sampling = generate_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -10645,6 +10741,27 @@ fn handleAnthropicMessages(
         .presence_penalty = 0.0,
         .seed = seed,
     };
+
+    // Grammar-constrained sampling for `output_config.format` json_schema —
+    // the chat-completions block, same lifetime rule: the SchemaConstraint
+    // must NOT be moved (the embedded Constraint holds pointers into it).
+    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc_init = false;
+    defer if (sc_init) sc.deinit();
+    if (output_cfg.schema) |sv| {
+        if (has_tools) {
+            log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
+        } else {
+            const tb = try lm.grammarTokenBytes(allocator, stream.io);
+            if (sc.initFromValue(allocator, sv, tb)) {
+                sc_init = true;
+                sampling.constraint = &sc.constraint;
+                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+            } else |err| {
+                log.warn("[grammar] schema parse failed ({s}); falling back to prompt-only enforcement\n", .{@errorName(err)});
+            }
+        }
+    }
 
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = local_ve;
@@ -15503,6 +15620,63 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
         try std.testing.expectEqualStrings(
             parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
     }
+}
+
+test "parseAnthropicOutputConfig: Claude Code's shape yields effort AND the schema" {
+    const allocator = std.testing.allocator;
+    // Verbatim shape from the live 2026-08-16 capture (schema abbreviated).
+    const body =
+        \\{"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}}}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const oc = parseAnthropicOutputConfig(parsed.value.object);
+    try std.testing.expectEqualStrings("high", oc.effort.?);
+    try std.testing.expect(oc.schema != null);
+    try std.testing.expect(oc.schema.? == .object);
+}
+
+test "parseAnthropicOutputConfig: absent, non-object, and non-schema shapes stay null" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{}",
+        \\{"output_config":"high"}
+        ,
+        // effort alone — no format means no schema, never a crash.
+        \\{"output_config":{"effort":"low"}}
+        ,
+        // a format we don't serve is not a schema request.
+        \\{"output_config":{"format":{"type":"text"}}}
+        ,
+    };
+    for (cases) |body| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const oc = parseAnthropicOutputConfig(parsed.value.object);
+        try std.testing.expect(oc.schema == null);
+    }
+    // The effort-alone case still carries its word.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"output_config":{"effort":"low"}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("low", parseAnthropicOutputConfig(parsed.value.object).effort.?);
+}
+
+test "reasoningEffortFromWord: none disables, words budget exactly like the OpenAI surface" {
+    // "none" is an explicit off with the word kept for the template.
+    const off = reasoningEffortFromWord("none", -1, false);
+    try std.testing.expect(!off.enable);
+    try std.testing.expectEqualStrings("none", off.effort.?);
+    // A word maps through the ONE effortBudget table…
+    const low = reasoningEffortFromWord("low", -1, false);
+    try std.testing.expect(low.enable);
+    try std.testing.expectEqual(@as(i32, 512), low.budget);
+    // …unless the template consumes the word (qwen3.8 class): then the word is
+    // the lever and the budget stays the launch default.
+    const consumed = reasoningEffortFromWord("low", -1, true);
+    try std.testing.expect(consumed.enable);
+    try std.testing.expectEqual(@as(i32, -1), consumed.budget);
 }
 
 test "resolveEnableThinking: an explicit request value outranks the arch default, silence takes it" {
