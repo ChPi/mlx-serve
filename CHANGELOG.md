@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### App
+
+- Assistant responses render inline and display LaTeX natively with SwaTex, including `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and common equation environments. Incomplete or invalid streamed TeX stays readable as source, fenced code and user prompts remain literal, and copying inline math restores its original delimiters. SwaTex is MIT-licensed; its bundled KaTeX fonts retain the SIL Open Font License 1.1.
 - Speculative decoding got faster without KV quantization: verify steps 6-9 tokens wide at head-dim 256 ran MLX's slow attention fallback on every machine. They now split into two fast passes, +4-9% decode with PLD or a deep draft head on Qwen-class models.
 - Draft heads that ship in bf16 (MTPLX packs, the stock Qwen MTP release) are now quantized to 4-bit at load. The head only proposes tokens and verification corrects them, so output quality is decided by the main model either way: measured +10% decode at equal acceptance on Qwen3.8-27B.
 - The speculative depth planner was re-measured against the faster verify steps: it now drafts one position deeper on predictable content, +3% decode on Qwen-class models with the draft head.
