@@ -626,3 +626,15 @@ all and whatever is arriving is the reason.
 Media BUNDLES stay per-component: a bundle is N repos and the manager learns a repo's total
 only when it starts, so a weighted bundle fraction would need sizes it doesn't have. That
 bar resets once per model, and its label already says which one ("Downloading model 1/2").
+
+## The abandoned connect() leak (MCP stdio connect race, 2026-08-15)
+
+Symptom: user's RAG chat hung after 3-4 turns. Server idle and healthy (`/health` sub-2ms, `requests_running=0`, `last-agent-request.json` untouched 11+ min — rules out the server and the "ghost turn" class). App at ~160% CPU over 23h (spikes ~700%), 5326 threads. `sample <pid>`: two threads parked in `Client.connect(transport:)`, awaiting the stdio transport's `AsyncThrowingStream`. A completed connect RETURNS from that call — a thread still inside it after 23h never finished.
+
+Root cause: `connectOrFailFast` races `client.connect(transport:)` (Path A) against a death-watcher (Path B, 10 Hz) and a 30s hard cap. The winner resumes the outer continuation; Path A's Task is abandoned, never cancelled ("the loser keeps running" — deliberate, to avoid `withThrowingTaskGroup`'s destructor hanging on an unresponsive child). The gap: nothing on the losing paths called `client.disconnect()`. Per the swift-sdk (`Client.swift:287-320`), `disconnect()` is the ONLY thing that resumes a pending `withCheckedThrowingContinuation` — cancelling the Task or killing the child does not unstick it. `executeToolCall`'s watchdog, a few hundred lines above, already documents and applies this exact break-glass for tool calls; the connect race never got the same treatment.
+
+Each failed connect (server dead or no answer within 30s) leaks one permanently-scheduled task. They accumulate over the session, starve the cooperative thread pool, and the agent's next turn — which awaits a tool call on that same pool — can't complete. The spin and thread count are the leak; the hung chat is the starvation.
+
+Fix: both losing paths call `client.disconnect()` (via `Task.detached` so it doesn't block the resume closure); the timeout path also terminates the child first. `connectOrFailFast` gained an injectable `hardCapSeconds` (default 30) and `onPathASettled` hook, and went `private`→`internal` for `@testable import`. Guard: `MCPConnectLeakTests.testAbandonedConnectSettlesAfterLosingTheRace` — real `sleep 60` child (accepts pipes, never speaks MCP, so the death-watcher never fires), 0.3s cap, asserts Path A settles within 5s.
+
+Rule: any race that abandons one arm must ask whether the abandoned arm can unstick itself — here, only `disconnect()` does. A "loser keeps running" comment is a code smell: re-read it whenever a related watchdog is added nearby, in case the treatments have diverged (they did, for ~months, between the tool-call watchdog and this race). Diagnosis: `/health` + `requests_running` rule out the server in under a second; `sample <pid>` on the app is the fastest way to catch a CPU-spinning leak — a thread still inside a one-shot async call hours in is the tell.
