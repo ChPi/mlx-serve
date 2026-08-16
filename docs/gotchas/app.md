@@ -352,6 +352,109 @@ superseded by the field.
 Guards: `TruncationNoticeTests` (field + clean content, both-cause strip,
 history builders carry neither field nor legacy text, tolerant decode).
 
+## The badges stopped where the small window had ended (fullscreen, 2026-08-13)
+
+⌘-held numbers the sidebar's conversation rows, and only the rows in the
+CLEAR get one — the list scrolls under the pinned destination block, so a
+number behind frosted glass names a shortcut you cannot read. That band was
+measured from three `frame(in: .global)` readers: the block's bottom edge, the
+column's bottom edge, and each row's own span.
+
+In fullscreen the badge count stopped tracking the window. Reproduced in an
+isolated SwiftUI harness with the same structure (`ScrollView` of rows +
+`.safeAreaInset(.top)` block + the two background readers), stepped through
+900x600 → 900x1300 → fullscreen:
+
+```
+windowed    blockMaxY=370.0  rows 378…406, 408…436, …   in band 16
+TALL        blockMaxY=370.0  rows 378…406, …            in band 16
+FULLSCREEN  blockMaxY=370.0  rows 396…424, 426…454, …   in band 18
+```
+
+`blockMaxY` is the same 370.0 in every state while the rows genuinely move
+(378 → 396). **A `.global` frame is not re-published when a view merely MOVES
+rather than resizes** — entering fullscreen translates the whole column, and
+the pinned block keeps whatever global maxY it had in the window that last
+laid it out. The band's top edge is then a number from a different window
+size, which is exactly what it looked like: badges based on the geometry the
+feature happened to be written at.
+
+The second `SidebarClearBandTopKey` publisher, `frame.minY +
+safeAreaInsets.top`, was documented as the same line derived a second way. It
+never was — measured, it reports **104** against a frost line at **370**,
+because that reader sits below the toolbar (it has already lost that inset)
+and the block's height is not part of what it reads back. It was harmless only
+because the key reduces by `max` and the real number was always larger. A
+fallback that can only ever be wrong is worse than no fallback: deleted.
+
+Fix: one named coordinate space on the column (`ChatSidebar.bandSpace`), and
+all three measurements taken in it. In the column's own space the top edge is
+the block's HEIGHT and the bottom edge is the column's HEIGHT — neither can be
+invalidated by the window moving, and both re-publish when there is genuinely
+a new layout. Same harness, same three states, container space: top constant
+at 318, bottom 825 → 827 → 897, and fullscreen numbers 19 of 19 measured rows
+where the global version numbered 18.
+
+The filter itself moved out of the view to `ChatQuickSwitch.numbering(rowSpans:
+clearBandTop:clearBandBottom:)`, which is what makes "a taller window numbers
+more rows" a test rather than a screenshot. Guards: `ChatQuickSwitchTests`
+(band cases + a source scan pinning zero `.global` frames and exactly three
+readers in the named space — verified red by reverting one reader).
+
+## Continuing a reply filed itself as a new version of it (2026-08-14)
+
+Three features landed together and two of them meet on one message. Regenerate
+puts a version pager under a reply; Continue hands the reply back to the model
+to finish. Both end at the same place — `ChatTurnEngine.endTurn` →
+`AppState.finishRevisions`, the ONE turn exit — and that exit could not tell
+them apart:
+
+```swift
+let seed = pendingRevisionSeed.removeValue(forKey: sessionId)   // nil after a continuation
+guard seed != nil || !msg.revisions.isEmpty else { return }     // …but revisions is not
+```
+
+So a reply that had been regenerated once (pager reading 2/2) went to **3/3**
+the moment you continued it, with 2/3 holding the same reply minus the ending
+that had just been written. Nothing errors and nothing is lost — the text is in
+v3 — which is what makes it the quiet kind: the pager silently grew a page that
+is not another answer to the question.
+
+The rule is that **the pager counts REGENERATIONS**, and a continuation is not
+one. It is the reply you are reading, carrying on — the same relationship an
+edit has to the version it changes, which is why `MessageRevisions.applyingEdit`
+already exists and says so: stepping away and back reloads `content` from the
+stored revision, so any in-place change that does not sync into the list is
+discarded the first time you touch an arrow.
+
+The fact has to be HELD, for the same reason `pendingRevisionSeed` is held: the
+turn exit is the only place that knows the turn is over, and by then the request
+that started it is gone. `AppState.markContinuing(_:)` is that marker, and it
+carries the seed's ordering hazard too — `continueReply` opens with
+`stop(sessionId:)`, which IS a turn exit, so a mark set before it is consumed
+immediately and the continuation records itself as a new version anyway. Set
+after `stop`, pinned by a scan that reads the two statements in order.
+
+Two more things describing a message that a continuation changes and the first
+cut did not carry over. The truncation notice was already cleared (the reply was
+cut; it is being un-cut). Token usage was not: `updateLastMessage` **replaces**
+`completionTokens`, so a 900-token reply finished by a 42-token continuation
+reported 42 in its footnote. `addingCompletionTokens:` adds instead, driven by
+`runPlainTurn`'s own `continuing` flag — the prompt count and the rate stay the
+latest generation's, since a continuation's prompt already contains everything
+before it and a rate is not a quantity to sum.
+
+And the affordance itself: `ContinueReply.isEligible` takes the `ServerEngine`
+now. ds4 renders its chat template inside the embedded engine, where there is
+nowhere to append a prefill, so the server refuses by name
+(`continuationRejectReason`) — a live button over a guaranteed 400 is the
+dead-control class, and the same rule as a locked composer disc.
+
+Guards: `ContinuedReplyBookkeepingTests`, `ContinueReplyTests` engine cases,
+`RegenerationSeedWiringTests` continuation cases (both verified red by
+reverting each half separately — the AppState branch and the `markContinuing`
+ordering fail independently).
+
 ## A typed `onDrop(of:)` never saw the Create panes' drops (2026-08-13)
 
 The media panes' shared drop target (`MediaDropTarget.swift`) shipped as

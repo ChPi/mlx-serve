@@ -401,10 +401,20 @@ struct ChatView: View {
         // not inside the content area — a list of tasks is navigation, and
         // nesting it in the detail column made the window look like it had two
         // unrelated sidebars stacked horizontally.
-        if appState.chatWorkspace.isThreeColumn {
-            threeColumnSplitView
-        } else {
-            standardSplitView
+        Group {
+            if appState.chatWorkspace.isThreeColumn {
+                threeColumnSplitView
+            } else {
+                standardSplitView
+            }
+        }
+        // ⌘L, on the WINDOW rather than on one split: the picker has to open
+        // over Tasks and Agents too, which are the other `NavigationSplitView`.
+        // Environment injected AT the sheet — a sheet inherits none.
+        .sheet(isPresented: $appState.modelPalettePresented) {
+            ModelPaletteSheet()
+                .environmentObject(appState)
+                .environmentObject(server)
         }
     }
 
@@ -498,7 +508,8 @@ struct ChatView: View {
                 ChatWorkspace.gateShouldPresent(gateIsBlocking: gateIsBlocking,
                                                 cancelled: gateCancelled,
                                                 workspace: appState.chatWorkspace,
-                                                welcomePresented: appState.showWelcome)
+                                                welcomePresented: appState.showWelcome,
+                                                palettePresented: appState.modelPalettePresented)
             },
             set: { _ in })) {
             ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)
@@ -576,9 +587,228 @@ enum SidebarRowStyle {
     }
 }
 
+/// The conversation list's modifier-aware selection maths. Pure, and at file
+/// scope rather than inside `ChatSidebar`, so it can be driven from
+/// `SidebarMultiSelectTests` without a rendered view — same reason
+/// `ChatRowBuilder` and `ChatModeToggles` live out here.
+///
+/// The list stopped being a `List` (see `conversationsSidebar`), and with it
+/// went the cmd/shift behaviour a `selection:` binding gives you for free.
+/// This is that behaviour, written out.
+enum SidebarMultiSelect {
+    struct Outcome: Equatable {
+        var selection: Set<UUID>
+        /// What a subsequent shift-click ranges FROM.
+        var anchor: UUID?
+        /// The chat the detail column should show, or nil to leave it where it
+        /// is — a cmd-click that deselects some OTHER row changes what is
+        /// selected without changing where you are.
+        var activate: UUID?
+    }
+
+    /// - Parameters:
+    ///   - ordered: every visible row id in panel order, both sections
+    ///     flattened — a shift-range crosses the Agents/Chats boundary.
+    ///   - active: the chat currently on screen.
+    static func click(_ id: UUID,
+                      ordered: [UUID],
+                      selection: Set<UUID>,
+                      anchor: UUID?,
+                      active: UUID?,
+                      command: Bool,
+                      shift: Bool) -> Outcome {
+        // Shift wins when both are held, as it does in every macOS list.
+        if shift, let anchor, anchor != id,
+           let from = ordered.firstIndex(of: anchor),
+           let to = ordered.firstIndex(of: id) {
+            let span = from <= to ? from...to : to...from
+            // The range REPLACES the selection and the anchor stays put, so
+            // shift-clicking around re-ranges from one origin instead of
+            // accumulating every range you passed through.
+            return Outcome(selection: Set(ordered[span]), anchor: anchor, activate: id)
+        }
+        guard command else {
+            return Outcome(selection: [id], anchor: id, activate: id)
+        }
+        guard selection.contains(id) else {
+            return Outcome(selection: selection.union([id]), anchor: id, activate: id)
+        }
+        // Cmd-clicking the ONLY selected row is a no-op: this selection is also
+        // the panel's "you are here", and emptying it would leave a transcript
+        // on screen with nothing in the list pointing at it.
+        guard selection.count > 1 else {
+            return Outcome(selection: selection, anchor: id, activate: nil)
+        }
+        var next = selection
+        next.remove(id)
+        // Deselecting the row you were READING moves to the nearest survivor —
+        // otherwise the transcript belongs to a row that is no longer lit.
+        let activate = active == id ? nearest(to: id, in: ordered, within: next) : nil
+        return Outcome(selection: next, anchor: id, activate: activate)
+    }
+
+    /// What the selection becomes when the composer takes the keyboard, or nil
+    /// when it already says that.
+    ///
+    /// Typing is a statement that you are working in ONE conversation. Without
+    /// this the multi-selection stayed lit behind the field, and since a
+    /// multi-selection outranks focus for ⌘⌫ (`ChatDeleteShortcut.route`) the
+    /// chord kept raising a delete dialog mid-message — two rules each reading
+    /// a true fact and disagreeing about which one meant "the user is deleting
+    /// chats". The chat you are typing IN is the survivor: its transcript is
+    /// the one on screen above the field.
+    ///
+    /// Nil rather than an equal set, so a focus event that changes nothing does
+    /// not publish.
+    static func focusingComposer(in sessionId: UUID, selection: Set<UUID>) -> Set<UUID>? {
+        selection == [sessionId] ? nil : [sessionId]
+    }
+
+    private static func nearest(to id: UUID, in ordered: [UUID], within set: Set<UUID>) -> UUID? {
+        guard let origin = ordered.firstIndex(of: id) else { return set.first }
+        return ordered.enumerated()
+            .filter { set.contains($0.element) }
+            .min { abs($0.offset - origin) < abs($1.offset - origin) }?
+            .element
+    }
+}
+
+/// Which deletions stop and ask first. Pure, and beside `SidebarMultiSelect`
+/// for the same reason — the rule is worth pinning, and there is nothing to
+/// see on screen until you have already lost the conversations.
+enum SidebarDeleteConfirm {
+    /// ⌘⌫ ALWAYS asks: the key names no row, so its target is implicit — every
+    /// selected row, or, with nothing selected, whichever chat you happen to be
+    /// reading. And any BULK delete asks whichever control started it, because
+    /// N conversations go on one action and nothing undoes it. A single
+    /// deliberate delete on a named row (the row's ✕, its context menu) still
+    /// goes straight through, as it always has.
+    static func required(count: Int, keyboard: Bool) -> Bool {
+        count > 0 && (keyboard || count > 1)
+    }
+
+    /// What ⌘⌫ acts on: the sidebar's selection, or — with nothing selected —
+    /// the chat being read. Nil when there is nothing to delete, which is also
+    /// what disables the menu item, since a command that does nothing when you
+    /// pick it is the dead-control class.
+    static func target(selection: Set<UUID>, activeChatId: UUID?) -> Set<UUID>? {
+        let ids = selection.isEmpty ? (activeChatId.map { Set([$0]) } ?? []) : selection
+        return ids.isEmpty ? nil : ids
+    }
+
+    /// The count is the thing to check before agreeing, so it is in the title.
+    static func title(count: Int) -> String {
+        count == 1 ? "Delete this chat?" : "Delete \(count) chats?"
+    }
+}
+
+/// Where ⌘⌫ goes.
+///
+/// A menu item's key equivalent is offered the keystroke by
+/// `performKeyEquivalent` BEFORE the first responder ever sees it, so a Delete
+/// Chat command in the menu bar takes ⌘⌫ away from every text field in the app
+/// — including the composer, where it has meant "delete to the start of the
+/// line" since long before this app existed. Typing it mid-message raised a
+/// delete-chat dialog, and `.disabled(chatDeletionTarget == nil)` cannot help:
+/// a chat is open in exactly the state where you are typing into one.
+///
+/// So the command ROUTES rather than claims. The keyboard's own owner wins
+/// while it has focus, and the menu item keeps its slot — which is the half
+/// that made the shortcut discoverable in the first place.
+enum ChatDeleteShortcut {
+    enum Route: Equatable {
+        /// Hand it back to the text being edited (see `deleteToBeginningOfLine`
+        /// — the menu has already swallowed the event, so returning early
+        /// would make ⌘⌫ do nothing at all in the composer).
+        case deleteToLineStart
+        case deleteChats
+    }
+
+    /// - Parameter selectedChats: how many rows the sidebar has picked. Several
+    ///   is unambiguous — you were working in the list — and it OUTRANKS focus,
+    ///   because focus alone is not a signal this window can be trusted to get
+    ///   right: nothing in it takes the keyboard off the composer except
+    ///   `KeyboardFocus.resignTextEditor`, and one stuck reading would
+    ///   otherwise make ⌘⌫ a line delete forever with a dozen chats selected
+    ///   behind it. Belt and braces on a key that deletes conversations.
+    static func route(editingText: Bool, selectedChats: Int) -> Route {
+        if selectedChats > 1 { return .deleteChats }
+        return editingText ? .deleteToLineStart : .deleteChats
+    }
+}
+
+/// Who holds the keyboard.
+///
+/// The chat window has no real focus model: its conversation rows are
+/// `.buttonStyle(.plain)` Buttons, which take no first responder under macOS's
+/// default keyboard navigation — the same fact that made `.onDeleteCommand` on
+/// that column never fire. So clicking a chat moved the selection while the
+/// COMPOSER kept the keyboard, and every keystroke-owning decision downstream
+/// read "the user is typing" forever (live 2026-08-12: after one click in the
+/// composer, ⌘⌫ never deleted a chat again).
+enum KeyboardFocus {
+
+    /// Whether the responder holding the keyboard is text being typed into.
+    ///
+    /// `NSTextView` covers both cases and is the only type that needs naming: a
+    /// focused `NSTextField` never becomes first responder itself — the
+    /// window's FIELD EDITOR does, and that is an `NSTextView`.
+    static func isTextEditor(_ responder: NSResponder?) -> Bool {
+        responder is NSTextView
+    }
+
+    /// Move the keyboard out of a text field, because nothing else in this
+    /// window will. Only when a text editor actually has it — an unconditional
+    /// `makeFirstResponder(nil)` would yank focus off whatever else legitimately
+    /// holds it.
+    static func resignTextEditor(in window: NSWindow?) {
+        guard let window, isTextEditor(window.firstResponder) else { return }
+        window.makeFirstResponder(nil)
+    }
+}
+
 // MARK: - Sidebar
 
+/// Every measured row, so the quick-switch can number only the ones in the
+/// clear. Published per row and merged on the way up.
+struct SidebarRowSpansKey: PreferenceKey {
+    static let defaultValue: [UUID: SidebarRowSpan] = [:]
+    static func reduce(value: inout [UUID: SidebarRowSpan],
+                       nextValue: () -> [UUID: SidebarRowSpan]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// The bottom edge of the frosted destination block, measured in the column's
+/// own space — rows above this line are behind glass.
+struct SidebarClearBandTopKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The bottom edge of the panel — rows below this line are off the fold.
+struct SidebarClearBandBottomKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ChatSidebar: View {
+    /// The one coordinate space the three band measurements share.
+    ///
+    /// Load-bearing that it is the COLUMN's own space and not `.global`: a
+    /// global frame is not re-published when a view merely MOVES, and entering
+    /// fullscreen translates the whole column without resizing the pinned
+    /// destination block — so the block went on reporting the maxY it had in
+    /// the smaller window while the rows slid out from under it, and rows in
+    /// plain sight lost their badges. Measured here, the top edge is the
+    /// block's own height and the bottom edge is the column's, both of which
+    /// change only when there is genuinely a new layout to report.
+    static let bandSpace = "chatSidebarBand"
+
     @EnvironmentObject var appState: AppState
     /// Observed directly — AppState forwards objectWillChange only for the
     /// server and the agent store, so a badge reading `appState.downloads`
@@ -586,12 +816,100 @@ struct ChatSidebar: View {
     @EnvironmentObject var downloads: DownloadManager
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
+    /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
+    /// alone by shift itself so dragging a range up and down keeps re-ranging
+    /// from the same origin instead of walking away from it.
+    @State private var selectionAnchor: UUID?
     /// Scans for installed agent CLIs — the Code Launcher row renders the tray's
     /// shared menu body, which needs it.
     @StateObject private var cliDetector = CLILauncher()
+    /// Holding ⌘ numbers the conversation rows. A modifier held down is STATE,
+    /// which SwiftUI does not report outside a hovered view — see the monitor.
+    @StateObject private var modifiers = ModifierKeyMonitor()
+    /// Where the frosted destination block ENDS, and where the panel ends, in
+    /// the column's own space — the band a conversation row has to sit inside
+    /// to be readable. Measured rather than derived from the inset's height:
+    /// the block's contents vary (the Create list, the download badge), so the
+    /// one number that cannot go stale is the one the block reports itself.
+    @State private var clearBandTop: CGFloat = 0
+    @State private var clearBandBottom: CGFloat = 0
+    /// Each conversation row's vertical extent, reported only while ⌘ is down.
+    @State private var rowSpans: [UUID: SidebarRowSpan] = [:]
+
+    /// The rows a number may land on: those fully clear of the frosted block
+    /// and inside the panel. `nil` means "not measured" — before the first
+    /// layout after ⌘ goes down — and numbers everything, which is the old
+    /// behaviour rather than a sidebar of blank rows for one frame.
+    private var numberedRows: Set<UUID>? {
+        guard modifiers.commandHeld else { return nil }
+        return ChatQuickSwitch.numbering(rowSpans: rowSpans,
+                                         clearBandTop: clearBandTop,
+                                         clearBandBottom: clearBandBottom)
+    }
 
     var body: some View {
         conversationsSidebar
+    }
+
+    /// ⌘1…⌘9 jumps to the row wearing that number; ⌃⌘1…⌃⌘9 ranges to it from
+    /// where you are, selecting everything in between.
+    ///
+    /// Zero-size hidden buttons, the same idiom as ⌘R regenerate: they need
+    /// THIS view's session list, and a key equivalent works wherever focus is,
+    /// including while the composer's text view has it.
+    ///
+    /// **Ranging is ⌃⌘, not the ⇧⌘ every macOS list uses, because macOS took
+    /// those digits first**: ⇧⌘3/4/5 are screen capture and ⇧⌘6 grabs the
+    /// Touch Bar, all system-level, so they never reach an app — four of the
+    /// nine ranged silently and the other five worked, which is worse than a
+    /// shortcut that is simply somewhere else. Control is the replacement
+    /// rather than Option because it is the one modifier that does not rewrite
+    /// the character its key produces (⌥4 is ¢), so key-equivalent matching
+    /// stays boring. ⌃ alone would collide with Mission Control's
+    /// switch-to-desktop-N; with ⌘ it does not.
+    private var quickSwitchShortcuts: some View {
+        ForEach(1...ChatQuickSwitch.maxSlots, id: \.self) { slot in
+            let key = KeyEquivalent(Character("\(slot)"))
+            Group {
+                Button { quickSwitch(to: slot, extend: false) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: .command)
+                Button { quickSwitch(to: slot, extend: true) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: [.command, .control])
+            }
+            .frame(width: 0, height: 0)
+            .opacity(0)
+        }
+    }
+
+    /// Go to a numbered chat, or range to it. Not `selectRow`: that one reads
+    /// the CURRENT event's modifier flags, and the event behind these always
+    /// has ⌘ down — every jump would toggle the row into a multi-selection
+    /// instead of going to it. The flags are stated explicitly instead, and the
+    /// decision itself is `ChatQuickSwitch.outcome`.
+    private func quickSwitch(to slot: Int, extend: Bool) {
+        guard let outcome = ChatQuickSwitch.outcome(
+            slot: slot,
+            sessions: appState.visibleChatSessions,
+            numbering: numberedRows,
+            selection: appState.sidebarSelection,
+            anchor: selectionAnchor,
+            active: appState.activeChatId,
+            extend: extend)
+        else { return }
+        apply(outcome)
+    }
+
+    /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
+    /// same reason `selectRow` does it in that order.
+    private func apply(_ outcome: SidebarMultiSelect.Outcome) {
+        appState.showConversation()
+        selectionAnchor = outcome.anchor
+        if appState.sidebarSelection != outcome.selection {
+            appState.sidebarSelection = outcome.selection
+        }
+        if let target = outcome.activate, appState.activeChatId != target {
+            appState.activeChatId = target
+        }
     }
 
     private var conversationsSidebar: some View {
@@ -599,7 +917,8 @@ struct ChatSidebar: View {
         // `listRowBackground`, which is the double highlight — two grays, the
         // inner one a different value from the destinations above, and an accent
         // agent label sitting on whichever won. Selection is ours now, drawn by
-        // the one `SidebarRowStyle` both halves of this panel read.
+        // the one `SidebarRowStyle` both halves of this panel read — and the
+        // cmd/shift behaviour the binding used to supply is `SidebarMultiSelect`.
         // A ScrollView, not a List. These rows draw everything themselves —
         // background, hover, selection, separators — so the only thing
         // `.listStyle(.sidebar)` still contributed was its own horizontal
@@ -615,21 +934,107 @@ struct ChatSidebar: View {
             // chats — the section is HIDDEN when there are none, because an
             // empty heading is a promise of content that isn't there.
             let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
+            // The panel's visual order, both sections flattened — a shift-click
+            // ranges across the Agents/Chats boundary, because the split is a
+            // heading, not a wall.
+            let ordered = groups.agents.map(\.id) + groups.chats.map(\.id)
             LazyVStack(alignment: .leading, spacing: 2) {
                 if !groups.agents.isEmpty {
                     sectionHeader("Agents")
                     ForEach(groups.agents) { session in
-                        sessionRow(session)
+                        sessionRow(session, ordered: ordered)
                     }
                 }
                 sectionHeader("Chats")
                 ForEach(groups.chats) { session in
-                    sessionRow(session)
+                    sessionRow(session, ordered: ordered)
                 }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.bottom, 8)
         }
+        .onAppear {
+            // The rows READ the selection to decide their highlight, so it has
+            // to be primed: `activeChatId` is usually set long before this panel
+            // first appears, and an .onChange can't fire for a value that was
+            // already there.
+            if appState.sidebarSelection.isEmpty, let id = appState.activeChatId {
+                appState.sidebarSelection = [id]
+                selectionAnchor = id
+            }
+        }
+        // Deletions from anywhere else (the tray, a task run, another window)
+        // must not leave ids in the selection that no longer name a chat — a
+        // stale one would be counted by the context menu's "Delete N Chats" and
+        // handed straight back to `deleteSessions` by ⌫.
+        .onChange(of: appState.visibleChatSessions.count) { _, _ in
+            let live = Set(appState.visibleChatSessions.map(\.id))
+            if !appState.sidebarSelection.isSubset(of: live) {
+                appState.sidebarSelection.formIntersection(live)
+            }
+            if let anchor = selectionAnchor, !live.contains(anchor) { selectionAnchor = nil }
+        }
+        .onChange(of: appState.sidebarSelection) { _, newSelection in
+            // When the sidebar's selection becomes a single id, make that the
+            // active chat so the detail column follows the user's intent.
+            if newSelection.count == 1, let id = newSelection.first {
+                if appState.activeChatId != id { appState.activeChatId = id }
+            }
+        }
+        .onChange(of: appState.activeChatId) { _, newActive in
+            // Keep the sidebar selection in sync when other parts of the app
+            // change the active chat (open-from-tray, quick launcher, etc.).
+            // Only COLLAPSE it when the new active chat isn't already IN it:
+            // this ran unconditionally, so a cmd-click that added a second row
+            // was overwritten by `[id]` on its way out and the panel could never
+            // hold more than one — the multi-select bug. A chat the selection
+            // already contains is a move WITHIN the selection, and leaves it be.
+            guard let id = newActive else {
+                appState.sidebarSelection.removeAll()
+                selectionAnchor = nil
+                return
+            }
+            if !appState.sidebarSelection.contains(id) {
+                appState.sidebarSelection = [id]
+                selectionAnchor = id
+            }
+        }
+        // NO `.onDeleteCommand`: it only fires while its view is in the
+        // responder chain, which is why it is List API — a `List(selection:)`
+        // becomes first responder when you click a row. This column stopped
+        // being a List (see above) and its rows are `.buttonStyle(.plain)`
+        // Buttons, which take no focus under macOS's default keyboard
+        // navigation, so the modifier sat here reading like a working ⌫ and
+        // never once ran. The keyboard route is the File menu's Delete Chat
+        // (⌘⌫, Finder's own shortcut), which is a menu command and therefore
+        // needs no focus at all — and being IN a menu, it is also visible.
+        //
+        // The dialog it raises is the one every delete control shares, so its
+        // state lives on AppState where the menu command can reach it.
+        .confirmationDialog(
+            SidebarDeleteConfirm.title(count: appState.pendingChatDeletion?.count ?? 1),
+            isPresented: Binding(get: { appState.pendingChatDeletion != nil },
+                                 set: { if !$0 { appState.pendingChatDeletion = nil } }),
+            presenting: appState.pendingChatDeletion
+        ) { ids in
+            Button("Delete", role: .destructive) {
+                deleteChats(ids)
+                appState.pendingChatDeletion = nil
+            }
+            // Return deletes. The dialog is the second time you have said so
+            // (a menu command or a row's Delete raised it), and reaching for
+            // the trackpad to confirm a decision already made is the whole
+            // reason this asked to be a keyboard app. Escape still cancels —
+            // AppKit gives the `.cancel` role that for free.
+            .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
+        } message: { _ in
+            Text("This can't be undone.")
+        }
+        // ⌘1…⌘9. In the sidebar rather than the window's `.commands` because
+        // they address THIS view's conversation list; hidden in a background so
+        // they cost no layout.
+        .background(quickSwitchShortcuts)
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -713,10 +1118,131 @@ struct ChatSidebar: View {
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.top, 10)
             .padding(.bottom, 8)
+            // Where the frost ENDS. This block is what conversation rows scroll
+            // under, so its own bottom edge is the line between "readable" and
+            // "behind glass" — no constant to keep in step with its contents.
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: SidebarClearBandTopKey.self,
+                        value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
+                }
+            }
             // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
             // has something to attach to again and the platform frosts what
             // scrolls beneath this block.
         }
+        // The panel's own bottom edge closes the band — in this space that is
+        // the column's HEIGHT, which is the whole "how much window is there?"
+        // question the badge count answers. Applied OUTSIDE the safeAreaInset
+        // so it measures the whole column, and so the three readers below are
+        // ancestors of the block that publishes the top edge — a preference
+        // only travels up.
+        //
+        // There was a second publisher for the TOP edge here, `frame.minY +
+        // safeAreaInsets.top`, described as the same line derived a second way.
+        // It never was: measured, it reported 104 against a frost line at 370,
+        // because this reader sits below the toolbar (so it has already lost
+        // that inset) and the block's height is not part of what it reads back.
+        // It was harmless only because the key reduces by `max` and the real
+        // measurement was always larger — a fallback that could only ever be
+        // wrong is worse than none.
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: SidebarClearBandBottomKey.self,
+                    value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
+            }
+        }
+        // Declared here, OUTSIDE both readers and the inset, so the block, the
+        // column and every row resolve against the same origin.
+        .coordinateSpace(.named(ChatSidebar.bandSpace))
+        .onPreferenceChange(SidebarClearBandTopKey.self) { value in
+            applyMeasurement(value, to: $clearBandTop)
+        }
+        .onPreferenceChange(SidebarClearBandBottomKey.self) { value in
+            applyMeasurement(value, to: $clearBandBottom)
+        }
+        .onPreferenceChange(SidebarRowSpansKey.self) { value in
+            guard rowSpans != value else { return }
+            // Async for the same reason the transcript's scroll correction is
+            // (issue #136): a geometry-driven write that lands inside the
+            // layout flush re-enters layout, and under a scroll it does so
+            // every frame. One turn later it coalesces instead.
+            DispatchQueue.main.async { rowSpans = value }
+        }
+    }
+
+    /// Store a measured edge, ignoring sub-pixel noise. The equality gate is
+    /// load-bearing, not an optimisation: a write per layout would re-enter
+    /// layout and never settle.
+    private func applyMeasurement(_ value: CGFloat, to binding: Binding<CGFloat>) {
+        guard abs(binding.wrappedValue - value) > 0.5 else { return }
+        DispatchQueue.main.async { binding.wrappedValue = value }
+    }
+
+    // MARK: Selection
+
+    /// Whether a conversation row can be lit at ALL in the current workspace
+    /// mode. Asked of the active chat against itself, so the answer is the mode
+    /// question alone — the per-row half is now selection membership.
+    private var conversationsAreLit: Bool {
+        guard let active = appState.activeChatId else { return false }
+        return SidebarSelection.isConversationSelected(
+            sessionId: active, activeChatId: active, workspace: appState.chatWorkspace)
+    }
+
+    /// One click on a conversation row. The modifier maths is pure and lives in
+    /// `SidebarMultiSelect`; this is only the wiring — read the flags off the
+    /// event AppKit is currently dispatching (a SwiftUI Button action has no
+    /// other way to see them), then apply the outcome.
+    ///
+    /// Selection is written BEFORE `activeChatId` on purpose: the sync above
+    /// collapses the selection for an active chat it doesn't already contain,
+    /// so the other order would undo a cmd-click on its way out.
+    private func selectRow(_ id: UUID, ordered: [UUID]) {
+        // Clicking a row means you are working in the LIST, so the keyboard
+        // comes with you. Nothing else moves it: these rows take no first
+        // responder, so the composer keeps the keyboard while you click around
+        // the sidebar — which is what made ⌘⌫ a line delete forever after one
+        // click in the field. Deliberately NOT done by `quickSwitch`: ⌘\<digit\>
+        // is for jumping to a chat and typing in it, so the composer stays
+        // armed there (a multi-selection is what tells ⌘⌫ otherwise).
+        KeyboardFocus.resignTextEditor(in: NSApp.keyWindow)
+        let flags = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags)
+            .intersection(.deviceIndependentFlagsMask)
+        let outcome = SidebarMultiSelect.click(
+            id, ordered: ordered,
+            selection: appState.sidebarSelection,
+            anchor: selectionAnchor,
+            active: appState.activeChatId,
+            command: flags.contains(.command),
+            shift: flags.contains(.shift))
+        apply(outcome)
+    }
+
+    /// Every control that deletes conversations comes through here, so which
+    /// ones ask first is `SidebarDeleteConfirm`'s decision and not a per-button
+    /// habit. `keyboard` is what separates ⌘⌫ — which names no row — from a
+    /// click on one.
+    private func requestDeleteChats(_ ids: Set<UUID>, keyboard: Bool) {
+        guard !ids.isEmpty else { return }
+        if SidebarDeleteConfirm.required(count: ids.count, keyboard: keyboard) {
+            appState.pendingChatDeletion = ids
+        } else {
+            deleteChats(ids)
+        }
+    }
+
+    /// Delete a set of conversations and leave the panel's own state consistent
+    /// — the ids go out of the selection and the anchor FIRST, so nothing that
+    /// reads them (the ⌫ handler, the context menu's count) can name a chat that
+    /// is already gone.
+    private func deleteChats(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        appState.sidebarSelection.subtract(ids)
+        if let anchor = selectionAnchor, ids.contains(anchor) { selectionAnchor = nil }
+        appState.deleteSessions(ids)
     }
 
     /// A section heading, sitting on the same left edge as the rows under it.
@@ -732,24 +1258,24 @@ struct ChatSidebar: View {
             .padding(.bottom, 2)
     }
 
-    /// One conversation row, shared by both sections.
+    /// One conversation row, shared by both sections. `ordered` is the panel's
+    /// flattened visual order, which shift-click ranges over.
     @ViewBuilder
-    private func sessionRow(_ session: ChatSession) -> some View {
-        // Exactly ONE row in this panel is lit at a time. A conversation is
-        // where you ARE only while the window is showing conversations —
-        // otherwise opening Tasks left the last chat lit alongside the Tasks
-        // destination, two "you are here" marks for one window.
-        let isSelected = SidebarSelection.isConversationSelected(
-            sessionId: session.id, activeChatId: appState.activeChatId,
-            workspace: appState.chatWorkspace)
+    private func sessionRow(_ session: ChatSession, ordered: [UUID]) -> some View {
+        // Lit rows are the SELECTION, not just the active chat — otherwise a
+        // cmd-clicked second row is selected (⌫ deletes it) while looking
+        // exactly like an unselected one. A conversation is still only lit while
+        // the window is showing conversations: otherwise opening Tasks left the
+        // last chat lit alongside the Tasks destination, two "you are here"
+        // marks for one window.
+        let isSelected = conversationsAreLit && appState.sidebarSelection.contains(session.id)
         // The button IS the row: it carries the padding, the height floor and
         // the contentShape, so every pixel of the fill is clickable. As a
         // sibling sized by an outer frame, the label was CENTRED in the row's
         // height and only its own text band answered a click — the dead strip
         // along the top and bottom of the highlight.
         Button {
-            appState.showConversation()
-            appState.activeChatId = session.id
+            selectRow(session.id, ordered: ordered)
         } label: {
             // An agent thread is named for its AGENT, with the agent's own
             // symbol beside it — the Agents section is a list of who you talk
@@ -806,6 +1332,20 @@ struct ChatSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // Where this row sits, so the numbering can skip whatever is under the
+        // frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+        // a preference write per row per scroll frame, and outside this
+        // transient mode nothing reads the answer.
+        .background {
+            if modifiers.commandHeld {
+                GeometryReader { proxy in
+                    let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
+                    Color.clear.preference(
+                        key: SidebarRowSpansKey.self,
+                        value: [session.id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
+                }
+            }
+        }
         // One meaning for gray in this panel, and one SHAPE: the fill rides the
         // row's own content inside the stack's gutter, exactly as a
         // destination's `.background` does. (It was a `listRowBackground` once,
@@ -819,10 +1359,38 @@ struct ChatSidebar: View {
         // A real Button laid OVER the row, never a tap gesture around one: an
         // overlay is hit-tested first, so its clicks reach it rather than the
         // row underneath, and the row keeps its whole area clickable.
+        //
+        // The badge and the delete button share this one reserved slot, and the
+        // badge WINS while ⌘ is down: they would otherwise draw on top of each
+        // other on the hovered row, which is exactly the row the pointer is on
+        // whenever anyone reads a number. ⌘-click is also how a second row
+        // joins the selection, so the pointer is regularly here with ⌘ held —
+        // and the ✕ is one pixel away from a click meaning "delete this".
         .overlay(alignment: .trailing) {
-            if hoveredSessionId == session.id {
+            if modifiers.commandHeld, let slot = ChatQuickSwitch.slot(for: session.id,
+                                                                      in: appState.visibleChatSessions,
+                                                                      numbering: numberedRows) {
+                Text("\(slot)")
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.primary.opacity(0.08))
+                    )
+                    .padding(.trailing, ChatMetrics.sidebarRowInset)
+                    // Decoration: it must never eat the click that selects the
+                    // row it is drawn on.
+                    .allowsHitTesting(false)
+                    .transition(AnyTransition.asymmetric(
+                        insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
+                        removal: .opacity.animation(.easeOut(duration: 0.15))
+                     ))
+                    .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld)
+            } else if hoveredSessionId == session.id {
                 Button {
-                    appState.deleteSession(session.id)
+                    requestDeleteChats([session.id], keyboard: false)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 14))
@@ -838,8 +1406,17 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
-            Button("Delete", role: .destructive) {
-                appState.deleteSession(session.id)
+            // Right-clicking INSIDE a multi-selection acts on all of it, and
+            // says how many; right-clicking outside one is a single delete.
+            if appState.sidebarSelection.count > 1,
+               appState.sidebarSelection.contains(session.id) {
+                Button("Delete \(appState.sidebarSelection.count) Chats", role: .destructive) {
+                    requestDeleteChats(appState.sidebarSelection, keyboard: false)
+                }
+            } else {
+                Button("Delete", role: .destructive) {
+                    requestDeleteChats([session.id], keyboard: false)
+                }
             }
         }
     }
@@ -938,6 +1515,13 @@ struct ChatDetailView: View {
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
+    /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
+    /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
+    /// walk left running would resume in someone else's conversation. Stale
+    /// indexes are harmless by construction (`ComposerHistory` treats one that
+    /// no longer names an entry as no walk at all), but resetting on the switch
+    /// is what makes the first ↑ in a new tab mean what it says.
+    @State private var composerWalk = ComposerHistory.Walk.idle
     // The three toolbar toggles mirror the visible session's persisted state
     // (`ChatSession.enableThinking` / `.mode` / `.useMCP`). They're loaded from
     // the session on appear AND on every `sessionId` change, and written back on
@@ -1419,6 +2003,12 @@ struct ChatDetailView: View {
         (session?.messages.isEmpty ?? true) && composerState != .generatingHere
     }
 
+    /// Which reply Cmd+R / the footer's Regenerate button targets — the
+    /// last assistant message, so the button only ever shows on that one.
+    private var lastAssistantMessageId: UUID? {
+        session?.messages.last { $0.role == .assistant }?.id
+    }
+
     /// Greeting + discovery chips, one fixed-height block. The vertical slack
     /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
     /// nested in here shares space unevenly with the body's own trailing one,
@@ -1487,7 +2077,52 @@ struct ChatDetailView: View {
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    })
+                                    },
+                                    // Both roles are editable, and they mean
+                                    // different things. Editing YOUR message
+                                    // is a re-ask: the turns after it answered
+                                    // something you no longer said, so they go
+                                    // and it resubmits. Editing the MODEL's is
+                                    // putting words in its mouth — that turn
+                                    // already happened, and the point is to
+                                    // steer what comes next (Continue, or the
+                                    // following turn), so nothing is dropped
+                                    // and nothing re-runs.
+                                    onEdit: session?.isExternalBridge == true ? nil : { newText in
+                                        if m.role == .user {
+                                            editAndResend(messageId: m.id, newText: newText)
+                                        } else {
+                                            appState.editAssistantMessage(in: sessionId,
+                                                                          messageId: m.id,
+                                                                          newText: newText)
+                                        }
+                                    },
+                                    onRegenerate: (m.role == .assistant && m.id == lastAssistantMessageId)
+                                        ? { regenerateLastResponse() }
+                                        : nil,
+                                    // Only the last message: a continuation
+                                    // streams into the END of the transcript,
+                                    // so offering it on an earlier reply would
+                                    // append the text to a different bubble.
+                                    onContinue: (m.id == session?.messages.last?.id && canContinue)
+                                        ? { continueReply() }
+                                        : nil,
+                                    onSelectRevision: { index in
+                                        appState.selectRevision(in: sessionId,
+                                                                messageId: m.id,
+                                                                index: index)
+                                    },
+                                    // Branch here. Offered on both roles and at
+                                    // any depth — unlike Continue and
+                                    // Regenerate, which act on the END of the
+                                    // transcript, a fork is a statement about
+                                    // this message. A task run or a bridge
+                                    // mirror can be branched INTO an ordinary
+                                    // chat, so no read-only gate: nothing about
+                                    // the source is changed.
+                                    onFork: ChatFork.isForkable(session?.messages ?? [], at: m.id)
+                                        ? { appState.forkSession(sessionId, from: m.id) }
+                                        : nil)
                                 .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
@@ -1655,6 +2290,18 @@ struct ChatDetailView: View {
             // The top spacer's sibling — see the empty-state branch above.
             if isEmptyConversation { Spacer(minLength: 0) }
         }
+        // Cmd+R — regenerate the last reply. A zero-size hidden button rather
+        // than a window-level `.commands` entry: it needs THIS tab's session
+        // and toolbar state, and disabling it here (rather than graying out a
+        // menu item elsewhere) is what keeps it from firing mid-stream or on
+        // an empty chat.
+        .background(
+            Button(action: regenerateLastResponse) { EmptyView() }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(!canRegenerate)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+        )
         .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
@@ -1767,6 +2414,11 @@ struct ChatDetailView: View {
                 pendingIntentPrompt = nil
                 proceedSend()
             }
+            // The nudge exists to recommend this one, so it is what Return
+            // takes. "Send Anyway" stays a deliberate click — it also
+            // suppresses the suggestion for the rest of the chat, which is
+            // not something to hand to a reflex.
+            .keyboardShortcut(.defaultAction)
             Button("Send Anyway") {
                 intentSuppress.suppress(prompt, for: sessionId)
                 pendingIntentPrompt = nil
@@ -1804,6 +2456,18 @@ struct ChatDetailView: View {
         .onChange(of: composerState) { _, state in
             if state == .idle { inputFocused = true }
         }
+        // The keyboard arriving in the composer collapses the sidebar selection
+        // to this chat. Keyed on the focus MIRROR rather than on the click, so
+        // it covers every way the field ends up holding the keyboard — and the
+        // rule is what keeps ⌘⌫ from raising a delete dialog mid-message with
+        // several chats still lit behind the field.
+        .onChange(of: inputFocused) { _, focused in
+            guard focused,
+                  let collapsed = SidebarMultiSelect.focusingComposer(
+                      in: sessionId, selection: appState.sidebarSelection)
+            else { return }
+            appState.sidebarSelection = collapsed
+        }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
             // the newly-visible session. The allow-list is NOT reset here — it's
@@ -1816,6 +2480,11 @@ struct ChatDetailView: View {
             // unpinned at whatever offset the previous conversation's content
             // happened to leave behind.
             applyScroll(.transcriptShown)
+            // A history walk belongs to ONE conversation. Stale indexes are
+            // harmless (ComposerHistory reads a mismatched draft as no walk),
+            // but the first ↑ in the newly-visible tab has to mean "the last
+            // thing I said HERE".
+            composerWalk = .idle
         }
     }
 
@@ -1830,6 +2499,19 @@ struct ChatDetailView: View {
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
                           onSend: { sendMessage() },
+                          // Escape stops the reply being written. Handled here
+                          // rather than as a hidden `.cancelAction` button so
+                          // the edit bubble and the approval sheet keep the key
+                          // while they are up (ComposerKey.onEscape).
+                          onCancel: {
+                              switch ComposerKey.onEscape(isGenerating: composerState == .generatingHere) {
+                              case .stop: stopGeneration(); return true
+                              case .pass: return false
+                              }
+                          },
+                          onArrow: { direction, caretAtStart, caretAtEnd in
+                              recallHistory(direction, caretAtStart: caretAtStart, caretAtEnd: caretAtEnd)
+                          },
                           onKeyCommand: { handleSlashKey($0) })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
@@ -1911,7 +2593,7 @@ struct ChatDetailView: View {
 
         Button {
             if composerState == .generatingHere {
-                chatEngine.stop(sessionId: sessionId)
+                stopGeneration()
             } else {
                 sendMessage()
             }
@@ -2390,6 +3072,10 @@ struct ChatDetailView: View {
             pendingIntentPrompt = prompt
             return
         }
+        // Sending ends any history walk: the composer is about to empty for a
+        // different reason, and a live walk would make the next ↑ resume from
+        // wherever the last one left off rather than from what was just sent.
+        composerWalk = .idle
         proceedSend()
     }
 
@@ -2439,9 +3125,22 @@ struct ChatDetailView: View {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
-        // any) overrides what it declared. One builder, so no field is read from
-        // a global here — see ChatTurnEngine.TurnConfig.
+        chatEngine.runTurn(sessionId: sessionId, userText: text,
+                           images: attachedImages, audio: attachedAudio,
+                           config: buildTurnConfig(),
+                           approval: { await requestToolApproval($0) })
+        // Your own message always wins: sending from halfway up the history used
+        // to leave you exactly there, because auto-follow was off and nothing
+        // else scrolled.
+        applyScroll(.userSentMessage)
+    }
+
+    /// The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
+    /// any) overrides what it declared. One builder, so no field is read from
+    /// a global here — see ChatTurnEngine.TurnConfig. Shared by send, Cmd+R
+    /// regenerate, and edit-and-resend so all three run under identical
+    /// settings.
+    private func buildTurnConfig() -> ChatTurnEngine.TurnConfig {
         let resolved = appState.resolvedAgentSettings(
             agentId: session?.agentId,
             toolsEnabled: isAgentMode,
@@ -2451,15 +3150,98 @@ struct ChatDetailView: View {
             workingDirectory: session?.workingDirectory,
             disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []),
             reasoningEffort: reasoningEffort)
-        let config = ChatTurnEngine.TurnConfig.from(
+        return ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
-        chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
-                           config: config,
+    }
+
+    /// Cmd+R — regenerate the last reply. Mirrors the footer's Regenerate
+    /// button; both funnel through `ChatTurnEngine.regenerate`, which drops
+    /// the last user turn and resubmits it fresh.
+    private var canRegenerate: Bool {
+        server.status == .running && composerState != .generatingHere
+            && session?.isExternalBridge != true
+            && (session?.messages.contains { $0.role == .user } ?? false)
+    }
+
+    /// Whether the reply at the end of this transcript can be finished off.
+    private var canContinue: Bool {
+        ContinueReply.isEligible(session?.messages ?? [],
+                                 serverRunning: server.status == .running,
+                                 busy: composerState != .idle,
+                                 engine: server.chatModelInfo?.engine)
+    }
+
+    /// Hand the last reply back to the model to finish. Same turn config as a
+    /// send, so the continuation runs under the settings that produced it.
+    private func continueReply() {
+        guard canContinue else { return }
+        chatEngine.continueReply(sessionId: sessionId, config: buildTurnConfig())
+        // The text lands at the END of a reply already on screen, so follow it
+        // down the same way a fresh send does.
+        applyScroll(.userSentMessage)
+    }
+
+    /// ↑ / ↓ in the composer: bring back an earlier message of your own.
+    ///
+    /// The rule is `ComposerHistory`, which decides from the draft, the caret
+    /// position and where the walk currently sits — everything here does is
+    /// feed it this chat's history and write the answer back. Returning false
+    /// hands the key to AppKit, which is what makes the arrows still move the
+    /// caret inside a draft.
+    private func recallHistory(_ direction: ComposerHistory.Direction,
+                               caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
+        let entries = ComposerHistory.entries(session?.messages ?? [])
+        let action = direction == .up
+            ? ComposerHistory.up(draft: inputText, caretAtStart: caretAtStart,
+                                 walk: composerWalk, entries: entries)
+            : ComposerHistory.down(draft: inputText, caretAtEnd: caretAtEnd,
+                                   walk: composerWalk, entries: entries)
+        switch action {
+        case .pass:
+            return false
+        case .recall(let text, let walk):
+            inputText = text
+            composerWalk = walk
+            return true
+        }
+    }
+
+    /// Stop this chat's turn. The ONE call both the composer's stop disc and
+    /// Escape make — per-session, because other tabs may be generating and
+    /// neither control may reach across.
+    private func stopGeneration() {
+        chatEngine.stop(sessionId: sessionId)
+    }
+
+    private func regenerateLastResponse() {
+        guard canRegenerate else { return }
+        chatEngine.regenerate(sessionId: sessionId, config: buildTurnConfig(),
+                               approval: { await requestToolApproval($0) })
+        // Same rule as a fresh send: the reply you just asked for is the thing
+        // to be looking at, wherever in the history the request came from.
+        applyScroll(.userSentMessage)
+    }
+
+    /// Edit a past user message in place, then resend it: everything from
+    /// that message onward (its old reply, any tool chain) is dropped and the
+    /// edited text runs as a brand-new turn — the standard "edit and resend"
+    /// behaviour rather than silently rewriting history the model already
+    /// answered.
+    private func editAndResend(messageId: UUID, newText: String) {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let msgs = session?.messages,
+              let idx = msgs.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let images = msgs[idx].images
+        let audio = msgs[idx].audio
+        appState.truncateMessages(in: sessionId, keepingFirst: idx)
+        chatEngine.runTurn(sessionId: sessionId, userText: trimmed,
+                           images: images, audio: audio,
+                           config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
-        // Your own message always wins: sending from halfway up the history used
-        // to leave you exactly there, because auto-follow was off and nothing
-        // else scrolled.
+        // An edit is started from wherever that message sits, which is by
+        // definition not the bottom — follow the resend down to it.
         applyScroll(.userSentMessage)
     }
 
@@ -2631,6 +3413,26 @@ struct GeneratingIndicator: View {
 
 // MARK: - Message Bubble
 
+/// Attaches double-click-to-edit, or attaches NOTHING at all.
+///
+/// A `nil` action must leave the view untouched rather than install a gesture
+/// that does nothing: this one is `highPriorityGesture`, so merely EXISTING is
+/// enough to beat `textSelection`'s own double-click-to-select-word. A
+/// no-op-inside-the-closure version therefore reads as "double-click stopped
+/// selecting words" on exactly the messages nobody can edit.
+private struct DoubleClickToEdit: ViewModifier {
+    let action: (() -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let action {
+            content.highPriorityGesture(TapGesture(count: 2).onEnded { _ in action() })
+        } else {
+            content
+        }
+    }
+}
+
 struct MessageBubble: View {
     let message: ChatMessage
     /// Pages a web search backed this reply with. Empty for every reply that
@@ -2645,8 +3447,32 @@ struct MessageBubble: View {
     /// a task run's transcript is a record, so it has no delete affordance
     /// rather than one that silently does nothing.
     var onDelete: (() -> Void)?
+    /// Edit this (user) message's text and resend it, dropping everything
+    /// that followed. nil for assistant messages and read-only surfaces —
+    /// same reasoning as `onDelete`.
+    var onEdit: ((String) -> Void)?
+    /// Regenerate this reply. Only ever set on the LAST assistant message —
+    /// the caller decides that, so the bubble itself doesn't need to know its
+    /// position in the transcript.
+    var onRegenerate: (() -> Void)?
+    /// Hand this reply back to the model to finish. Present only on the last
+    /// message, and only when it is continuable (`ContinueReply.isEligible`).
+    var onContinue: (() -> Void)?
+    /// Show a different generated version of this reply.
+    var onSelectRevision: ((Int) -> Void)?
+    /// Branch the conversation here: everything up to this message becomes a
+    /// new chat and this one is left alone. nil when there would be nothing to
+    /// fork (`ChatFork.isForkable`) or on a read-only surface.
+    var onFork: (() -> Void)?
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
+    @State private var isEditing = false
+    @State private var editDraft = ""
+    /// The edit field is the composer's field (`GrowingTextEditor`), so it
+    /// needs the composer's two bindings: where the caret is, and how tall the
+    /// text has grown.
+    @State private var editFocused = false
+    @State private var editHeight: CGFloat = 0
 
     var body: some View {
         // A failure notice is not model output: it renders as its own card
@@ -2734,7 +3560,15 @@ struct MessageBubble: View {
                 }
 
                 // Content.
-                if !message.content.isEmpty || message.isStreaming {
+                if isEditing, onEdit != nil {
+                    editingContent
+                } else if !message.content.isEmpty || message.isStreaming {
+                    // Only the USER gets a bubble (`isBare` below). An assistant
+                    // reply is the page's main content — long, formatted, full
+                    // of code blocks and tables — and boxing it wastes the
+                    // column's width and fights every block that wants the full
+                    // measure. A tool-call summary keeps its card so it still
+                    // reads as machinery, not prose.
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
                             Label("Tool Call", systemImage: "wrench.and.screwdriver")
@@ -2757,6 +3591,27 @@ struct MessageBubble: View {
                             GeneratingIndicator()
                         }
                     }
+                    // `.highPriorityGesture`, not `.onTapGesture` — the `Text`
+                    // above has `.textSelection(.enabled)`, which installs its
+                    // OWN double-click-to-select-word handling. A plain
+                    // `.onTapGesture(count: 2)` sits behind that in the
+                    // gesture hierarchy and never sees the second click, so
+                    // double-click silently did nothing. `highPriorityGesture`
+                    // makes this the one that wins.
+                    //
+                    // Which is exactly why the `onEdit` test is on the MODIFIER
+                    // and not inside the closure: a message with no edit action
+                    // (every assistant reply, every read-only surface) would
+                    // otherwise still install a winning gesture that beats
+                    // text selection and then does nothing — killing
+                    // double-click-to-select-a-word on the replies, which is
+                    // most of what anyone selects.
+                    // …and why the model's replies are excluded even though they
+                    // ARE editable now: the gesture wins over text selection,
+                    // and an assistant reply is prose people select words in.
+                    // Its edit is reached from the context menu instead.
+                    .modifier(DoubleClickToEdit(
+                        action: (onEdit == nil || message.role != .user) ? nil : { startEditing() }))
                     .padding(.horizontal, isBare ? 0 : ChatMetrics.bubblePaddingH)
                     .padding(.vertical, isBare ? 0 : ChatMetrics.bubblePaddingV)
                     .background(bubbleBackground)
@@ -2792,10 +3647,94 @@ struct MessageBubble: View {
         }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
+            if onEdit != nil {
+                // Named for what it DOES: editing your own message re-asks the
+                // question, editing the model's rewrites what it said.
+                Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
+            }
+            if onRegenerate != nil {
+                Button("Regenerate") { onRegenerate?() }
+            }
+            if let onFork {
+                // Between the two destructive answers and Delete: a fork keeps
+                // BOTH branches, so it belongs next to the ones that don't.
+                Divider()
+                Button("Branch Chat From Here", action: onFork)
+            }
             if onDelete != nil {
                 Button("Delete Message", role: .destructive) { onDelete?() }
             }
         }
+    }
+
+    /// Replaces the static bubble while editing: a growing multi-line field
+    /// pre-filled with the message's current text, Cancel / Save beneath it.
+    /// Save hands the new text to `onEdit`, which drops this message and
+    /// everything after it and resubmits — same shape as a fresh send.
+    ///
+    /// It is the COMPOSER's field, not a `TextEditor`. Editing a message is a
+    /// send, so it answers the keyboard like one: Return submits, Shift+Return
+    /// breaks the line — `ComposerKey.onReturn` decides for both, and
+    /// `editCanSubmit` is the same gate that dims Save, so the key and the
+    /// button can never disagree about whether this draft can go.
+    private var editingContent: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            GrowingTextEditor(text: $editDraft,
+                              isFocused: $editFocused,
+                              measuredHeight: $editHeight,
+                              maxLines: 12,
+                              isIdle: ComposerKey.editCanSubmit(editDraft),
+                              onSend: { commitEdit() },
+                              // Belt and braces: the Cancel button's key
+                              // equivalent claims Escape first while this is up.
+                              onCancel: { cancelEdit(); return true })
+                .frame(height: max(ChatMetrics.composerMinHeight, editHeight))
+                .padding(8)
+                .background(Color(nsColor: .controlBackgroundColor)) // Distinct surface fill
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.accentColor.opacity(0.6), lineWidth: 1.5) // Glowing outline
+                )
+                .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 3) // Depth
+
+            HStack(spacing: 8) {
+                Button("Cancel") { cancelEdit() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Save") { commitEdit() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!ComposerKey.editCanSubmit(editDraft))
+            }
+            .font(.caption)
+        }
+        .padding(4)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func startEditing() {
+        editDraft = message.content
+        isEditing = true
+        // Put the caret in the field the edit just opened — otherwise Return
+        // is typed at whatever still holds focus (the composer below), which
+        // sends a NEW message instead of the edit.
+        editFocused = true
+    }
+
+    private func cancelEdit() {
+        isEditing = false
+        editFocused = false
+        editDraft = ""
+    }
+
+    private func commitEdit() {
+        guard ComposerKey.editCanSubmit(editDraft) else { return }
+        let text = editDraft
+        isEditing = false
+        editFocused = false
+        onEdit?(text)
     }
 
     // MARK: - Bubble vs bare
@@ -2836,8 +3775,56 @@ struct MessageBubble: View {
 
             Spacer(minLength: 8)
 
+            // Which version of this reply you are reading. Left of the actions
+            // because it is a statement about the text above it, not another
+            // thing to do to it — and it only exists once there is a choice.
+            if MessageRevisions.isPagerVisible(message.revisions) {
+                HStack(spacing: 1) {
+                    footerButton("chevron.left", help: "Previous version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: -1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoBack(index: message.activeRevision))
+                    Text(MessageRevisions.label(index: message.activeRevision,
+                                                count: message.revisions.count))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    footerButton("chevron.right", help: "Next version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: 1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoForward(index: message.activeRevision,
+                                                             count: message.revisions.count))
+                }
+            }
+
             HStack(spacing: 2) {
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                // The model's replies are editable but have no double-click
+                // route into it (that gesture belongs to selecting a word), so
+                // without this the only way in is a context menu nobody thinks
+                // to open on a paragraph.
+                if onEdit != nil, message.role == .assistant {
+                    footerButton("pencil", help: "Edit this reply — then Continue to carry on from it") {
+                        startEditing()
+                    }
+                }
+                // Continue sits BEFORE regenerate: they are the two answers to
+                // "this reply isn't what I need", and the non-destructive one
+                // goes first — regenerate throws the reply away.
+                if let onContinue {
+                    footerButton("text.append",
+                                 help: message.truncationNotice != nil
+                                     ? "Finish this reply — it was cut short"
+                                     : "Keep writing from where this left off",
+                                 action: onContinue)
+                }
+                if let onRegenerate {
+                    footerButton("arrow.clockwise", help: "Regenerate this reply (⌘R)",
+                                 action: onRegenerate)
+                }
                 if let onDelete {
                     footerButton("trash", help: "Delete this message from the conversation",
                                  action: onDelete)
@@ -4080,6 +5067,11 @@ enum ComposerLayout {
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
 enum ComposerReturnAction: Equatable { case send, newline, ignore }
 
+/// What an Escape keypress does in the composer. `.pass` hands the key back to
+/// AppKit rather than swallowing it — with no turn to stop, Escape still has
+/// its platform meaning here.
+enum ComposerEscapeAction: Equatable { case stop, pass }
+
 /// A key the composer offers to the "/" menu before handling it itself.
 enum ComposerKeyCommand { case up, down, accept, cancel }
 
@@ -4087,6 +5079,27 @@ enum ComposerKey {
     static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
         if shift { return .newline }
         return isIdle ? .send : .ignore
+    }
+
+    /// Escape stops the reply being written, and does nothing otherwise.
+    ///
+    /// This runs from `cancelOperation(_:)` — the RESPONDER CHAIN — not from a
+    /// `.keyboardShortcut(.cancelAction)`. Key equivalents are offered the
+    /// keystroke first, so the edit bubble's Cancel and the tool-approval
+    /// sheet's Deny keep Escape whenever they are on screen, and the composer
+    /// only sees it when neither is. That ordering is the whole reason this
+    /// is not a hidden button like ⌘R regenerate.
+    static func onEscape(isGenerating: Bool) -> ComposerEscapeAction {
+        isGenerating ? .stop : .pass
+    }
+
+    /// Whether an in-place message edit is submittable — the ONE gate the Save
+    /// button and the Return key both read. A resubmit drops the old reply and
+    /// everything after it, so a blanked draft must not be able to spend that:
+    /// the edit field feeds this to `onReturn`'s `isIdle`, which turns a bare
+    /// Return on nothing into `.ignore` rather than a send.
+    static func editCanSubmit(_ draft: String) -> Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -4104,8 +5117,18 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var maxLines: Int = 15
     var isIdle: Bool
     var onSend: () -> Void
+    /// Escape, from the responder chain. Defaults to nothing so a field that
+    /// has no use for the key leaves it to AppKit.
+    var onCancel: () -> Bool = { false }
+    /// ↑ / ↓, with WHERE THE CARET IS — the composer recalls earlier messages,
+    /// but only from the edge of the text, so the keys keep moving the caret
+    /// inside a multi-line draft (`ComposerHistory`). Returning false hands the
+    /// key back to AppKit. Defaults to nothing: the in-place message editor has
+    /// no history to walk.
+    var onArrow: (ComposerHistory.Direction, _ caretAtStart: Bool, _ caretAtEnd: Bool) -> Bool = { _, _, _ in false }
     /// Keys the "/" menu wants first. Returns true when it consumed one — the
-    /// editor's own Return handling only runs when nothing above claimed it.
+    /// editor's own Return handling, Escape and arrow recall only run when
+    /// nothing above claimed the key.
     var onKeyCommand: (ComposerKeyCommand) -> Bool = { _ in false }
 
     /// Read from the SAME constants the placeholder overlay reads — the two
@@ -4157,19 +5180,41 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         // in-progress edit at the same value.
         if tv.string != text {
             tv.string = text
+            // Caret to the END of whatever was just put in the field. Setting
+            // `string` collapses the selection to the front, which after a
+            // history recall means typing lands BEFORE the recalled message and
+            // ↓ (which arms at the end) can never walk back out of it.
+            tv.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
             context.coordinator.recomputeHeight()
         }
         let enabled = context.environment.isEnabled
         if tv.isEditable != enabled { tv.isEditable = enabled }
-        // Drive AppKit first-responder from the SwiftUI focus mirror.
-        if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
-            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        // Drive AppKit first-responder from the SwiftUI focus mirror — on the
+        // EDGE of a request, never on its level.
+        //
+        // This ran on every update while `isFocused` was true, which made the
+        // field impossible to leave: `onResignFocus` publishes the cleared flag
+        // ASYNCHRONOUSLY, so any update in between saw a still-true flag and a
+        // text view that no longer had the keyboard, and handed it straight
+        // back. `isFocused` is set true on appear and again whenever a turn goes
+        // idle, and nothing ever cleared it, so the composer held the keyboard
+        // for the life of the window — and ⌘⌫ read "the user is typing" forever
+        // (live 2026-08-12).
+        if isFocused != context.coordinator.appliedFocus {
+            context.coordinator.appliedFocus = isFocused
+            if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
+                DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+            }
         }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: GrowingTextEditor
         weak var textView: ComposerTextView?
+        /// The last focus REQUEST this view acted on, so `updateNSView` can
+        /// tell "focus me" from "you are still notionally focused" — see the
+        /// note there.
+        var appliedFocus = false
         init(_ parent: GrowingTextEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
@@ -4179,6 +5224,14 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            // The "/" skill menu gets FIRST REFUSAL on every key it navigates
+            // with, and only a menu that is actually open claims one. When it
+            // declines, the composer's own bindings below run unchanged — so
+            // Escape still stops a reply and ↑/↓ still walk history whenever
+            // the menu is closed. Order matters both ways: an open menu that
+            // let Escape through would stop the generation instead of closing
+            // itself, and arrows reaching history would scroll the transcript
+            // out from under the highlighted row.
             switch commandSelector {
             case #selector(NSResponder.moveUp(_:)):
                 if parent.onKeyCommand(.up) { return true }
@@ -4190,6 +5243,27 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
                 if parent.onKeyCommand(.cancel) { return true }
             default:
                 break
+            }
+            // Escape. Reached only when no `.cancelAction` key equivalent is on
+            // screen to claim it first — see ComposerKey.onEscape.
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                return parent.onCancel()
+            }
+            // ↑ / ↓ recall earlier messages, but the caret position is what
+            // decides — a draft is regularly several lines tall, and swallowing
+            // the arrows inside one would make it uneditable. The rule needs
+            // both edges, so both are measured here rather than inferred: the
+            // caret is at the start and the end simultaneously in an empty
+            // field, which is the state the walk arms from.
+            if commandSelector == #selector(NSResponder.moveUp(_:))
+                || commandSelector == #selector(NSResponder.moveDown(_:)) {
+                let selection = textView.selectedRange()
+                let length = (textView.string as NSString).length
+                let collapsed = selection.length == 0
+                return parent.onArrow(
+                    commandSelector == #selector(NSResponder.moveUp(_:)) ? .up : .down,
+                    collapsed && selection.location == 0,
+                    collapsed && selection.location == length)
             }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
             // Return picks the highlighted command when the menu is open —
