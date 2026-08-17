@@ -60,17 +60,56 @@ pub const MtpCostProfile = enum {
     generic,
     g17_nax_q8_gs32,
     g17_nax_q4_gs32,
+    g17_nax_q4_gs64,
+    g17_nax_q6_gs64,
+    g17_nax_q8_gs64,
     g17_nax_oq4e_q4_gs64,
 };
 
-fn m5NaxCostProfileForQuant(bits: u32, group_size: u32) MtpCostProfile {
-    if (bits == 4 and group_size == 64) return .g17_nax_oq4e_q4_gs64;
-    if (group_size == 32) return switch (bits) {
-        8 => .g17_nax_q8_gs32,
-        4 => .g17_nax_q4_gs32,
-        else => .generic,
+/// Target-side tensors that contribute materially to a complete MTP round.
+/// This is deliberately a single classification rather than independent
+/// booleans: one bound target can match at most one measured cost surface.
+pub const MtpNaxTargetSurface = enum {
+    none,
+    uniform_quantized_embedding,
+    uniform_bf16_embedding,
+    uniform_q6_quantized_embedding,
+    uniform_q8_bf16_embedding,
+    oqe_quantized_embedding,
+};
+
+/// Pure first-stage classifier for a complete sidecar/target fingerprint.
+/// Runtime tensor-shape validation below must still pass before the returned
+/// calibrated profile is used.
+pub fn m5NaxCostProfileForFingerprint(
+    bits: u32,
+    group_size: u32,
+    target_surface: MtpNaxTargetSurface,
+) MtpCostProfile {
+    return switch (target_surface) {
+        .uniform_quantized_embedding => if (group_size == 32) switch (bits) {
+            8 => .g17_nax_q8_gs32,
+            4 => .g17_nax_q4_gs32,
+            else => .generic,
+        } else .generic,
+        .uniform_bf16_embedding => if (bits == 4 and group_size == 64)
+            .g17_nax_q4_gs64
+        else
+            .generic,
+        .uniform_q6_quantized_embedding => if (bits == 6 and group_size == 64)
+            .g17_nax_q6_gs64
+        else
+            .generic,
+        .uniform_q8_bf16_embedding => if (bits == 8 and group_size == 64)
+            .g17_nax_q8_gs64
+        else
+            .generic,
+        .oqe_quantized_embedding => if (bits == 4 and group_size == 64)
+            .g17_nax_oq4e_q4_gs64
+        else
+            .generic,
+        .none => .generic,
     };
-    return .generic;
 }
 
 /// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
@@ -287,26 +326,40 @@ pub const MtpModel = struct {
     }
 
     /// Select the exact full-round cost surface for this bound sidecar and
-    /// target. Both G17 profiles require the successfully built 3-bit/gs-64
-    /// draft-only lm_head and a homogeneous dense Qwen3.6-27B sidecar; their
-    /// q8/gs-32 and q4/gs-32 draft costs are calibrated independently.
+    /// target. Every G17 profile requires the successfully built 3-bit/gs-64
+    /// draft-only lm_head and an exact dense 27B sidecar. Uniform q4/q6/q8
+    /// gs64 trunks and mixed-q4/q5/q6 oQ4e trunks remain separate profiles;
+    /// target embedding storage is part of the fingerprint too.
     /// Compatible but off-profile geometry remains correct under `generic`.
     pub fn m5NaxCostProfile(self: *const MtpModel, target: *const Transformer) MtpCostProfile {
         if (self.eh_proj != null) return .generic;
-        const profile = m5NaxCostProfileForQuant(self.quant_bits, self.quant_group_size);
-        switch (profile) {
-            .g17_nax_oq4e_q4_gs64 => if (!target.mtpOqeNaxProfileEnabled()) return .generic,
-            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => if (!target.mtpNaxProfileEnabled()) return .generic,
-            .generic => return .generic,
-        }
+        const target_surface: MtpNaxTargetSurface = if (target.mtpNaxQ4Gs64ProfileEnabled())
+            .uniform_bf16_embedding
+        else if (target.mtpNaxQ6Gs64ProfileEnabled())
+            .uniform_q6_quantized_embedding
+        else if (target.mtpNaxQ8Gs64ProfileEnabled())
+            .uniform_q8_bf16_embedding
+        else if (target.mtpNaxProfileEnabled())
+            .uniform_quantized_embedding
+        else if (target.mtpOqeNaxProfileEnabled())
+            .oqe_quantized_embedding
+        else
+            .none;
+        const profile = m5NaxCostProfileForFingerprint(
+            self.quant_bits,
+            self.quant_group_size,
+            target_surface,
+        );
+        if (profile == .generic) return .generic;
         const sidecar_bits: u32 = switch (profile) {
-            .g17_nax_q8_gs32 => 8,
-            .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 => 4,
+            .g17_nax_q8_gs32, .g17_nax_q8_gs64 => 8,
+            .g17_nax_q6_gs64 => 6,
+            .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_oq4e_q4_gs64 => 4,
             .generic => return .generic,
         };
         const sidecar_group_size: u32 = switch (profile) {
             .g17_nax_q8_gs32, .g17_nax_q4_gs32 => 32,
-            .g17_nax_oq4e_q4_gs64 => 64,
+            .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => 64,
             .generic => return .generic,
         };
 
@@ -1016,9 +1069,13 @@ fn inferGroupSize(q: *const QLinear, bits: u32) ?u32 {
     const packed_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
     const scale_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
     if (scale_cols == 0) return null;
-    const expanded = packed_cols * (32 / bits);
+    const packed_bits = @as(u64, packed_cols) * 32;
+    if (packed_bits % bits != 0) return null;
+    const expanded = packed_bits / bits;
     if (expanded % scale_cols != 0) return null;
-    return expanded / scale_cols;
+    const group_size = expanded / scale_cols;
+    if (group_size > std.math.maxInt(u32)) return null;
+    return @intCast(group_size);
 }
 
 /// Infer the quant BIT WIDTH from packed-weight geometry. The MTP layer's
@@ -1030,9 +1087,11 @@ fn inferBits(q: *const QLinear, hidden: u32) ?u32 {
     const w_shape = mlx.getShape(q.w);
     if (w_shape.len < 2) return null;
     const packed_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
-    const bits = (32 * packed_cols) / hidden;
+    const packed_bits = 32 * packed_cols;
+    if (packed_bits % hidden != 0) return null;
+    const bits = packed_bits / hidden;
     return switch (bits) {
-        2, 4, 8 => bits,
+        2, 3, 4, 5, 6, 8 => bits,
         else => null,
     };
 }
@@ -2473,6 +2532,23 @@ test "mtp: inferGroupSize geometry" {
     try testing.expectEqual(@as(?u32, 8), inferBits(&q, 16));
     try testing.expectEqual(@as(?u32, null), inferBits(&q, 0));
     try testing.expectEqual(@as(?u32, null), inferBits(&q, 100));
+    // Every affine width accepted by the shared geometry solver must also be
+    // a valid sidecar fallback; q3/q5/q6 used to silently fall back to q4.
+    var q_mixed = QLinear{
+        .w = mlx.mlx_array_new_data(&@as([12]i32, @splat(0)), &[_]c_int{ 2, 6 }, 2, .int32),
+        .s = mlx.mlx_array_new_data(&@as([4]f32, @splat(0)), &[_]c_int{ 2, 2 }, 2, .float32),
+        .b = mlx.mlx_array_new(),
+    };
+    defer q_mixed.deinit();
+    try testing.expectEqual(@as(?u32, 3), inferBits(&q_mixed, 64));
+    try testing.expectEqual(@as(?u32, 6), inferBits(&q_mixed, 32));
+    try testing.expectEqual(@as(?u32, 32), inferGroupSize(&q_mixed, 3));
+    try testing.expectEqual(@as(?u32, 16), inferGroupSize(&q_mixed, 6));
+    const q5_w = mlx.mlx_array_new_data(&@as([10]i32, @splat(0)), &[_]c_int{ 2, 5 }, 2, .int32);
+    _ = mlx.mlx_array_free(q_mixed.w);
+    q_mixed.w = q5_w;
+    try testing.expectEqual(@as(?u32, 5), inferBits(&q_mixed, 32));
+    try testing.expectEqual(@as(?u32, 16), inferGroupSize(&q_mixed, 5));
     // The real sidecar geometry: in=5120 packed to 640 u32 cols at 4 bits,
     // scales 160 cols → group 32.
     try testing.expectEqual(@as(u32, 32), (5120 / 160));
@@ -2558,11 +2634,23 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
         }
     };
 
-    try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs32, m5NaxCostProfileForQuant(8, 32));
-    try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs32, m5NaxCostProfileForQuant(4, 32));
-    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(8, 64));
-    try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForQuant(4, 64));
-    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(3, 32));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs32, m5NaxCostProfileForFingerprint(8, 32, .uniform_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs32, m5NaxCostProfileForFingerprint(4, 32, .uniform_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(8, 64, .uniform_quantized_embedding));
+    // Qwen3.8's resident bf16 embedding is part of its measured q4/gs64
+    // round surface. A uniformly-quantized embedding is a different, still
+    // unmeasured surface and must remain generic.
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(4, 64, .uniform_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs64, m5NaxCostProfileForFingerprint(4, 64, .uniform_bf16_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q6_gs64, m5NaxCostProfileForFingerprint(6, 64, .uniform_q6_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs64, m5NaxCostProfileForFingerprint(8, 64, .uniform_q8_bf16_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(8, 64, .uniform_q6_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(6, 64, .uniform_q8_bf16_embedding));
+    // It must not be mistaken for the older mixed-q4/q5/q6 oQ4e trunk merely
+    // because both native sidecars are q4/gs64.
+    try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForFingerprint(4, 64, .oqe_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(4, 64, .none));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(3, 32, .uniform_quantized_embedding));
 
     var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
     defer sidecar.deinit();
