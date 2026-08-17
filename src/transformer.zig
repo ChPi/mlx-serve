@@ -4631,6 +4631,12 @@ pub const ForwardCtx = struct {
     /// `Transformer.spec_capture_ssm`.
     capture_ssm_seq: bool = false,
     vision_embeddings: ?mlx.mlx_array,
+    /// Chunked vision prefill (issue #197): number of image/audio placeholder
+    /// tokens already spliced by earlier chunks of this prefill. The splice's
+    /// row lookup is a cumsum over the CURRENT forward's placeholder mask, so
+    /// without this every chunk would restart at vision row 0. Set per chunk
+    /// by the generate.zig prefill loop; 0 for unchunked/decode forwards.
+    vision_splice_offset: usize = 0,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens
@@ -7682,7 +7688,17 @@ pub const Transformer = struct {
     /// Returns new h with vision embeddings replacing image token positions.
     /// masked_scatter: replaces image token positions with vision features.
     /// Matches Python reference: cumsum-based indexing into flattened source.
-    fn spliceVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32) !mlx.mlx_array {
+    fn spliceVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32, row_offset: usize) !mlx.mlx_array {
+        return spliceVisionRows(h, token_ids, vision_emb, image_token_id, audio_token_id, row_offset, self.s);
+    }
+
+    /// Scatter vision/audio embedding rows into `h` at placeholder-token
+    /// positions. `row_offset` is the number of placeholder tokens earlier
+    /// chunks of this prefill already consumed (chunked vision prefill): the
+    /// row lookup is a cumsum over THIS forward's mask, so the offset is what
+    /// keeps a chunk boundary inside an image from restarting the scatter at
+    /// row 0. Frees `h` and returns the spliced replacement.
+    pub fn spliceVisionRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32, row_offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
         const h_shape = mlx.getShape(h);
 
         // mask = (token_ids == image_token_id) [| (token_ids == audio_token_id)].
@@ -7694,15 +7710,15 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(img_id_arr);
         var mask_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_2d);
-        try mlx.check(mlx.mlx_equal(&mask_2d, token_ids, img_id_arr, self.s));
+        try mlx.check(mlx.mlx_equal(&mask_2d, token_ids, img_id_arr, s));
         if (audio_token_id > 0) {
             const aud_id_arr = mlx.mlx_array_new_int(@intCast(audio_token_id));
             defer _ = mlx.mlx_array_free(aud_id_arr);
             var aud_mask = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(aud_mask);
-            try mlx.check(mlx.mlx_equal(&aud_mask, token_ids, aud_id_arr, self.s));
+            try mlx.check(mlx.mlx_equal(&aud_mask, token_ids, aud_id_arr, s));
             var combined = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_logical_or(&combined, mask_2d, aud_mask, self.s));
+            try mlx.check(mlx.mlx_logical_or(&combined, mask_2d, aud_mask, s));
             _ = mlx.mlx_array_free(mask_2d);
             mask_2d = combined;
         }
@@ -7711,7 +7727,7 @@ pub const Transformer = struct {
         const expand_shape = [_]c_int{ h_shape[0], h_shape[1], 1 };
         var mask_3d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_3d);
-        try mlx.check(mlx.mlx_reshape(&mask_3d, mask_2d, &expand_shape, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&mask_3d, mask_2d, &expand_shape, 3, s));
 
         // Broadcast to full shape via logical and with ones
         var mask_expanded = mlx.mlx_array_new();
@@ -7719,8 +7735,8 @@ pub const Transformer = struct {
         {
             var ones_h = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(ones_h);
-            try mlx.check(mlx.mlx_ones(&ones_h, h_shape.ptr, 3, .bool_, self.s));
-            try mlx.check(mlx.mlx_multiply(&mask_expanded, mask_3d, ones_h, self.s));
+            try mlx.check(mlx.mlx_ones(&ones_h, h_shape.ptr, 3, .bool_, s));
+            try mlx.check(mlx.mlx_multiply(&mask_expanded, mask_3d, ones_h, s));
         }
 
         // Flatten everything
@@ -7729,22 +7745,26 @@ pub const Transformer = struct {
 
         var mask_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_flat);
-        try mlx.check(mlx.mlx_reshape(&mask_flat, mask_expanded, &flat_shape, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&mask_flat, mask_expanded, &flat_shape, 1, s));
 
         // mask_int = mask_flat.astype(int32)
         var mask_int = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_int);
-        try mlx.check(mlx.mlx_astype(&mask_int, mask_flat, .int32, self.s));
+        try mlx.check(mlx.mlx_astype(&mask_int, mask_flat, .int32, s));
 
-        // indices = cumsum(mask_int, axis=0) - 1
+        // indices = cumsum(mask_int, axis=0) - 1 + row_offset*hidden. The
+        // cumsum counts masked ELEMENTS of this forward (hidden consecutive
+        // per placeholder token); earlier chunks consumed row_offset rows of
+        // the flat source, i.e. row_offset*hidden elements.
         var cumsum_arr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cumsum_arr);
-        try mlx.check(mlx.mlx_cumsum(&cumsum_arr, mask_int, 0, false, true, self.s));
-        const one_i = mlx.mlx_array_new_int(1);
-        defer _ = mlx.mlx_array_free(one_i);
+        try mlx.check(mlx.mlx_cumsum(&cumsum_arr, mask_int, 0, false, true, s));
+        const elem_offset: i64 = @as(i64, @intCast(row_offset)) * @as(i64, @intCast(h_shape[2]));
+        const off_i = mlx.mlx_array_new_int(@intCast(elem_offset - 1));
+        defer _ = mlx.mlx_array_free(off_i);
         var indices = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(indices);
-        try mlx.check(mlx.mlx_subtract(&indices, cumsum_arr, one_i, self.s));
+        try mlx.check(mlx.mlx_add(&indices, cumsum_arr, off_i, s));
 
         // source = vision_emb.flatten()
         const ve_shape = mlx.getShape(vision_emb);
@@ -7752,38 +7772,38 @@ pub const Transformer = struct {
         const source_shape = [_]c_int{source_size};
         var source_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(source_flat);
-        try mlx.check(mlx.mlx_reshape(&source_flat, vision_emb, &source_shape, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&source_flat, vision_emb, &source_shape, 1, s));
 
         // indices_mod = indices % source_size
         const source_size_arr = mlx.mlx_array_new_int(source_size);
         defer _ = mlx.mlx_array_free(source_size_arr);
         var indices_mod = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(indices_mod);
-        try mlx.check(mlx.mlx_remainder(&indices_mod, indices, source_size_arr, self.s));
+        try mlx.check(mlx.mlx_remainder(&indices_mod, indices, source_size_arr, s));
 
         // aligned = source[indices_mod]
         var aligned = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(aligned);
-        try mlx.check(mlx.mlx_take(&aligned, source_flat, indices_mod, self.s));
+        try mlx.check(mlx.mlx_take(&aligned, source_flat, indices_mod, s));
 
         // Cast aligned to bf16 to match h
         var aligned_bf = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(aligned_bf);
-        try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, .bfloat16, self.s));
+        try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, .bfloat16, s));
 
         // input_flat = h.flatten()
         var input_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(input_flat);
-        try mlx.check(mlx.mlx_reshape(&input_flat, h, &flat_shape, 1, self.s));
+        try mlx.check(mlx.mlx_reshape(&input_flat, h, &flat_shape, 1, s));
 
         // result_flat = where(mask_flat, aligned_bf, input_flat)
         var result_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(result_flat);
-        try mlx.check(mlx.mlx_where(&result_flat, mask_flat, aligned_bf, input_flat, self.s));
+        try mlx.check(mlx.mlx_where(&result_flat, mask_flat, aligned_bf, input_flat, s));
 
         // Reshape back to [B, seq_len, hidden]
         var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, s));
         _ = mlx.mlx_array_free(h);
         return result;
     }
@@ -7803,7 +7823,7 @@ pub const Transformer = struct {
         // mlx-vlm does NOT re-scale them by sqrt(hidden) the way text embeddings are scaled
         // at LM embedding time. Splice directly — scaling here corrupts the MoE router's
         // magnitude assumptions (visible as "please provide an image" responses on 26B MoE).
-        return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id, cfg.audio_token_id);
+        return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id, cfg.audio_token_id, ctx.vision_splice_offset);
     }
 
     // ── Activation functions ──
@@ -8111,6 +8131,13 @@ pub const Transformer = struct {
     }
 
     const DECODE_ASYNC_LADDER_AUTO: u32 = 8;
+
+    // A PREFILL-side async-eval ladder (mlxfast-challenge prefillLadder:
+    // asyncEval every 3rd-4th layer at seq >= 512) was ported and measured
+    // 2026-08-16 (qwen3.8-27B-4bit, 43.7k-token prompt, M4 Max): off 227.9
+    // vs ladder 225.9 tok/s median — null-to-negative, same reason the
+    // decode ladder loses here: chunked prefill + the eval cadence already
+    // collect the overlap. Removed rather than shipped as a dead knob.
 
     /// Fire the ladder at this layer boundary, if it is one. `h` is the live
     /// residual; handing it to `mlx_async_eval` starts every op it depends on.
@@ -11456,6 +11483,23 @@ pub const Transformer = struct {
             k_rope = pair[1];
             fused_qk = true;
         }
+        // hd-256 sibling (qwen3.5/3.6 full-attention layers), decode AND
+        // spec-verify widths (S 1..16) — the hd-128 gate above never fires
+        // there, so those layers paid the composed chain on every step.
+        if (!fused_qk and batch == 1 and hd == 256 and seq_len <= 32 and
+            ctx.mrope_cos_cur == null and
+            fa.q_norm.ctx != null and fa.k_norm.ctx != null and
+            self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
+        blk: {
+            const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+            const angles = self.qkAngleRowsFor(0, rope_dims, mlx.mlx_optional_float.some(self.config.rope_theta), .{ .ctx = null }, eff_off, seq_len) catch break :blk;
+            const pair = (fusedQkNormRope256(self.s, queries, k_r, fa.q_norm, fa.k_norm, angles, self.rms_eps_arr, h_count, kv_h, seq_len, rope_dims) catch null) orelse break :blk;
+            _ = mlx.mlx_array_free(q_rope);
+            _ = mlx.mlx_array_free(k_rope);
+            q_rope = pair[0];
+            k_rope = pair[1];
+            fused_qk = true;
+        }
         if (!fused_qk) {
             // Q/K norms
             const q_normed = try self.rmsNorm(queries, fa.q_norm);
@@ -11800,13 +11844,21 @@ pub const Transformer = struct {
     /// The angle row for `offset` in the given rope family, rebuilt when the
     /// offset moves (per decode token: 38-of-40 layers hit the cache).
     fn qkAngleFor(self: *Transformer, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array, offset: c_int) !mlx.mlx_array {
+        return self.qkAngleRowsFor(family, rd, base, freqs, offset, 1);
+    }
+
+    /// Multi-row variant for the hd-256 fused path at verify widths: one
+    /// [rows, rd] table for positions offset..offset+rows-1, same per-forward
+    /// cache (every layer of one verify round shares the table).
+    fn qkAngleRowsFor(self: *Transformer, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: mlx.mlx_array, offset: c_int, rows: c_int) !mlx.mlx_array {
         const slot = &self.qk_angle_cache[family];
-        if (slot.arr.ctx != null and slot.offset == offset and slot.rd == rd) return slot.arr;
+        if (slot.arr.ctx != null and slot.offset == offset and slot.rd == rd and slot.rows == rows) return slot.arr;
         if (slot.arr.ctx != null) _ = mlx.mlx_array_free(slot.arr);
         slot.arr = .{ .ctx = null };
-        slot.arr = try ropeAngleRow(self.s, rd, base, freqs, offset, self.allocator);
+        slot.arr = try ropeAngleRows(self.s, rd, base, freqs, offset, rows, self.allocator);
         slot.offset = offset;
         slot.rd = rd;
+        slot.rows = rows;
         return slot.arr;
     }
 
@@ -12610,52 +12662,6 @@ pub const Transformer = struct {
             a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
             b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
         }
-        // Conv1d with cache: prepend conv_state, apply depthwise conv + silu
-        const conv_out = try self.conv1dWithCache(qkv, la.conv1d_w, null, ssm, batch, conv_dim, kernel, true);
-        defer _ = mlx.mlx_array_free(conv_out);
-
-        // Split conv output into Q, K, V
-        // Q: [B, S, key_dim] → [B, S, num_k_heads, dk]
-        // K: [B, S, key_dim] → [B, S, num_k_heads, dk]
-        // V: [B, S, value_dim] → [B, S, num_v_heads, dv]
-        const strides3 = [_]c_int{ 1, 1, 1 };
-        var q_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q_flat);
-        {
-            const start = [_]c_int{ 0, 0, 0 };
-            const stop = [_]c_int{ batch, seq_len, key_dim };
-            try mlx.check(mlx.mlx_slice(&q_flat, conv_out, &start, 3, &stop, 3, &strides3, 3, self.s));
-        }
-        var k_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_flat);
-        {
-            const start = [_]c_int{ 0, 0, key_dim };
-            const stop = [_]c_int{ batch, seq_len, key_dim * 2 };
-            try mlx.check(mlx.mlx_slice(&k_flat, conv_out, &start, 3, &stop, 3, &strides3, 3, self.s));
-        }
-        var v_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(v_flat);
-        {
-            const start = [_]c_int{ 0, 0, key_dim * 2 };
-            const stop = [_]c_int{ batch, seq_len, key_dim * 2 + value_dim };
-            try mlx.check(mlx.mlx_slice(&v_flat, conv_out, &start, 3, &stop, 3, &strides3, 3, self.s));
-        }
-
-        // Reshape to head dims
-        const q_shape = [_]c_int{ batch, seq_len, num_k_heads, dk };
-        const k_shape = [_]c_int{ batch, seq_len, num_k_heads, dk };
-        const v_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
-        var q_heads = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q_heads);
-        var k_heads = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_heads);
-        var v_heads = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(v_heads);
-        try mlx.check(mlx.mlx_reshape(&q_heads, q_flat, &q_shape, 4, self.s));
-        try mlx.check(mlx.mlx_reshape(&k_heads, k_flat, &k_shape, 4, self.s));
-        try mlx.check(mlx.mlx_reshape(&v_heads, v_flat, &v_shape, 4, self.s));
-
-        // Q/K normalization: q = (1/dk) * rms_norm(q, null), k = (1/sqrt(dk)) * rms_norm(k, null)
         // Scale scalars + the parameter-free rms_norm ones-weight (mlx-c
         // requires a non-empty weight) are cached on the Transformer — they
         // used to be rebuilt every layer every decode step.
@@ -12666,27 +12672,113 @@ pub const Transformer = struct {
         }
         const inv_scale_sq = self.gdn_q_scale.?;
         const inv_sqrt_sc = self.gdn_k_scale.?;
-        if (self.gdn_ones_w == null) {
-            const ones_shape = [_]c_int{dk};
-            var w = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_ones(&w, &ones_shape, 1, .bfloat16, self.s));
-            self.gdn_ones_w = w;
-        }
-        const ones_w = self.gdn_ones_w.?;
 
-        var q_norm = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q_norm);
-        try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, ones_w, 1e-6, self.s));
         var q_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_scaled);
-        try mlx.check(mlx.mlx_multiply(&q_scaled, q_norm, inv_scale_sq, self.s));
-
-        var k_norm = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_norm);
-        try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, ones_w, 1e-6, self.s));
         var k_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_scaled);
-        try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, self.s));
+        var v_heads = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_heads);
+        var fused_prework = false;
+
+        // Packed prework mixer at verify widths (S 3..9): one launch for
+        // conv + SiLU + split + Q/K norm-and-scale + next conv state. The
+        // per-channel (KDA) gate never lands here — its q/k/v layout is the
+        // same but the composed path is what its parity tests pin.
+        if (!cfg.kda_vector_gate and batch == 1 and kernel == 4 and ssm.initialized) blk: {
+            const pre = (gdnPreworkFused(self.s, qkv, ssm.conv_state, la.conv1d_w, inv_scale_sq, inv_sqrt_sc, num_k_heads, num_v_heads, dk, dv, seq_len) catch null) orelse break :blk;
+            // Spec-capture rollback slices the conv INPUT; build the concat
+            // the composed path would have stashed (lazy, one launch).
+            if (self.spec_capture_ssm) {
+                const arr = [_]mlx.mlx_array{ ssm.conv_state, qkv };
+                const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+                ssm.spec_conv_input = mlx.mlx_array_new();
+                mlx.check(mlx.mlx_concatenate_axis(&ssm.spec_conv_input, vec, 1, self.s)) catch {
+                    // Free the fused outputs and fall back to the composed
+                    // chain rather than adopt state with no rollback capture.
+                    _ = mlx.mlx_array_free(pre.q);
+                    _ = mlx.mlx_array_free(pre.k);
+                    _ = mlx.mlx_array_free(pre.v);
+                    _ = mlx.mlx_array_free(pre.conv_state);
+                    break :blk;
+                };
+            }
+            _ = mlx.mlx_array_free(ssm.conv_state);
+            ssm.conv_state = pre.conv_state;
+            _ = mlx.mlx_array_free(q_scaled);
+            _ = mlx.mlx_array_free(k_scaled);
+            _ = mlx.mlx_array_free(v_heads);
+            q_scaled = pre.q;
+            k_scaled = pre.k;
+            v_heads = pre.v;
+            fused_prework = true;
+        }
+
+        if (!fused_prework) {
+            // Conv1d with cache: prepend conv_state, apply depthwise conv + silu
+            const conv_out = try self.conv1dWithCache(qkv, la.conv1d_w, null, ssm, batch, conv_dim, kernel, true);
+            defer _ = mlx.mlx_array_free(conv_out);
+
+            // Split conv output into Q, K, V
+            // Q: [B, S, key_dim] → [B, S, num_k_heads, dk]
+            // K: [B, S, key_dim] → [B, S, num_k_heads, dk]
+            // V: [B, S, value_dim] → [B, S, num_v_heads, dv]
+            const strides3 = [_]c_int{ 1, 1, 1 };
+            var q_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_flat);
+            {
+                const start = [_]c_int{ 0, 0, 0 };
+                const stop = [_]c_int{ batch, seq_len, key_dim };
+                try mlx.check(mlx.mlx_slice(&q_flat, conv_out, &start, 3, &stop, 3, &strides3, 3, self.s));
+            }
+            var k_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_flat);
+            {
+                const start = [_]c_int{ 0, 0, key_dim };
+                const stop = [_]c_int{ batch, seq_len, key_dim * 2 };
+                try mlx.check(mlx.mlx_slice(&k_flat, conv_out, &start, 3, &stop, 3, &strides3, 3, self.s));
+            }
+            var v_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_flat);
+            {
+                const start = [_]c_int{ 0, 0, key_dim * 2 };
+                const stop = [_]c_int{ batch, seq_len, key_dim * 2 + value_dim };
+                try mlx.check(mlx.mlx_slice(&v_flat, conv_out, &start, 3, &stop, 3, &strides3, 3, self.s));
+            }
+
+            // Reshape to head dims
+            const q_shape = [_]c_int{ batch, seq_len, num_k_heads, dk };
+            const k_shape = [_]c_int{ batch, seq_len, num_k_heads, dk };
+            const v_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
+            var q_heads = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_heads);
+            var k_heads = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_heads);
+            try mlx.check(mlx.mlx_reshape(&q_heads, q_flat, &q_shape, 4, self.s));
+            try mlx.check(mlx.mlx_reshape(&k_heads, k_flat, &k_shape, 4, self.s));
+            try mlx.check(mlx.mlx_reshape(&v_heads, v_flat, &v_shape, 4, self.s));
+
+            // Q/K normalization: q = (1/dk) * rms_norm(q, null), k = (1/sqrt(dk)) * rms_norm(k, null)
+            if (self.gdn_ones_w == null) {
+                const ones_shape = [_]c_int{dk};
+                var w = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_ones(&w, &ones_shape, 1, .bfloat16, self.s));
+                self.gdn_ones_w = w;
+            }
+            const ones_w = self.gdn_ones_w.?;
+
+            var q_norm = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_norm);
+            try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, ones_w, 1e-6, self.s));
+            try mlx.check(mlx.mlx_multiply(&q_scaled, q_norm, inv_scale_sq, self.s));
+
+            var k_norm = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_norm);
+            try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, ones_w, 1e-6, self.s));
+            try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, self.s));
+        }
 
         // Gating. GatedDeltaNet: g = exp(-exp(A_log) * softplus(a + dt_bias)),
         // one scalar per (token, value head) — one fused kernel via compiled
@@ -16525,6 +16617,7 @@ fn attnDqNvfp4FromEnv() ?i64 {
 const QkAngleSlot = struct {
     offset: c_int = -1,
     rd: c_int = 0,
+    rows: c_int = 0,
     arr: mlx.mlx_array = .{ .ctx = null },
 };
 
@@ -16770,20 +16863,418 @@ pub fn ropeAngleRow(
     offset: c_int,
     allocator: std.mem.Allocator,
 ) !mlx.mlx_array {
+    return ropeAngleRows(s, rd, base, freqs, offset, 1, allocator);
+}
+
+/// Multi-position variant: [rows * rd] f32, row p = the cos|sin row at
+/// position `offset + p` — the probe is a [1,1,rows,rd] stack of ones|zeros
+/// rows, so `mlx_fast_rope` stamps each row at its own position exactly as it
+/// would the real tensor.
+pub fn ropeAngleRows(
+    s: mlx.mlx_stream,
+    rd: c_int,
+    base: mlx.mlx_optional_float,
+    freqs: mlx.mlx_array,
+    offset: c_int,
+    rows: c_int,
+    allocator: std.mem.Allocator,
+) !mlx.mlx_array {
     const n: usize = @intCast(rd);
-    const buf = try allocator.alloc(f32, n);
+    const nrows: usize = @intCast(rows);
+    const buf = try allocator.alloc(f32, n * nrows);
     defer allocator.free(buf);
-    for (buf, 0..) |*v, i| v.* = if (i < n / 2) 1.0 else 0.0;
-    const shape = [_]c_int{ 1, 1, 1, rd };
+    for (buf, 0..) |*v, i| v.* = if ((i % n) < n / 2) 1.0 else 0.0;
+    const shape = [_]c_int{ 1, 1, rows, rd };
     const probe = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
     defer _ = mlx.mlx_array_free(probe);
     var rotated = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rotated);
     try mlx.check(mlx.mlx_fast_rope(&rotated, probe, rd, false, base, 1.0, offset, freqs, s));
     var flat = mlx.mlx_array_new();
-    const flat_shape = [_]c_int{rd};
+    const flat_shape = [_]c_int{rows * rd};
     try mlx.check(mlx.mlx_reshape(&flat, rotated, &flat_shape, 1, s));
     return flat;
+}
+
+// ── Fused QK-norm+RoPE, hd-256 (mlxfast-challenge qwen35_attention_qk_rms_rope port) ──
+//
+// The hd-128 kernel above never fires on qwen3.5/3.6 full-attention layers
+// (every checkpoint in the family is hd 256), so their decode AND verify
+// widths paid the composed per-head RMSNorm → transpose → partial-RoPE chain.
+// This is the 256-wide sibling: 64 threads per (head, position) row, RMS via
+// the same simdgroup-partials tree `rms_single_row` uses, normalized row
+// staged bf16 in threadgroup memory (one rounding — the value the separate
+// rms kernel would have written), then the RD-dim rotation reads the staged
+// row against a PER-POSITION angle table (`ropeAngleRows` probe — the stock
+// kernel's own floats, never re-derived; the challenge computes cos/sin
+// in-kernel, which trusts JIT transcendentals our house rule forbids).
+// Output is head-major [B,H,S,D], so the transposes vanish. Covers S 1..32
+// (verify widths + one-chunk tiny-prompt prefills; challenge raised the same
+// gate 16 -> 32 in 033f622).
+// Bit-identity with the composed chain is the acceptance bar; same kill
+// switch as the 128 kernel (MLX_SERVE_QK_NORM_ROPE_FUSED=0).
+const QK_NORM_ROPE_256_SOURCE =
+    \\constexpr uint HD = 256;
+    \\constexpr uint half_rd = uint(RD) / 2;
+    \\uint row = threadgroup_position_in_grid.x;
+    \\uint tid = thread_position_in_threadgroup.x;
+    \\uint simd_lane = thread_index_in_simdgroup;
+    \\uint simd_group = simdgroup_index_in_threadgroup;
+    \\uint q_rows = uint(HQ) * uint(S);
+    \\bool is_q = row < q_rows;
+    \\uint local_row = is_q ? row : row - q_rows;
+    \\uint head = local_row / uint(S);
+    \\uint seq = local_row % uint(S);
+    \\// Inputs are row-contiguous [1, S, H, 256]; outputs head-major [1, H, S, 256].
+    \\const device T* src = is_q ? (q + (seq * uint(HQ) + head) * HD)
+    \\                           : (k + (seq * uint(HK) + head) * HD);
+    \\const device T* w = is_q ? qw : kw;
+    \\device T* dst = is_q ? (oq + local_row * HD) : (ok + local_row * HD);
+    \\uint base = tid * 4;
+    \\threadgroup float local_sums[32];
+    \\threadgroup float local_inv[1];
+    \\threadgroup T nrm[HD];
+    \\float acc = 0.0f;
+    \\for (uint i = 0; i < 4; ++i) {
+    \\    float v = float(src[base + i]);
+    \\    acc += v * v;
+    \\}
+    \\acc = simd_sum(acc);
+    \\if (simd_group == 0) {
+    \\    local_sums[simd_lane] = 0.0f;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (simd_lane == 0) {
+    \\    local_sums[simd_group] = acc;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (simd_group == 0) {
+    \\    acc = simd_sum(local_sums[simd_lane]);
+    \\    if (simd_lane == 0) {
+    \\        local_inv[0] = metal::precise::rsqrt(acc / float(HD) + float(eps));
+    \\    }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float inv = local_inv[0];
+    \\for (uint i = 0; i < 4; ++i) {
+    \\    nrm[base + i] = w[base + i] * T(float(src[base + i]) * inv);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const device float* arow = angles + seq * uint(RD);
+    \\for (uint i = 0; i < 4; ++i) {
+    \\    uint j = base + i;
+    \\    T r;
+    \\    if (j < half_rd) {
+    \\        r = T(float(nrm[j]) * arow[j] - float(nrm[j + half_rd]) * arow[half_rd + j]);
+    \\    } else if (j < uint(RD)) {
+    \\        r = T(float(nrm[j - half_rd]) * arow[j] + float(nrm[j]) * arow[j - half_rd]);
+    \\    } else {
+    \\        r = nrm[j];
+    \\    }
+    \\    dst[j] = r;
+    \\}
+;
+
+// ── Packed GDN prework mixer (mlxfast-challenge qwen35_packed_gdn_prework port) ──
+//
+// ONE launch replacing the verify-width GDN prework chain — conv-state
+// concat + depthwise conv1d + SiLU + q/k/v split + reshapes + Q/K
+// rmsNorm-and-scale + conv-state slice (~10 dispatches per GDN layer per
+// spec round). Four outputs: normed/scaled Q and K, activated V, and the
+// next 3-row conv state. Unlike the challenge's kernel, `g` and `beta` stay
+// graph ops here: our g chain (bf16 add → f32 exp/log1p/exp → bf16) rides
+// MLX's metallib transcendentals, which a JIT kernel cannot promise to
+// reproduce (house rule), and both are ONE elementwise launch each on
+// [1,S,Hv]. The in-kernel sigmoid (SiLU half) uses MLX's own unary formula
+// (exp-of-abs form) — the challenge swept all 65,280 finite bf16 inputs
+// against it: silu bit-exact everywhere.
+// S >= 3 is a HARD gate: the conv-state copy reads only qkv rows, which is
+// wrong when a state row would come from the OLD conv state. Above 9 no
+// verify width exists. Bit-identity with the composed chain is the
+// acceptance bar; kill switch MLX_SERVE_GDN_PREWORK=0.
+const GDN_PREWORK_SOURCE =
+    \\uint lane = thread_position_in_threadgroup.x;
+    \\uint row = threadgroup_position_in_grid.y;
+    \\uint logical_head = threadgroup_position_in_grid.z;
+    \\constexpr uint q_heads = uint(HK);
+    \\constexpr uint k_head_base = uint(HK);
+    \\constexpr uint v_head_base = 2 * uint(HK);
+    \\bool is_q = logical_head < q_heads;
+    \\bool is_k = logical_head >= k_head_base && logical_head < v_head_base;
+    \\uint head = is_q ? logical_head
+    \\           : (is_k ? logical_head - k_head_base : logical_head - v_head_base);
+    \\uint channel_base = is_q ? head * uint(DK)
+    \\                   : (is_k ? uint(HK) * uint(DK) + head * uint(DK)
+    \\                           : 2 * uint(HK) * uint(DK) + head * uint(DV));
+    \\T activated[4];
+    \\float sumsq = 0.0f;
+    \\for (uint i = 0; i < 4; ++i) {
+    \\    uint channel = channel_base + lane * 4 + i;
+    \\    float acc = 0.0f;
+    \\    for (uint tap = 0; tap < 4; ++tap) {
+    \\        uint input_row = row + tap;
+    \\        const T xv = input_row < uint(NKEEP)
+    \\            ? conv_state[input_row * uint(C) + channel]
+    \\            : qkv[(input_row - uint(NKEEP)) * uint(C) + channel];
+    \\        acc += float(xv) * float(conv_w[channel * 4 + tap]);
+    \\    }
+    \\    const T conv = T(acc);
+    \\    // MLX's unary Sigmoid formula (unary_ops.h), verbatim, in the tensor dtype.
+    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
+    \\    const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+    \\    activated[i] = act;
+    \\    float value = float(act);
+    \\    sumsq += value * value;
+    \\}
+    \\if (is_q || is_k) {
+    \\    sumsq = simd_sum(sumsq);
+    \\    float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+    \\    const T scale = is_q ? q_scale : k_scale;
+    \\    uint out_base = (row * uint(HK) + head) * uint(DK) + lane * 4;
+    \\    for (uint i = 0; i < 4; ++i) {
+    \\        // ones-weight rms_norm rounding (T(x*inv)), then the separate
+    \\        // scalar multiply's rounding — the composed chain's two casts.
+    \\        const T rms = T(1) * T(float(activated[i]) * inv);
+    \\        const T value = scale * rms;
+    \\        if (is_q) {
+    \\            q_out[out_base + i] = value;
+    \\        } else {
+    \\            k_out[out_base + i] = value;
+    \\        }
+    \\    }
+    \\} else {
+    \\    uint out_base = (row * uint(HV) + head) * uint(DV) + lane * 4;
+    \\    for (uint i = 0; i < 4; ++i) {
+    \\        v_out[out_base + i] = activated[i];
+    \\    }
+    \\}
+    \\if (row + uint(NKEEP) >= uint(S)) {
+    \\    uint state_row = row + uint(NKEEP) - uint(S);
+    \\    uint raw_base = row * uint(C) + channel_base + lane * 4;
+    \\    uint state_base = state_row * uint(C) + channel_base + lane * 4;
+    \\    for (uint i = 0; i < 4; ++i) {
+    \\        conv_out[state_base + i] = qkv[raw_base + i];
+    \\    }
+    \\}
+;
+
+var gdn_prework_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var gdn_prework_engaged: bool = false;
+pub var gdn_prework_override: ?bool = null; // test seam
+var gdn_prework_env: ?bool = null;
+
+fn gdnPreworkEnabled() bool {
+    if (gdn_prework_override) |v| return v;
+    if (gdn_prework_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_GDN_PREWORK");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    gdn_prework_env = enabled;
+    return enabled;
+}
+
+fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
+    if (gdn_prework_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale" };
+    const output_names = [_][*:0]const u8{ "q_out", "k_out", "v_out", "conv_out" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "mlxserve_gdn_prework",
+        in_vec,
+        out_vec,
+        GDN_PREWORK_SOURCE,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gdn_prework_kernel = kernel;
+    return kernel;
+}
+
+const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, c: c_int };
+var gdn_prework_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var gdn_prework_cfg_key: GdnPreworkCfgKey = std.mem.zeroes(GdnPreworkCfgKey);
+
+pub const GdnPrework = struct {
+    q: mlx.mlx_array, // [1, S, Hk, 128] normed + scaled
+    k: mlx.mlx_array, // [1, S, Hk, 128] normed + scaled
+    v: mlx.mlx_array, // [1, S, Hv, 128] silu-activated
+    conv_state: mlx.mlx_array, // [1, NKEEP, C] next conv state
+};
+
+/// One fused dispatch for the GDN prework at verify widths (S 3..9, per-head
+/// gate archs only). Null → caller keeps the composed chain. The caller owns
+/// all four outputs (and installs `conv_state` into the SSM cache entry).
+pub fn gdnPreworkFused(
+    s: mlx.mlx_stream,
+    qkv: mlx.mlx_array, // [1, S, C] bf16, row-contiguous
+    conv_state: mlx.mlx_array, // [1, NKEEP, C] bf16
+    conv_w: mlx.mlx_array, // [C, 4, 1] depthwise weight
+    q_scale: mlx.mlx_array, // 0-dim bf16 (1/dk)
+    k_scale: mlx.mlx_array, // 0-dim bf16 (1/sqrt(dk))
+    hk: c_int,
+    hv: c_int,
+    dk: c_int,
+    dv: c_int,
+    seq: c_int,
+) !?GdnPrework {
+    if (!gdnPreworkEnabled()) return null;
+    if (seq < 3 or seq > 9) return null;
+    if (dk != 128 or dv != 128) return null;
+    if (mlx.mlx_array_dtype(qkv) != .bfloat16 or mlx.mlx_array_dtype(conv_state) != .bfloat16) return null;
+    if (mlx.mlx_array_dtype(conv_w) != .bfloat16) return null;
+    const wsh = mlx.getShape(conv_w);
+    if (wsh.len < 2 or wsh[1] != 4) return null;
+    const c_dim: c_int = hk * dk * 2 + hv * dv;
+    const qsh = mlx.getShape(qkv);
+    if (qsh[qsh.len - 1] != c_dim) return null;
+
+    const nkeep: c_int = 3;
+    const key = GdnPreworkCfgKey{ .hk = hk, .hv = hv, .seq = seq, .c = c_dim };
+    if (gdn_prework_cfg == null or !std.meta.eql(gdn_prework_cfg_key, key)) {
+        if (gdn_prework_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        const q_shape = [_]c_int{ 1, seq, hk, dk };
+        const v_shape = [_]c_int{ 1, seq, hv, dv };
+        const st_shape = [_]c_int{ 1, nkeep, c_dim };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &q_shape, 4, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &q_shape, 4, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &v_shape, 4, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &st_shape, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, seq, 2 * hk + hv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HK", hk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HV", hv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", dk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", dv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NKEEP", nkeep));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "C", c_dim));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "S", seq));
+        gdn_prework_cfg = config;
+        gdn_prework_cfg_key = key;
+    }
+
+    const kernel = try getGdnPreworkKernel();
+    const inputs_arr = [_]mlx.mlx_array{ qkv, conv_state, conv_w, q_scale, k_scale };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gdn_prework_cfg.?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 4) return error.MetalKernelBadOutputCount;
+    var out = GdnPrework{
+        .q = mlx.mlx_array_new(),
+        .k = mlx.mlx_array_new(),
+        .v = mlx.mlx_array_new(),
+        .conv_state = mlx.mlx_array_new(),
+    };
+    try mlx.check(mlx.mlx_vector_array_get(&out.q, outputs_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&out.k, outputs_vec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&out.v, outputs_vec, 2));
+    try mlx.check(mlx.mlx_vector_array_get(&out.conv_state, outputs_vec, 3));
+    if (!gdn_prework_engaged) {
+        gdn_prework_engaged = true;
+        log.info("[gdn] packed prework engaged: Hk={d} Hv={d} S={d}\n", .{ hk, hv, seq });
+    }
+    return out;
+}
+
+var qk256_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var qk256_fused_engaged: bool = false;
+
+fn getQkNormRope256Kernel() !mlx.mlx_fast_metal_kernel {
+    if (qk256_fused_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "q", "k", "qw", "kw", "angles", "eps" };
+    const output_names = [_][*:0]const u8{ "oq", "ok" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "mlxserve_qk_norm_rope_256",
+        in_vec,
+        out_vec,
+        QK_NORM_ROPE_256_SOURCE,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qk256_fused_kernel = kernel;
+    return kernel;
+}
+
+const Qk256CfgKey = struct { hq: c_int, hk: c_int, seq: c_int, rd: c_int, dtype: mlx.mlx_dtype };
+var qk256_fused_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var qk256_fused_cfg_key: Qk256CfgKey = std.mem.zeroes(Qk256CfgKey);
+
+/// One fused dispatch for hd-256 heads at S in 1..16: per-head RMSNorm +
+/// partial RoPE for q AND k, emitting the transposed [1,H,S,256] layout.
+/// `angles` is the [S*RD] f32 table from `ropeAngleRows` (row p = position
+/// offset+p). Null → caller keeps the composed chain.
+pub fn fusedQkNormRope256(
+    s: mlx.mlx_stream,
+    q_in: mlx.mlx_array, // [1, S, HQ, 256] (view ok — ensure_row_contiguous materializes)
+    k_in: mlx.mlx_array, // [1, S, HK, 256]
+    q_norm_w: mlx.mlx_array,
+    k_norm_w: mlx.mlx_array,
+    angles: mlx.mlx_array,
+    eps_arr: mlx.mlx_array, // 0-dim f32 scalar
+    hq: c_int,
+    hk: c_int,
+    seq: c_int,
+    rd: c_int,
+) !?[2]mlx.mlx_array {
+    if (!qkNormRopeFusedEnabled()) return null;
+    if (seq < 1 or seq > 32) return null;
+    const dt = mlx.mlx_array_dtype(q_in);
+    if (dt != .bfloat16 or mlx.mlx_array_dtype(k_in) != .bfloat16) return null;
+    // The shuffle-free staged rotation is exact for any even rd <= 256 whose
+    // pair partner stays inside the row; the served geometry is rd=64
+    // (qwen3.5/3.6 partial factor 0.25 x 256).
+    if (rd != 32 and rd != 64 and rd != 128) return null;
+    if (q_norm_w.ctx == null or k_norm_w.ctx == null) return null;
+
+    const key = Qk256CfgKey{ .hq = hq, .hk = hk, .seq = seq, .rd = rd, .dtype = dt };
+    if (qk256_fused_cfg == null or !std.meta.eql(qk256_fused_cfg_key, key)) {
+        if (qk256_fused_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        const oq_shape = [_]c_int{ 1, hq, seq, 256 };
+        const ok_shape = [_]c_int{ 1, hk, seq, 256 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &oq_shape, 4, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ok_shape, 4, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, (hq + hk) * seq * 64, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HQ", hq));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HK", hk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "S", seq));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RD", rd));
+        qk256_fused_cfg = config;
+        qk256_fused_cfg_key = key;
+    }
+
+    const kernel = try getQkNormRope256Kernel();
+    const inputs_arr = [_]mlx.mlx_array{ q_in, k_in, q_norm_w, k_norm_w, angles, eps_arr };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qk256_fused_cfg.?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+    var oq = mlx.mlx_array_new();
+    var ok = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&oq, outputs_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&ok, outputs_vec, 1));
+    if (!qk256_fused_engaged) {
+        qk256_fused_engaged = true;
+        log.info("[attn] fused QK-norm+RoPE (hd-256) engaged: hq={d} hk={d} S={d} rd={d}\n", .{ hq, hk, seq, rd });
+    }
+    return .{ oq, ok };
 }
 
 /// Quantize a dense pre-transposed [in, out] weight into a side copy
@@ -29604,6 +30095,190 @@ test "qk norm rope fused: bit-identical at the qwen geometry (rd=32, strided pos
     }
 }
 
+test "gdn packed prework: bit-identical to the composed chain at S 3..9 (+ decline gates)" {
+    const s = mlx.gpuStream();
+    gdn_prework_override = true;
+    defer gdn_prework_override = null;
+    var prng = std.Random.DefaultPrng.init(0x6D1);
+    const rnd = prng.random();
+
+    const hk: c_int = 2;
+    const hv: c_int = 4;
+    const dk: c_int = 128;
+    const dv: c_int = 128;
+    const c_dim: c_int = hk * dk * 2 + hv * dv;
+    const key_dim: c_int = hk * dk;
+    const value_dim: c_int = hv * dv;
+
+    const q_scale = bf16Scalar(1.0 / 128.0, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const k_scale = bf16Scalar(@sqrt(1.0 / 128.0), s);
+    defer _ = mlx.mlx_array_free(k_scale);
+    var ones_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones_w);
+    const ones_shape = [_]c_int{dk};
+    try mlx.check(mlx.mlx_ones(&ones_w, &ones_shape, 1, .bfloat16, s));
+
+    for ([_]c_int{ 3, 5, 9 }) |seq| {
+        const qkv_shape = [_]c_int{ 1, seq, c_dim };
+        const qkv = try attn256RandBf16(rnd, &qkv_shape, s);
+        defer _ = mlx.mlx_array_free(qkv);
+        const st_shape = [_]c_int{ 1, 3, c_dim };
+        const conv_state = try attn256RandBf16(rnd, &st_shape, s);
+        defer _ = mlx.mlx_array_free(conv_state);
+        const w_shape = [_]c_int{ c_dim, 4, 1 };
+        const conv_w = try attn256RandBf16(rnd, &w_shape, s);
+        defer _ = mlx.mlx_array_free(conv_w);
+
+        const pre = (try gdnPreworkFused(s, qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, dk, dv, seq)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(pre.q);
+        defer _ = mlx.mlx_array_free(pre.k);
+        defer _ = mlx.mlx_array_free(pre.v);
+        defer _ = mlx.mlx_array_free(pre.conv_state);
+
+        // Composed reference — the production chain, op for op.
+        var conv_input = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(conv_input);
+        {
+            const arr = [_]mlx.mlx_array{ conv_state, qkv };
+            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, s));
+        }
+        var ref_state = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_state);
+        {
+            const start = [_]c_int{ 0, seq, 0 };
+            const stop = [_]c_int{ 1, seq + 3, c_dim };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&ref_state, conv_input, &start, 3, &stop, 3, &strides, 3, s));
+        }
+        var conv_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(conv_raw);
+        try mlx.check(mlx.mlx_conv1d(&conv_raw, conv_input, conv_w, 1, 0, 1, c_dim, s));
+        var sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sig);
+        try mlx.check(mlx.mlx_sigmoid(&sig, conv_raw, s));
+        var conv_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(conv_out);
+        try mlx.check(mlx.mlx_multiply(&conv_out, conv_raw, sig, s));
+
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        {
+            var v_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_flat);
+            const start = [_]c_int{ 0, 0, key_dim * 2 };
+            const stop = [_]c_int{ 1, seq, key_dim * 2 + value_dim };
+            try mlx.check(mlx.mlx_slice(&v_flat, conv_out, &start, 3, &stop, 3, &strides3, 3, s));
+            var v_heads = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_heads);
+            const v_shape = [_]c_int{ 1, seq, hv, dv };
+            try mlx.check(mlx.mlx_reshape(&v_heads, v_flat, &v_shape, 4, s));
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.v, v_heads, s));
+        }
+        inline for (.{
+            .{ @as(c_int, 0), key_dim, hk, dk, q_scale, pre.q },
+            .{ key_dim, key_dim * 2, hk, dk, k_scale, pre.k },
+        }) |case| {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const start = [_]c_int{ 0, 0, case[0] };
+            const stop = [_]c_int{ 1, seq, case[1] };
+            try mlx.check(mlx.mlx_slice(&flat, conv_out, &start, 3, &stop, 3, &strides3, 3, s));
+            var heads = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(heads);
+            const h_shape = [_]c_int{ 1, seq, case[2], case[3] };
+            try mlx.check(mlx.mlx_reshape(&heads, flat, &h_shape, 4, s));
+            var nrm = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(nrm);
+            try mlx.check(mlx.mlx_fast_rms_norm(&nrm, heads, ones_w, 1e-6, s));
+            var scaled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(scaled);
+            try mlx.check(mlx.mlx_multiply(&scaled, nrm, case[4], s));
+            try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(case[5], scaled, s));
+        }
+        try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.conv_state, ref_state, s));
+    }
+
+    // Decline gates: S outside 3..9, and non-128 head dims.
+    {
+        const qkv_shape = [_]c_int{ 1, 2, c_dim };
+        const qkv = try attn256RandBf16(rnd, &qkv_shape, s);
+        defer _ = mlx.mlx_array_free(qkv);
+        const st_shape = [_]c_int{ 1, 3, c_dim };
+        const conv_state = try attn256RandBf16(rnd, &st_shape, s);
+        defer _ = mlx.mlx_array_free(conv_state);
+        const w_shape = [_]c_int{ c_dim, 4, 1 };
+        const conv_w = try attn256RandBf16(rnd, &w_shape, s);
+        defer _ = mlx.mlx_array_free(conv_w);
+        try std.testing.expect((try gdnPreworkFused(s, qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, dk, dv, 2)) == null);
+        try std.testing.expect((try gdnPreworkFused(s, qkv, conv_state, conv_w, q_scale, k_scale, hk, hv, 64, dv, 3)) == null);
+    }
+}
+
+test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 incl. strided q" {
+    const s = mlx.gpuStream();
+    qk_fused_override = true;
+    defer qk_fused_override = null;
+    var prng = std.Random.DefaultPrng.init(0x256A);
+    const rnd = prng.random();
+
+    const hq: c_int = 24;
+    const hk: c_int = 4;
+    const rd: c_int = 64;
+    const eps: f32 = 1.0e-6;
+    const eps_arr = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const base = mlx.mlx_optional_float{ .value = 10000000.0, .has_value = true };
+    const no_freqs = mlx.mlx_array{ .ctx = null };
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+
+    for ([_]c_int{ 1, 3, 9, 16, 32 }) |seq| {
+        for ([_]c_int{ 0, 8191 }) |offset| {
+            // q arrives as the attn_output_gate SPLIT view: [1,S,hq,512] with
+            // the first 256 of each 512 being the query half.
+            const qg_shape = [_]c_int{ 1, seq, hq, 512 };
+            const q_gate = try attn256RandBf16(rnd, &qg_shape, s);
+            defer _ = mlx.mlx_array_free(q_gate);
+            var split_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(split_vec);
+            try mlx.check(mlx.mlx_split(&split_vec, q_gate, 2, -1, s));
+            var q_view = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_view);
+            try mlx.check(mlx.mlx_vector_array_get(&q_view, split_vec, 0)); // [1,S,hq,256] strided
+
+            const k_shape = [_]c_int{ 1, seq, hk, 256 };
+            const k = try attn256RandBf16(rnd, &k_shape, s);
+            defer _ = mlx.mlx_array_free(k);
+            const w_shape = [_]c_int{256};
+            const qw = try attn256RandBf16(rnd, &w_shape, s);
+            defer _ = mlx.mlx_array_free(qw);
+            const kw = try attn256RandBf16(rnd, &w_shape, s);
+            defer _ = mlx.mlx_array_free(kw);
+
+            const angles = try ropeAngleRows(s, rd, base, no_freqs, offset, seq, std.testing.allocator);
+            defer _ = mlx.mlx_array_free(angles);
+            const pair = (try fusedQkNormRope256(s, q_view, k, qw, kw, angles, eps_arr, hq, hk, seq, rd)) orelse return error.FusedDeclined;
+            defer _ = mlx.mlx_array_free(pair[0]);
+            defer _ = mlx.mlx_array_free(pair[1]);
+
+            // Composed reference over the SAME inputs (norm → transpose → rope).
+            inline for (.{ .{ q_view, qw, pair[0] }, .{ k, kw, pair[1] } }) |case| {
+                var n = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(n);
+                try mlx.check(mlx.mlx_fast_rms_norm(&n, case[0], case[1], eps, s));
+                var t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(t);
+                try mlx.check(mlx.mlx_transpose_axes(&t, n, &perm, 4, s));
+                var r = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(r);
+                try mlx.check(mlx.mlx_fast_rope(&r, t, rd, false, base, 1.0, offset, no_freqs, s));
+                try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(case[2], r, s));
+            }
+        }
+    }
+}
+
 test "qk norm rope fused: bit-identical to the composed chain (sliding, rd=128)" {
     const s = mlx.gpuStream();
     qk_fused_override = true;
@@ -29933,4 +30608,114 @@ test "every generative forward arm splices vision embeddings" {
     }
     // A scan that matches nothing passes vacuously.
     try testing.expect(checked >= 3);
+}
+
+// ── Chunked vision splice (issue #197) ───────────────────────────────────────
+// A vision prompt prefills in chunks; the splice's row lookup is a cumsum over
+// the CURRENT forward's placeholder mask, so each chunk passes the rows earlier
+// chunks consumed as `row_offset` — a restarted scatter silently reuses the
+// first image rows in every chunk (coherent output, wrong image content).
+
+test "spliceVisionRows: two chunks with row offsets equal the whole-prompt splice" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const hidden: c_int = 4;
+    const seq: c_int = 6;
+    const img_id: u32 = 99;
+    // token ids: [7, 99, 99, 8, 99, 9] — placeholders at 1, 2 (chunk A) and 4
+    // (chunk B), so the boundary lands INSIDE the image row sequence.
+    const ids = [_]i32{ 7, 99, 99, 8, 99, 9 };
+    // h rows: row i filled with i+1 (bf16-exact values).
+    var h_data: [6 * 4]f32 = undefined;
+    for (0..6) |r| for (0..4) |c| {
+        h_data[r * 4 + c] = @floatFromInt(r + 1);
+    };
+    // vision rows: row k filled with 100+k — distinct per row, so a restarted
+    // scatter (row 0 reused in chunk B) produces different bytes.
+    var ve_data: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        ve_data[r * 4 + c] = @floatFromInt(100 + r);
+    };
+    const ve_shape = [_]c_int{ 1, 3, hidden };
+    const ve = mlx.mlx_array_new_data(&ve_data, &ve_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(ve);
+
+    const readRow = struct {
+        fn f(arr: mlx.mlx_array, row: usize, out: *[4]f32, st: mlx.mlx_stream) !void {
+            var f32arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f32arr);
+            try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, st));
+            try mlx.check(mlx.mlx_array_eval(f32arr));
+            const ptr = mlx.mlx_array_data_float32(f32arr).?;
+            for (0..4) |c| out[c] = ptr[row * 4 + c];
+        }
+    }.f;
+
+    // Whole-prompt splice (the reference: what the unchunked path computes).
+    var full_rows: [6][4]f32 = undefined;
+    {
+        const h_shape = [_]c_int{ 1, seq, hidden };
+        const h = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+        const ids_shape = [_]c_int{ 1, seq };
+        const tid = mlx.mlx_array_new_data(&ids, &ids_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tid);
+        const spliced = try Transformer.spliceVisionRows(h, tid, ve, img_id, 0, 0, s);
+        defer _ = mlx.mlx_array_free(spliced);
+        for (0..6) |r| try readRow(spliced, r, &full_rows[r], s);
+    }
+
+    // Chunk A = tokens [0..3), offset 0; chunk B = tokens [3..6), offset 2
+    // (chunk A consumed 2 placeholder rows).
+    const chunks = [_]struct { start: usize, len: c_int, off: usize }{
+        .{ .start = 0, .len = 3, .off = 0 },
+        .{ .start = 3, .len = 3, .off = 2 },
+    };
+    for (chunks) |ck| {
+        const h_shape = [_]c_int{ 1, ck.len, hidden };
+        const h = mlx.mlx_array_new_data(h_data[ck.start * 4 ..].ptr, &h_shape, 3, .float32);
+        const ids_shape = [_]c_int{ 1, ck.len };
+        const tid = mlx.mlx_array_new_data(ids[ck.start..].ptr, &ids_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tid);
+        const spliced = try Transformer.spliceVisionRows(h, tid, ve, img_id, 0, ck.off, s);
+        defer _ = mlx.mlx_array_free(spliced);
+        for (0..@intCast(ck.len)) |r| {
+            var got: [4]f32 = undefined;
+            try readRow(spliced, r, &got, s);
+            for (0..4) |c| try std.testing.expectEqual(full_rows[ck.start + r][c], got[c]);
+        }
+    }
+}
+
+test "spliceVisionRows: audio placeholders share the row stream in prompt order" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const hidden: c_int = 4;
+    const img_id: u32 = 99;
+    const aud_id: u32 = 88;
+    // [99, 7, 88] — image row then audio row from ONE concatenated source.
+    const ids = [_]i32{ 99, 7, 88 };
+    var h_data: [12]f32 = @splat(0);
+    var ve_data: [2 * 4]f32 = undefined;
+    for (0..2) |r| for (0..4) |c| {
+        ve_data[r * 4 + c] = @floatFromInt(50 + r);
+    };
+    const ve_shape = [_]c_int{ 1, 2, hidden };
+    const ve = mlx.mlx_array_new_data(&ve_data, &ve_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(ve);
+    const h_shape = [_]c_int{ 1, 3, hidden };
+    const h = mlx.mlx_array_new_data(&h_data, &h_shape, 3, .float32);
+    const ids_shape = [_]c_int{ 1, 3 };
+    const tid = mlx.mlx_array_new_data(&ids, &ids_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(tid);
+    const spliced = try Transformer.spliceVisionRows(h, tid, ve, img_id, aud_id, 0, s);
+    defer _ = mlx.mlx_array_free(spliced);
+    var f32arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32arr);
+    try mlx.check(mlx.mlx_astype(&f32arr, spliced, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32arr));
+    const ptr = mlx.mlx_array_data_float32(f32arr).?;
+    try std.testing.expectEqual(@as(f32, 50), ptr[0]); // image row 0
+    try std.testing.expectEqual(@as(f32, 0), ptr[4]); // text untouched
+    try std.testing.expectEqual(@as(f32, 51), ptr[8]); // audio row 1
 }
