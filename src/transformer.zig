@@ -4074,6 +4074,12 @@ const FullAttnWeights = struct {
     // latent instead of q/k/v — those three fields stay null-ctx and
     // `mlaAttnWith` runs in place of gatedFullAttnWith. `o_w` holds the
     // checkpoint's `dense` (the output projection) as usual.
+    /// The direct Q projection, used INSTEAD of the q_a/q_b pair when the
+    /// config carries `q_lora_rank: null` (`ModelConfig.mlaHasQLora`). Exactly
+    /// one of `mla_q_direct_w` and `mla_q_a_w` is non-null on an MLA layer.
+    mla_q_direct_w: mlx.mlx_array = .{ .ctx = null },
+    mla_q_direct_s: mlx.mlx_array = .{ .ctx = null },
+    mla_q_direct_b: mlx.mlx_array = .{ .ctx = null },
     mla_q_a_w: mlx.mlx_array = .{ .ctx = null },
     mla_q_a_s: mlx.mlx_array = .{ .ctx = null },
     mla_q_a_b: mlx.mlx_array = .{ .ctx = null },
@@ -11787,12 +11793,21 @@ pub const Transformer = struct {
         const strides3 = [_]c_int{ 1, 1, 1 };
         const strides4 = [_]c_int{ 1, 1, 1, 1 };
 
-        // ── Q: low rank, then split into the non-positional and rope halves.
-        const q_a = try self.qmatmul(x, fa.mla_q_a_w, fa.mla_q_a_s, fa.mla_q_a_b);
-        defer _ = mlx.mlx_array_free(q_a);
-        const q_a_n = try self.rmsNorm(q_a, fa.mla_q_a_norm);
-        defer _ = mlx.mlx_array_free(q_a_n);
-        const q_flat = try self.qmatmul(q_a_n, fa.mla_q_b_w, fa.mla_q_b_s, fa.mla_q_b_b);
+        // ── Q, then split into the non-positional and rope halves.
+        //
+        // Two arms. The low-rank pair (q_a → norm → q_b) is tiny's; a direct
+        // q_proj is flash's, where `q_lora_rank` is null. Both produce the same
+        // [batch, seq, heads * qk_head_dim] flat query, so everything below is
+        // shared — only the projection differs.
+        const q_flat = if (fa.mla_q_direct_w.ctx != null)
+            try self.qmatmul(x, fa.mla_q_direct_w, fa.mla_q_direct_s, fa.mla_q_direct_b)
+        else blk: {
+            const q_a = try self.qmatmul(x, fa.mla_q_a_w, fa.mla_q_a_s, fa.mla_q_a_b);
+            defer _ = mlx.mlx_array_free(q_a);
+            const q_a_n = try self.rmsNorm(q_a, fa.mla_q_a_norm);
+            defer _ = mlx.mlx_array_free(q_a_n);
+            break :blk try self.qmatmul(q_a_n, fa.mla_q_b_w, fa.mla_q_b_s, fa.mla_q_b_b);
+        };
         defer _ = mlx.mlx_array_free(q_flat);
 
         var q_heads = mlx.mlx_array_new();
@@ -14284,12 +14299,28 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 qkv_s[n] = getLayerWeightOpt(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.scales", .{base}) catch unreachable) orelse mlx.mlx_array_new();
                 qkv_b[n] = getLayerWeightOpt(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.biases", .{base}) catch unreachable) orelse mlx.mlx_array_new();
                 if (qkv_s[n].ctx != null) any_scales = true;
-                const conv_base = switch (n) {
+                // The depthwise conv is `<x>_conv1d.conv.weight` in the reference
+                // HF checkpoint, where it sits inside a ShortConvolution module.
+                // mlx-lm's converter flattens that module away and emits
+                // `<x>_conv1d.weight` instead — same [C, 1, K] tensor, one name
+                // segment shorter. Both public MLX Ling-3.0 quants ship the flat
+                // form (djrsystemservices/Ling-3.0-tiny-oQ8e,
+                // d1sl1ke/Ling-3.0-flash-oQ4e-mtp), so a nested-only lookup
+                // aborts the load on every one of them. Prefer the nested name
+                // so reference checkpoints bind exactly as before, then fall
+                // back to the flat one.
+                const conv_nested = switch (n) {
                     0 => "attention.q_conv1d.conv.weight",
                     1 => "attention.k_conv1d.conv.weight",
                     else => "attention.v_conv1d.conv.weight",
                 };
-                conv_w[n] = getLayerWeight(weights, name_buf, prefix, li, conv_base);
+                const conv_flat = switch (n) {
+                    0 => "attention.q_conv1d.weight",
+                    1 => "attention.k_conv1d.weight",
+                    else => "attention.v_conv1d.weight",
+                };
+                conv_w[n] = getLayerWeightOpt(weights, name_buf, prefix, li, conv_nested) orelse
+                    getLayerWeight(weights, name_buf, prefix, li, conv_flat);
             }
             // The three projections must be quantized IDENTICALLY to join. A
             // dense q beside a quantized k gives a triple whose scales cover
@@ -14460,13 +14491,19 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     .g_w = getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
                     .g_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.scales") orelse mlx.mlx_array_new(),
                     .g_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.biases") orelse mlx.mlx_array_new(),
-                    .mla_q_a_w = getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_proj.weight"),
-                    .mla_q_a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.scales") orelse mlx.mlx_array_new(),
-                    .mla_q_a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.biases") orelse mlx.mlx_array_new(),
-                    .mla_q_a_norm = getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_layernorm.weight"),
-                    .mla_q_b_w = getLayerWeight(weights, name_buf, prefix, li, "attention.q_b_proj.weight"),
-                    .mla_q_b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.scales") orelse mlx.mlx_array_new(),
-                    .mla_q_b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.biases") orelse mlx.mlx_array_new(),
+                    // Exactly ONE Q arm per checkpoint: the low-rank pair
+                    // (tiny) or a direct q_proj (flash, `q_lora_rank: null`).
+                    // Asking for the absent one would abort the load.
+                    .mla_q_direct_w = if (config.mlaHasQLora()) mlx.mlx_array_new() else getLayerWeight(weights, name_buf, prefix, li, "attention.q_proj.weight"),
+                    .mla_q_direct_s = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.scales") orelse mlx.mlx_array_new()),
+                    .mla_q_direct_b = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.biases") orelse mlx.mlx_array_new()),
+                    .mla_q_a_w = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_proj.weight") else mlx.mlx_array_new(),
+                    .mla_q_a_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
+                    .mla_q_a_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
+                    .mla_q_a_norm = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_layernorm.weight") else mlx.mlx_array_new(),
+                    .mla_q_b_w = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_b_proj.weight") else mlx.mlx_array_new(),
+                    .mla_q_b_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
+                    .mla_q_b_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
                     .mla_kv_a_w = getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.weight"),
                     .mla_kv_a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.scales") orelse mlx.mlx_array_new(),
                     .mla_kv_a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.biases") orelse mlx.mlx_array_new(),
@@ -14480,6 +14517,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 const fa = &lw.attn.full;
                 try maybeTransposeForBf16(&fa.o_w, fa.o_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.g_w, fa.g_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&fa.mla_q_direct_w, fa.mla_q_direct_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.mla_q_a_w, fa.mla_q_a_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.mla_q_b_w, fa.mla_q_b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&fa.mla_kv_a_w, fa.mla_kv_a_s, &owned_bf16, allocator, s);
@@ -14605,20 +14643,31 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // Routing itself (sigmoid → +bias → group limit → top-k → renorm →
             // routed_scaling_factor) is hy3's chain with the group limit
             // inserted; `moe_n_group`/`moe_topk_group` pick it in moeMLP2.
+            //
+            // mlx-lm's converter renames both banks: it quantizes the router
+            // and keeps its module level, so the router lands at
+            // `mlp.gate.gate_proj.*`, and it stacks the experts under
+            // `mlp.switch_mlp.*`. Resolve each by probing, exactly as laguna
+            // and hy_v3 already do, so reference and converted checkpoints
+            // both bind.
+            const rt = bailingRouterBase(weights, name_buf, prefix, li);
+            const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
+            var rtbuf: [64]u8 = undefined;
+            var exbuf: [64]u8 = undefined;
             lw.mlp = .{
                 .moe = .{
-                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
-                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
-                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
-                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
-                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
-                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .router_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
+                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
                     .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
                     .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
@@ -19738,6 +19787,22 @@ fn lagunaRouterBase(weights: *const Weights, buf: *[256]u8, prefix: []const u8, 
     return if (getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.weight") == null and
         getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.proj.weight") != null)
         "mlp.gate.proj"
+    else
+        "mlp.gate";
+}
+
+/// Resolve the bailing_hybrid MoE router's weight base. The reference Ling-3.0
+/// checkpoint carries a dense `mlp.gate.weight`; mlx-lm's converter quantizes
+/// the router and keeps its module layout, so the same [E, hidden] tensor lands
+/// at `mlp.gate.gate_proj.*` with its own scales and biases
+/// (djrsystemservices/Ling-3.0-tiny-oQ8e, d1sl1ke/Ling-3.0-flash-oQ4e-mtp).
+/// Same shape as lagunaRouterBase: prefer the flat name so reference
+/// checkpoints bind byte-identically, and fall back to it when neither exists
+/// so the MISSING WEIGHT error names the canonical key.
+fn bailingRouterBase(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32) []const u8 {
+    return if (getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.weight") == null and
+        getLayerWeightOpt(weights, buf, prefix, layer, "mlp.gate.gate_proj.weight") != null)
+        "mlp.gate.gate_proj"
     else
         "mlp.gate";
 }
