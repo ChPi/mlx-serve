@@ -8,6 +8,7 @@
 - **Concurrent chats on Qwen 3.5/3.6/3.8 decode together instead of one after another** — 2.76x aggregate throughput at 4 streams.
 - **DFlash 2 draft heads are supported**, and warm turns keep their draft history across the SSD prefix cache instead of drafting blind.
 - **Per-machine tuning**: the Neural Engine share, the draft block size and the speculative depth cap are now measured per chip rather than one number for every Mac in auto mode.
+- **Markdown tables**: chat now render as a real grid instead of monospaced ASCII-art text: bold header row, one divider, no vertical borders, with inline markdown (bold, code, links) rendered inside cells instead of shown as literal characters.
 
 ### Neural Engine prefill
 

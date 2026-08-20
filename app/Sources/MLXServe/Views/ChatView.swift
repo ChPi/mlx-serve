@@ -1555,6 +1555,16 @@ struct ChatDetailView: View {
     // it back into this flag. The Cmd+V attach monitor reads it; on-appear and
     // post-generation code set it true to (re)focus the field.
     @State private var inputFocused = false
+    /// The detail column's measured width — the panel next to the session
+    /// sidebar, not the whole window. Drives `contentWidth` below. Zero until
+    /// `body`'s root view reports its first `onGeometryChange`.
+    @State private var columnWidth: CGFloat = 0
+
+    /// The shared reading measure all three capped sites (transcript,
+    /// composer, empty-state greeting) apply. See `ChatMetrics.contentWidthFraction`.
+    private var contentWidth: CGFloat {
+        columnWidth > 0 ? columnWidth * ChatMetrics.contentWidthFraction : ChatMetrics.contentFallbackWidth
+    }
     @State private var composerHeight: CGFloat = 36
     // The composer's "create mode" (the chip rewired the composer into a
     // generator) is GONE: a media chip navigates to the Create pane, exactly
@@ -2048,7 +2058,7 @@ struct ChatDetailView: View {
         }
         // Same column as the transcript and the composer below it, so the
         // greeting sits over the field rather than spanning the window.
-        .frame(maxWidth: ChatMetrics.contentMaxWidth)
+        .frame(maxWidth: contentWidth)
         .frame(maxWidth: .infinity)
         .padding(.horizontal, ChatMetrics.gutter)
         .padding(.bottom, 22)
@@ -2143,7 +2153,7 @@ struct ChatDetailView: View {
                     }
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
-                    .frame(maxWidth: ChatMetrics.contentMaxWidth)
+                    .frame(maxWidth: contentWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
@@ -2277,7 +2287,7 @@ struct ChatDetailView: View {
                 .composerTipOverlay()
               }   // end else (non-Telegram composer)
             }
-            .frame(maxWidth: ChatMetrics.contentMaxWidth)
+            .frame(maxWidth: contentWidth)
             .frame(maxWidth: .infinity)
             .padding(.horizontal, ChatMetrics.gutter)
             .padding(.vertical, 10)
@@ -2486,6 +2496,9 @@ struct ChatDetailView: View {
             // thing I said HERE".
             composerWalk = .idle
         }
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { columnWidth = $0 }
     }
 
     /// The input field. No background or border of its own — the composer
@@ -4119,10 +4132,12 @@ struct MarkdownText: View {
 
     var body: some View {
         // Fenced code renders as its own view (colors, copy button);
-        // everything between fences stays in ONE text view per run so
-        // drag-selection still crosses paragraphs, lists and tables. See
-        // `MarkdownSegmenter` for why the split is at fences, not at blocks.
-        VStack(alignment: .leading, spacing: 10) {
+        // everything between fences — including tables, rendered as an
+        // `NSTextTable` inside the shared attributed string — stays in ONE
+        // text view per run so drag-selection still crosses paragraphs,
+        // lists, and tables. See `MarkdownSegmenter` for why the split is at
+        // fences, not at blocks.
+        VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
                 switch segment {
                 case .prose(let text):
@@ -4183,8 +4198,6 @@ struct MarkdownText: View {
         if blocks.isEmpty { blocks.append(.prose(source)) }
         return blocks
     }
-
-    enum TableAlignment { case left, right, center }
 
     fileprivate enum Block {
         case paragraph(String)
@@ -4269,17 +4282,6 @@ struct MarkdownText: View {
                 continue
             }
 
-            // Markdown table: a `|`-leading row immediately followed by a separator
-            // row (`|---|---|`, optionally with `:` for alignment). We accept the
-            // looser "must have at least one `|`" form too — many models drop the
-            // leading pipe — but require the separator line to confirm intent so
-            // we don't misinterpret a stray pipe as a table header.
-            if let table = Self.tryParseTable(lines: lines, start: i) {
-                blocks.append(.table(table.headers, table.rows, table.alignments))
-                i = table.end
-                continue
-            }
-
             // Heading
             if line.hasPrefix("#") {
                 let level = line.prefix(while: { $0 == "#" }).count
@@ -4291,6 +4293,16 @@ struct MarkdownText: View {
                         continue
                     }
                 }
+            }
+
+            // Table (GFM pipe table, or the whitespace-aligned pseudo-table
+            // smaller models emit without GFM syntax) — checked before
+            // list-item/paragraph so a `- ` inside a cell or numbered header
+            // doesn't get misread as a list marker.
+            if let table = MarkdownTable.parse(lines: lines, start: i) {
+                blocks.append(.table(table.headers, table.rows, table.alignments))
+                i = table.end
+                continue
             }
 
             // List item
@@ -4334,145 +4346,6 @@ struct MarkdownText: View {
         }
 
         return blocks
-    }
-
-    // MARK: Table parsing
-
-    private struct ParsedTable {
-        let headers: [String]
-        let rows: [[String]]
-        let alignments: [TableAlignment]
-        let end: Int  // index of the line *after* the table
-    }
-
-    /// Detect a GFM-style markdown table starting at `lines[start]`. Requires a
-    /// header row, a separator row of dashes (with optional colons for alignment),
-    /// and zero-or-more data rows. Returns nil if any structural check fails so
-    /// the caller falls through to paragraph handling.
-    private static func tryParseTable(lines: [String], start: Int) -> ParsedTable? {
-        guard start + 1 < lines.count else { return nil }
-        let headerLine = lines[start].trimmingCharacters(in: .whitespaces)
-        let sepLine = lines[start + 1].trimmingCharacters(in: .whitespaces)
-        // First try the strict GFM form (pipes + dashed separator).
-        if headerLine.contains("|"), isTableSeparator(sepLine) {
-            let headers = parseTableRow(headerLine)
-            let alignments = parseTableAlignments(sepLine)
-            guard !headers.isEmpty else { return nil }
-            var rows: [[String]] = []
-            var i = start + 2
-            while i < lines.count {
-                let r = lines[i].trimmingCharacters(in: .whitespaces)
-                guard r.contains("|") else { break }
-                if isTableSeparator(r) { break }
-                rows.append(parseTableRow(r))
-                i += 1
-            }
-            return ParsedTable(headers: headers, rows: rows, alignments: alignments, end: i)
-        }
-        // Fallback: ASCII pseudo-table — many smaller models emit
-        //   Header1   Header2   Header3
-        //   ---------------------------
-        //   value1    value2    value3
-        // i.e. multi-space column separators + a single row of dashes. Detect
-        // it by looking for a header line with at least two 2+-space gaps,
-        // followed by a row that's mostly dashes, followed by data rows that
-        // also have multi-space gaps. We split each row on `\s{2,}` to recover
-        // cells.
-        return tryParseAsciiPseudoTable(lines: lines, start: start)
-    }
-
-    /// Recognise the whitespace-aligned "table" shape smaller models emit when
-    /// asked for tabular data without using GFM pipe syntax. We require a
-    /// dashed-rule line within the next two lines and at least 3 columns in the
-    /// header so we don't false-positive a paragraph that happens to contain a
-    /// double space.
-    private static func tryParseAsciiPseudoTable(lines: [String], start: Int) -> ParsedTable? {
-        let header = lines[start]
-        let headerCells = splitOnDoubleSpace(header)
-        guard headerCells.count >= 2 else { return nil }
-        // Find the separator line — typically immediately next, sometimes after
-        // a blank line. Don't search far so paragraphs don't accidentally match.
-        var sepIdx = start + 1
-        while sepIdx < min(start + 3, lines.count) {
-            let candidate = lines[sepIdx].trimmingCharacters(in: .whitespaces)
-            if isAsciiRule(candidate) { break }
-            if !candidate.isEmpty { return nil }
-            sepIdx += 1
-        }
-        guard sepIdx < lines.count else { return nil }
-        guard isAsciiRule(lines[sepIdx].trimmingCharacters(in: .whitespaces)) else { return nil }
-        // Collect data rows: non-blank, with at least one 2+-space gap, and not
-        // another rule line.
-        var rows: [[String]] = []
-        var i = sepIdx + 1
-        while i < lines.count {
-            let raw = lines[i]
-            let t = raw.trimmingCharacters(in: .whitespaces)
-            if t.isEmpty { i += 1; break }
-            if isAsciiRule(t) { i += 1; break }
-            let cells = splitOnDoubleSpace(raw)
-            // Tolerate single-cell continuation lines (model wrapping a long
-            // cell to the next line) by appending to the previous row's last
-            // cell rather than starting a new row.
-            if cells.count == 1, !rows.isEmpty {
-                rows[rows.count - 1][rows[rows.count - 1].count - 1] += " " + cells[0]
-            } else {
-                rows.append(cells)
-            }
-            i += 1
-        }
-        guard !rows.isEmpty else { return nil }
-        // All-left alignment (we have no `:---:` markers in this format).
-        let alignments = [TableAlignment](repeating: .left, count: headerCells.count)
-        return ParsedTable(headers: headerCells, rows: rows, alignments: alignments, end: i)
-    }
-
-    /// Split on runs of two-or-more whitespace. Trims each cell. Drops the
-    /// empty leading element if the line was indented.
-    private static func splitOnDoubleSpace(_ line: String) -> [String] {
-        let parts = line.components(separatedBy: "  ")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        return parts
-    }
-
-    /// True if the (already-trimmed) line consists entirely of dashes / box-
-    /// drawing chars / spaces and is at least 3 chars long. Catches the
-    /// "----------" rule under header rows in pseudo-tables.
-    private static func isAsciiRule(_ line: String) -> Bool {
-        guard line.count >= 3 else { return false }
-        let allowed: Set<Character> = ["-", "─", "=", " ", "|"]
-        let allAllowed = line.allSatisfy { allowed.contains($0) }
-        let hasDash = line.contains("-") || line.contains("─") || line.contains("=")
-        return allAllowed && hasDash
-    }
-
-    private static func parseTableRow(_ line: String) -> [String] {
-        var t = line.trimmingCharacters(in: .whitespaces)
-        if t.hasPrefix("|") { t.removeFirst() }
-        if t.hasSuffix("|") { t.removeLast() }
-        return t.split(separator: "|", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-    }
-
-    private static func isTableSeparator(_ line: String) -> Bool {
-        let cells = parseTableRow(line)
-        guard !cells.isEmpty else { return false }
-        return cells.allSatisfy { cell in
-            let c = cell.replacingOccurrences(of: " ", with: "")
-            return c.range(of: "^:?-{3,}:?$", options: .regularExpression) != nil
-        }
-    }
-
-    private static func parseTableAlignments(_ line: String) -> [TableAlignment] {
-        return parseTableRow(line).map { cell in
-            let c = cell.replacingOccurrences(of: " ", with: "")
-            let leftColon = c.hasPrefix(":")
-            let rightColon = c.hasSuffix(":")
-            if leftColon && rightColon { return .center }
-            if rightColon { return .right }
-            return .left
-        }
     }
 
     // MARK: NSAttributedString assembly
@@ -4560,6 +4433,9 @@ struct MarkdownText: View {
                 combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
                 result.append(combined)
 
+            case .table(let headers, let rows, let alignments):
+                result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
+
             case .xmlBlock(let content):
                 let p = NSMutableParagraphStyle()
                 p.firstLineHeadIndent = 8
@@ -4572,14 +4448,92 @@ struct MarkdownText: View {
                 ]
                 result.append(NSAttributedString(string: content, attributes: attrs))
 
-            case .table(let headers, let rows, let alignments):
-                result.append(renderTable(
-                    headers: headers,
-                    rows: rows,
-                    alignments: alignments,
-                    theme: theme
-                ))
             }
+        }
+        return result
+    }
+
+    /// Render a table as an `NSTextTable` run appended directly into the
+    /// message's continuous attributed string, so drag-selection and copy
+    /// span prose and table cells together like every other block instead of
+    /// stopping at the table's edge. `NSTextTable` has no "tight to content"
+    /// sizing mode — every column is a percentage of the available width —
+    /// so columns are weighted by content length
+    /// reading column.
+    ///
+    /// Cell content is rendered through `renderCell`, memoized by cell text
+    /// - a table's earlier rows/cells don't change once streamed, only the
+    /// actively-growing last cell does, so this amortizes the per-cell
+    /// markdown/LaTeX-segmentation cost to near zero after the first full
+    /// render instead of repeating it for every unchanged cell on every
+    /// token.
+    private static let cellRenderCache: NSCache<NSString, NSAttributedString> = {
+        let c = NSCache<NSString, NSAttributedString>()
+        c.countLimit = 2048
+        return c
+    }()
+
+    private static func renderCell(_ text: String, theme: LaTeXTheme, bold: Bool) -> NSAttributedString {
+        let key = "\(theme.rawValue)\u{0}\(bold)\u{0}\(text)" as NSString
+        if let hit = cellRenderCache.object(forKey: key) { return hit }
+        let rendered = renderInline(text, theme: theme, weight: bold ? .semibold : .regular)
+        cellRenderCache.setObject(rendered, forKey: key)
+        return rendered
+    }
+
+    private static func renderTable(
+        headers: [String],
+        rows: [[String]],
+        alignments: [TableAlignment],
+        theme: LaTeXTheme
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let cols = headers.count
+        guard cols > 0 else { return result }
+
+        let table = NSTextTable()
+        table.numberOfColumns = cols
+        let fractions = MarkdownTable.columnFractions(headers: headers, rows: rows)
+        let dividerColor = NSColor.separatorColor
+
+        func textAlignment(_ column: Int) -> NSTextAlignment {
+            guard column < alignments.count else { return .left }
+            switch alignments[column] {
+            case .left: return .left
+            case .right: return .right
+            case .center: return .center
+            }
+        }
+
+        func appendRow(_ cells: [String], rowIndex: Int, bold: Bool) {
+            for column in 0..<cols {
+                let text = column < cells.count ? cells[column] : ""
+                let block = NSTextTableBlock(
+                    table: table, startingRow: rowIndex, rowSpan: 1,
+                    startingColumn: column, columnSpan: 1
+                )
+                block.setContentWidth(Double(fractions[column]) * 100, type: .percentageValueType)
+                block.setWidth(6, type: .absoluteValueType, for: .padding)
+                // Divider under the header row only — no vertical borders,
+                // no rules between data rows, matching the "minimal GFM"
+                // look chat UIs use.
+                if rowIndex == 0 {
+                    block.setBorderColor(dividerColor, for: .maxY)
+                    block.setWidth(1, type: .absoluteValueType, for: .border, edge: .maxY)
+                }
+                let pStyle = NSMutableParagraphStyle()
+                pStyle.textBlocks = [block]
+                pStyle.alignment = textAlignment(column)
+                let cell = NSMutableAttributedString(attributedString: renderCell(text, theme: theme, bold: bold))
+                cell.append(NSAttributedString(string: "\n"))
+                cell.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: cell.length))
+                result.append(cell)
+            }
+        }
+
+        appendRow(headers, rowIndex: 0, bold: true)
+        for (index, row) in rows.enumerated() {
+            appendRow(row, rowIndex: index + 1, bold: false)
         }
         return result
     }
@@ -4608,13 +4562,13 @@ struct MarkdownText: View {
         let latex: String
         let raw: String
     }
-
-    private static func renderInline(
+    static func renderInline(
         _ text: String,
         theme: LaTeXTheme,
+        weight: NSFont.Weight = .regular,
         fontSize: CGFloat = ChatMetrics.transcriptFontSize
     ) -> NSAttributedString {
-        let bodyFont = NSFont.systemFont(ofSize: fontSize)
+        let bodyFont = NSFont.systemFont(ofSize: fontSize, weight: weight)
         let prepared = inlineMathPlaceholders(in: text)
         var result = markdownAttributedString(prepared.source)
 
@@ -4764,129 +4718,6 @@ struct MarkdownText: View {
         }
     }
 
-    /// Render a markdown table as monospaced columns padded to the widest cell
-    /// per column. Header row gets a bold font; a horizontal rule separates the
-    /// header from the data rows. Looks great in a chat bubble and stays
-    /// selectable as part of the surrounding text.
-    private static func renderTable(
-        headers: [String],
-        rows: [[String]],
-        alignments: [TableAlignment],
-        theme: LaTeXTheme
-    ) -> NSAttributedString {
-        let cols = headers.count
-        var widths = [Int](repeating: 0, count: cols)
-        let allRows = [headers] + rows
-        for row in allRows {
-            for (j, cell) in row.prefix(cols).enumerated() {
-                widths[j] = max(widths[j], cell.count)
-            }
-        }
-        // Pad cells with at least 1 space so columns don't visually merge.
-        for j in 0..<cols { widths[j] = max(widths[j], 1) }
-
-        func pad(_ cell: String, width: Int, align: TableAlignment) -> String {
-            let gap = width - cell.count
-            if gap <= 0 { return cell }
-            switch align {
-            case .left:   return cell + String(repeating: " ", count: gap)
-            case .right:  return String(repeating: " ", count: gap) + cell
-            case .center:
-                let l = gap / 2
-                return String(repeating: " ", count: l) + cell + String(repeating: " ", count: gap - l)
-            }
-        }
-
-        func formatRow(_ cells: [String]) -> String {
-            var padded = cells
-            while padded.count < cols { padded.append("") }
-            return padded.prefix(cols).enumerated().map { idx, cell in
-                let a = idx < alignments.count ? alignments[idx] : .left
-                return pad(cell, width: widths[idx], align: a)
-            }.joined(separator: "  ")
-        }
-
-        // A table is column-aligned with padded spaces, so it must be the same
-        // monospaced size as a fenced block or the columns stop lining up with
-        // the code around them.
-        let mono = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular)
-        let monoBold = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .semibold)
-        let result = NSMutableAttributedString()
-
-        // Header row (bold) + horizontal rule using box-drawing chars. Explicit
-        // `.foregroundColor: .labelColor` so the table flips light/dark with
-        // the system mode — without it some macOS versions render the cells
-        // in the captured static color from the AttributedString bridge.
-        let headerLine = formatRow(headers) + "\n"
-        result.append(NSAttributedString(string: headerLine, attributes: [
-            .font: monoBold,
-            .foregroundColor: NSColor.labelColor,
-        ]))
-        let rule = widths.map { String(repeating: "─", count: $0) }.joined(separator: "  ") + "\n"
-        result.append(NSAttributedString(string: rule, attributes: [
-            .font: mono,
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]))
-        // Data rows.
-        for (idx, row) in rows.enumerated() {
-            let line = formatRow(row) + (idx == rows.count - 1 ? "" : "\n")
-            result.append(NSAttributedString(string: line, attributes: [
-                .font: mono,
-                .foregroundColor: NSColor.labelColor,
-            ]))
-        }
-        replaceInlineMathAttachments(
-            in: result,
-            theme: theme,
-            fontSize: ChatMetrics.transcriptCodeFontSize
-        )
-        return result
-    }
-
-    /// Tables deliberately keep their raw monospaced layout instead of going
-    /// through Foundation's Markdown parser. Replace only math segments after
-    /// that layout is assembled; backtick spans remain literal because the
-    /// segmenter excludes them before ranges are collected.
-    private static func replaceInlineMathAttachments(
-        in result: NSMutableAttributedString,
-        theme: LaTeXTheme,
-        fontSize: CGFloat
-    ) {
-        var utf16Offset = 0
-        var replacements: [(range: NSRange, latex: String, raw: String)] = []
-
-        for segment in LaTeXSegmenter.segments(result.string) {
-            switch segment {
-            case .text(let text):
-                utf16Offset += (text as NSString).length
-            case .inline(let latex, let raw):
-                let length = (raw as NSString).length
-                replacements.append((NSRange(location: utf16Offset, length: length), latex, raw))
-                utf16Offset += length
-            case .display(_, let raw):
-                utf16Offset += (raw as NSString).length
-            }
-        }
-
-        for replacement in replacements.reversed() {
-            guard let rendered = InlineLaTeXRenderer.attributedAttachment(
-                latex: replacement.latex,
-                raw: replacement.raw,
-                theme: theme,
-                fontSize: fontSize
-            ) else { continue }
-            let inherited = result.attributes(
-                at: replacement.range.location,
-                effectiveRange: nil
-            )
-            let inserted = NSMutableAttributedString(attributedString: rendered)
-            inserted.addAttributes(
-                inherited,
-                range: NSRange(location: 0, length: inserted.length)
-            )
-            result.replaceCharacters(in: replacement.range, with: inserted)
-        }
-    }
 }
 
 /// A complete display equation is its own horizontally scrollable surface.
