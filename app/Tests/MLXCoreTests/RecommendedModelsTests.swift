@@ -336,7 +336,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testDeepseekV4FlashIsTheNativeMlxMirror() {
         let ds4 = RecommendedModelPick.deepseekV4Flash
         XCTAssertEqual(ds4.family, .largest)
-        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit")
+        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw")
         XCTAssertNil(ds4.ggufFilename, "the native MLX mirror fetches the whole safetensors repo")
         XCTAssertEqual(ds4.approxRAMNeededGB, 128.0)
         XCTAssertTrue(ds4.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
@@ -407,6 +407,7 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(label("mlx-community/gemma-4-31b-it-8bit"), "8-bit")
         XCTAssertEqual(label("mlx-community/Hy3-oQ2e"), "oQ2e")
         XCTAssertEqual(label("ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit"), "mixed 2/3/8-bit")
+        XCTAssertEqual(label("ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw"), "iQ-MLX 3.3 bpw")
         XCTAssertEqual(label("poolside/Laguna-S-2.1-NVFP4-mlx"), "NVFP4")
         XCTAssertEqual(label("x/y", gguf: "model-Q4_K_M.gguf"), "Q4_K_M")
         XCTAssertNil(label("x/plain-model"))

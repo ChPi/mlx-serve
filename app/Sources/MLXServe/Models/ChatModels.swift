@@ -1105,9 +1105,9 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
     GemmaModelOption(
         id: "dsv4-flash-mlx",
-        displayName: "DeepSeek-V4-Flash (MLX native)",
-        repoId: "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit",
-        sizeEstimate: "~118 GB, needs 128 GB RAM",
+        displayName: "DeepSeek-V4-Flash (iQ-MLX 3.3 bpw)",
+        repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
+        sizeEstimate: "~130 GB, needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.

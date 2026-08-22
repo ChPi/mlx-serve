@@ -357,6 +357,7 @@ private struct RecommendedModelTableRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+    @State private var card: ModelCardRequest?
 
     /// How this pick's memory requirement fits the Mac's usable budget.
     private var fit: MemoryFit { memory.fit(neededGB: pick.approxRAMNeededGB) }
@@ -395,26 +396,31 @@ private struct RecommendedModelTableRow: View {
     var body: some View {
         HStack(spacing: RecTableMetrics.spacing) {
             // Model — name + tagline; the full blurb is on hover.
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(pick.name)
-                        .font(.callout.weight(.medium))
-                    if isRecommended {
-                        Text("Recommended")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
-                            .foregroundStyle(.tint)
+            Button { card = ModelCardRequest(repoId: pick.repoId, title: pick.name) } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(pick.name)
+                            .font(.callout.weight(.medium))
+                        if isRecommended {
+                            Text("Recommended")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                                .foregroundStyle(.tint)
+                        }
                     }
+                    Text(pick.tagline)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text(pick.tagline)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(pick.blurb)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .help(pick.blurb)
 
             // Capability — intelligence over speed.
             MiniCapability(pick: pick)
@@ -444,6 +450,7 @@ private struct RecommendedModelTableRow: View {
         .padding(.horizontal, RecTableMetrics.hPad)
         .padding(.vertical, 9)
         .background(isRecommended ? Color.accentColor.opacity(0.07) : Color.clear)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     /// The memory column: how much RAM the model needs, and a colored badge for
@@ -932,6 +939,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
     @State private var confirmDelete = false
+    @State private var card: ModelCardRequest?
 
     private var bundle: MediaBundle { preset.bundle }
     private var isReady: Bool { downloads.bundleReady(bundle) }
@@ -947,6 +955,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
+            Button { card = ModelCardRequest(repoId: bundle.primaryRepo, title: preset.name) } label: {
             VStack(alignment: .leading, spacing: 3) {
                 Text(preset.name)
                     .font(.callout.weight(.medium))
@@ -978,6 +987,9 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                         .lineLimit(1)
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 4) {
@@ -989,6 +1001,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     @ViewBuilder
@@ -1253,10 +1266,12 @@ private struct ModelBrowserRow: View {
     private var isReady: Bool { downloads.isReady(model.id) }
     private var state: DownloadManager.DownloadState? { downloads.downloads[model.id] }
     private var disabled: Bool { !model.isCompatible }
+    @State private var card: ModelCardRequest?
 
     var body: some View {
         HStack(spacing: ModelBrowserMetrics.columnSpacing) {
-            // Model name — takes all remaining space
+            // Model name — takes all remaining space; click opens the card.
+            Button { card = ModelCardRequest(repoId: model.id, title: model.modelName) } label: {
             VStack(alignment: .leading, spacing: 1) {
                 Text(model.modelName)
                     .font(.callout.weight(.medium))
@@ -1274,6 +1289,9 @@ private struct ModelBrowserRow: View {
                     }
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             // Quantization badge
@@ -1339,6 +1357,7 @@ private struct ModelBrowserRow: View {
         .padding(.horizontal, ModelBrowserMetrics.rowPaddingH)
         .padding(.vertical, 6)
         .opacity(disabled ? 0.4 : 1.0)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     private var fitnessColor: Color {
@@ -1746,6 +1765,14 @@ private struct LocalModelRow: View {
     /// only, and a refresh re-locks it. The friction is worth one click; the
     /// old dead badge was not worth anything.
     @State private var unlocked = false
+    @State private var card: ModelCardRequest?
+
+    /// nil for a bare folder that maps to no Hugging Face repo.
+    private var cardRequest: ModelCardRequest? {
+        ModelCard.repoId(localName: model.name).map {
+            ModelCardRequest(repoId: $0, title: ModelDisplayName.pretty(model.displayLabel))
+        }
+    }
 
     private var useState: ModelUseState {
         ModelUseState.resolve(
@@ -1769,6 +1796,7 @@ private struct LocalModelRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            Button { card = cardRequest } label: {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     // The READABLE name. `displayLabel` (the repo id, plus a
@@ -1844,6 +1872,10 @@ private struct LocalModelRow: View {
                     }
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(cardRequest == nil)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(model.sizeFormatted)
@@ -1928,11 +1960,15 @@ private struct LocalModelRow: View {
         } message: {
             Text(ModelRowActions.deleteMessage(model))
         }
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
         .contextMenu {
             if model.isChatPickable, useState == .idle {
                 Button("Use This Model") {
                     appState.selectedModelPath = model.path
                 }
+            }
+            if cardRequest != nil {
+                Button("Model Details\u{2026}") { card = cardRequest }
             }
             Button("Show in Finder", action: revealInFinder)
             Button("Copy Path") {
