@@ -4111,7 +4111,7 @@ test "mtp: a QUANTIZED fc loads verbatim and binds (avlp12 Alis layout)" {
     try testing.expect(!fcMatchesHidden(&m.fc, 8));
 }
 
-test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama -mlx packs)" {
+fn fpSidecarCase(mode: [*:0]const u8, bits: c_int, group: c_int, want: model_mod.QuantMode) !void {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -4122,13 +4122,16 @@ test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama
     const root_len = try tmp_dir.dir.realPath(io, &path_buf);
     const dir_path = path_buf[0..root_len];
 
-    // Ollama's `qwen3.8:27b-mlx` and mlx-community's `*-nvfp4` sidecars ship
-    // nvfp4 (4 bits / group 16): every contracted weight is a `(w, scales)`
-    // PAIR with fp8-encoded uint8 scales and NO `.biases`. `loadLinear` used
-    // to demand `.biases` whenever `.scales` was present, so the whole head
-    // failed with `missing tensor: mtp.fc.biases` and MTP silently disabled.
-    // Hidden 64 so nvfp4's group of 16 divides both 64 and fc's 2H = 128.
-    const H: c_int = 64;
+    // Every fp quant mode ships a `(weight, scales)` PAIR: affine is the only
+    // mode whose checkpoints carry per-group biases. `loadLinear` demanded
+    // `.biases` whenever `.scales` was present, so the whole head failed with
+    // `missing tensor: mtp.fc.biases` and MTP silently disabled — and
+    // `qLinearFwd` then passed a literal "affine" to mlx_quantized_matmul,
+    // which throws over fp8 scales. nvfp4 is the mode that shipped broken
+    // (ollama's `*-mlx` tags, mlx-community's `*-nvfp4`); mxfp4 and mxfp8
+    // are the same bug waiting, so the case runs for all three.
+    // Hidden 128 so every group size under test divides both H and fc's 2H.
+    const H: c_int = 128;
     const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.safetensors", .{dir_path}, 0);
     defer allocator.free(st_path);
     {
@@ -4156,13 +4159,13 @@ test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama
                 defer _ = mlx.mlx_array_free(bf);
                 _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
             }
-            /// nvfp4-quantize a dense weight and insert ONLY `(weight, scales)`.
-            fn putNvfp4(m: mlx.mlx_map_string_to_array, prefix: []const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+            /// fp-quantize a dense weight and insert ONLY `(weight, scales)`.
+            fn putFp(m: mlx.mlx_map_string_to_array, prefix: []const u8, shape: []const c_int, st: mlx.mlx_stream, md: [*:0]const u8, bt: c_int, gp: c_int) !void {
                 const dense = try bf16(shape, st);
                 defer _ = mlx.mlx_array_free(dense);
                 var pair = mlx.mlx_vector_array_new();
                 defer _ = mlx.mlx_vector_array_free(pair);
-                try mlx.check(mlx.mlx_quantize(&pair, dense, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, st));
+                try mlx.check(mlx.mlx_quantize(&pair, dense, mlx.mlx_optional_int.some(gp), mlx.mlx_optional_int.some(bt), md, .{}, st));
                 const suffixes = [_][]const u8{ "weight", "scales" };
                 for (suffixes, 0..) |suf, i| {
                     var a = mlx.mlx_array_new();
@@ -4176,21 +4179,21 @@ test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama
             }
         };
         // fc: [out=H, in=2H] nvfp4, no biases — the tensor that used to fail.
-        try Hlp.putNvfp4(map, "mtp.fc", &.{ H, H * 2 }, s);
+        try Hlp.putFp(map, "mtp.fc", &.{ H, H * 2 }, s, mode, bits, group);
         try Hlp.put(map, "mtp.pre_fc_norm_embedding.weight", &.{H}, s);
         try Hlp.put(map, "mtp.pre_fc_norm_hidden.weight", &.{H}, s);
         try Hlp.put(map, "mtp.norm.weight", &.{H}, s);
         try Hlp.put(map, "mtp.layers.0.input_layernorm.weight", &.{H}, s);
         try Hlp.put(map, "mtp.layers.0.post_attention_layernorm.weight", &.{H}, s);
-        try Hlp.put(map, "mtp.layers.0.self_attn.q_norm.weight", &.{32}, s);
-        try Hlp.put(map, "mtp.layers.0.self_attn.k_norm.weight", &.{32}, s);
-        try Hlp.putNvfp4(map, "mtp.layers.0.self_attn.q_proj", &.{ H, H }, s);
-        try Hlp.putNvfp4(map, "mtp.layers.0.self_attn.k_proj", &.{ 32, H }, s);
-        try Hlp.putNvfp4(map, "mtp.layers.0.self_attn.v_proj", &.{ 32, H }, s);
-        try Hlp.putNvfp4(map, "mtp.layers.0.self_attn.o_proj", &.{ H, H }, s);
-        try Hlp.putNvfp4(map, "mtp.layers.0.mlp.gate_proj", &.{ H, H }, s);
-        try Hlp.putNvfp4(map, "mtp.layers.0.mlp.up_proj", &.{ H, H }, s);
-        try Hlp.putNvfp4(map, "mtp.layers.0.mlp.down_proj", &.{ H, H }, s);
+        try Hlp.put(map, "mtp.layers.0.self_attn.q_norm.weight", &.{64}, s);
+        try Hlp.put(map, "mtp.layers.0.self_attn.k_norm.weight", &.{64}, s);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.q_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.k_proj", &.{ 64, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.v_proj", &.{ 64, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.o_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.gate_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.up_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.down_proj", &.{ H, H }, s, mode, bits, group);
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
 
@@ -4205,18 +4208,18 @@ test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama
 
     // Geometry resolves to nvfp4's 4 bits / group 16, and the mode is carried
     // so `qLinearFwd` does not hand fp8 scales to an "affine" matmul.
-    try testing.expectEqual(@as(u32, 4), m.quant_bits);
-    try testing.expectEqual(@as(u32, 16), m.quant_group_size);
-    try testing.expectEqual(model_mod.QuantMode.nvfp4, m.quant_mode);
+    try testing.expectEqual(@as(u32, @intCast(bits)), m.quant_bits);
+    try testing.expectEqual(@as(u32, @intCast(group)), m.quant_group_size);
+    try testing.expectEqual(want, m.quant_mode);
 
-    // A packed nvfp4 fc still binds against its trunk (group 16 is outside
-    // `affineParamsFromGeometry`'s 32/64/128 set, so the affine solve alone
-    // would reject it).
+    // A packed fp fc still binds against its trunk — nvfp4's group of 16 is
+    // outside `affineParamsFromGeometry`'s 32/64/128 set, so the affine solve
+    // alone would reject it outright.
     try testing.expect(fcMatchesHidden(&m.fc, @intCast(H)));
     try testing.expect(!fcMatchesHidden(&m.fc, @intCast(H * 2)));
 
-    // And the forward actually runs in nvfp4 — an "affine" matmul over
-    // bias-less fp8 scales throws inside MLX.
+    // And the forward actually runs in the checkpoint's own mode — an
+    // "affine" matmul over bias-less fp8 scales throws inside MLX.
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
     const x_shape = [_]c_int{ 1, H * 2 };
@@ -4227,6 +4230,18 @@ test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama
     const y_shape = mlx.getShape(y);
     try testing.expectEqual(@as(c_int, 1), y_shape[0]);
     try testing.expectEqual(H, y_shape[1]);
+}
+
+test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama -mlx packs)" {
+    try fpSidecarCase("nvfp4", 4, 16, .nvfp4);
+}
+
+test "mtp: an mxfp4 sidecar loads bias-less and forwards in its own mode" {
+    try fpSidecarCase("mxfp4", 4, 32, .mxfp4);
+}
+
+test "mtp: an mxfp8 sidecar loads bias-less and forwards in its own mode" {
+    try fpSidecarCase("mxfp8", 8, 32, .mxfp8);
 }
 
 test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible widths stay dense" {
