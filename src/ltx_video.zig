@@ -1619,21 +1619,6 @@ fn addArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
     return o;
 }
 
-/// `[1, Nv, 1]` bf16 selector for the KEYFRAME tokens: 1 where the denoise
-/// mask says a token is clean (supplied by the caller), 0 where it is being
-/// generated. It is the complement of `cond_mask`, so the two can never
-/// disagree about which frames were handed in.
-fn keyframeGate(alloc: std.mem.Allocator, cond_mask: []const f32, s: S) !mlx.mlx_array {
-    const buf = try alloc.alloc(f32, cond_mask.len);
-    defer alloc.free(buf);
-    for (cond_mask, 0..) |m, i| buf[i] = 1.0 - m;
-    const shape = [_]c_int{ 1, @intCast(cond_mask.len), 1 };
-    const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(f32_arr);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s));
-    return out;
-}
 fn mulArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_multiply(&o, x, y, s));
@@ -2681,39 +2666,10 @@ pub fn ditForward(
     var vh = try linBias(comp, alloc, video_latent, "{s}", .{"transformer.patchify_proj"}, s);
     var ah = try linBias(comp, alloc, audio_latent, "{s}", .{"transformer.audio_patchify_proj"}, s);
 
-    // LTX 2.5: a learned row marking, in the reference's words, "tokens whose
-    // latent encodes a single standalone pixel frame" — added to the PROJECTED
-    // hidden immediately after patchify_proj as `h + mask * embedding`
-    // (`transformer_args.apply_keyframes_absolute_embedding`).
-    //
-    // `cond_mask[n] == 0` is exactly that set here: the only conditioning this
-    // engine builds is a first and/or last frame (`keyframeMask`), each
-    // VAE-encoded on its own as a standalone frame and pinned clean by the
-    // denoise loop. Riding the same mask is what keeps the two from ever
-    // disagreeing about which frames were handed in. A future
-    // conditioning shape whose clean tokens come from a multi-frame CLIP would
-    // need its own mask — those tokens are not standalone frames.
-    //
-    // The parameter is zero-initialized upstream, so on a checkpoint that has
-    // not trained it this is an exact no-op; and no conditioning ⇒ no keyframes
-    // ⇒ nothing added, which is why plain text-to-video is byte-unchanged.
-    if (cfg.keyframes_abs_pos) {
-        if (cond_mask) |mask| {
-            if (comp.get("transformer.keyframes_abs_pos_embedding")) |kf| {
-                const gate = try keyframeGate(alloc, mask, s);
-                defer _ = mlx.mlx_array_free(gate);
-                var kf3 = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(kf3);
-                try mlx.check(mlx.mlx_reshape(&kf3, kf, &[_]c_int{ 1, 1, @intCast(vdim) }, 3, s));
-                var scaled = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(scaled);
-                try mlx.check(mlx.mlx_multiply(&scaled, gate, kf3, s));
-                const nv2 = try addArr(vh, scaled, s);
-                _ = mlx.mlx_array_free(vh);
-                vh = nv2;
-            }
-        }
-    }
+    // LTX 2.5's `keyframes_abs_pos_embedding` marks GENERATED keyframe slots
+    // only; given-content tokens (first/last image guidance) are never marked
+    // (reference `extend_keyframes_mask(marked=False)`). This engine builds no
+    // generated slots, so the parameter is never added.
 
     // ── timestep embeddings → adaLN param sets ──
     // Audio / prompt / AV-gate AdaLN ALWAYS use the scalar sigma sinusoids.
@@ -4191,16 +4147,17 @@ pub fn generateVideoFrames(
     defer if (kf) |*c| c.deinit(alloc);
     if (vae_encoder) |venc| if (cond_image != null or last_image != null) {
         if (progress) |p| p.emit("Encoding image", 0, num_steps);
-        kf = try buildKeyframeCond(alloc, venc, cond_image, last_image, noise_v, HW, F, s);
+        kf = try buildKeyframeCond(alloc, venc, cond_image, last_image, noise_v, vpos, H, W, F, num_frames, frame_rate, s);
         log.info("[ltx] keyframe conditioning: first={} last={} ({d} of {d} tokens)\n", .{ cond_image != null, last_image != null, HW * (@as(u32, @intFromBool(cond_image != null)) + @intFromBool(last_image != null)), Nv });
     };
     const clean_v: ?mlx.mlx_array = if (kf) |c| c.clean else null;
     const cond_mask: ?[]const f32 = if (kf) |c| c.mask else null;
     const sampler_v = if (kf) |c| c.init_latent else noise_v;
+    const sampler_vpos = if (kf) |c| c.positions else vpos;
 
     // ── denoise ──
     const total_steps: u32 = @intCast(sigmas.len - 1);
-    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
+    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, sampler_vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
     defer _ = mlx.mlx_array_free(final.v);
     // final.a (audio latent [1, Na, 128]) is transferred to the caller below for
     // optional audio decode; if anything fails before then, free it.
@@ -4211,7 +4168,11 @@ pub fn generateVideoFrames(
 
     // ── decode video → frames ──
     if (progress) |p| p.emit("Decoding video", total_steps, total_steps);
-    const latent = try unpatchifyVideo(final.v, F, H, W, s);
+    const canvas_v = if (kf) |c| try c.trim(final.v, s) else final.v;
+    defer if (kf != null) {
+        _ = mlx.mlx_array_free(canvas_v);
+    };
+    const latent = try unpatchifyVideo(canvas_v, F, H, W, s);
     defer _ = mlx.mlx_array_free(latent);
     const pixels = try vae.decode(alloc, latent, s);
     defer _ = mlx.mlx_array_free(pixels);
@@ -4234,37 +4195,71 @@ pub fn generateVideoFrames(
 
 /// Keyframe conditioning state for one stage (built from the encoded anchor images).
 const KeyframeCond = struct {
-    init_latent: mlx.mlx_array, // [1,Nv,C]: `base` with the anchor ranges replaced
-    clean: mlx.mlx_array, // [1,Nv,C]: anchor tokens, zeros elsewhere
-    mask: []f32, // 0 on the anchor ranges, 1 elsewhere
+    init_latent: mlx.mlx_array, // [1,N,C]: `base` with frame 0 replaced, last-anchor tokens appended
+    clean: mlx.mlx_array, // [1,N,C]: anchor tokens, zeros elsewhere
+    mask: []f32, // 0 on the anchor tokens, 1 elsewhere
+    positions: []f32, // video positions for all N tokens
+    canvas_tokens: u32, // Nv: tokens that survive into the decoder (appended ones are trimmed)
 
     fn deinit(self: *KeyframeCond, alloc: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.init_latent);
         _ = mlx.mlx_array_free(self.clean);
         alloc.free(self.mask);
+        alloc.free(self.positions);
+    }
+
+    /// Drop the appended conditioning tokens from a sampled stream.
+    fn trim(self: KeyframeCond, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        return sliceTokens(x, 0, self.canvas_tokens, s);
     }
 };
 
-/// Denoise mask over `F_lat*HW` video tokens: 0 on every conditioned latent
-/// frame, 1 elsewhere. A first anchor is latent frame 0 (tokens `[0, HW)`),
-/// a last anchor is latent frame `F_lat-1` (the last pixel frame on the
-/// causal VAE, `num_frames = 8k+1`). This is the ONE place keyframe token
-/// ranges are computed; `VideoConditionByLatentIndex` at strength 1.
+/// Denoise mask over the video token stream: 0 on conditioned tokens, 1
+/// elsewhere. A first anchor REPLACES latent frame 0 (tokens `[0, HW)`,
+/// `VideoConditionByLatentIndex`); a last anchor is APPENDED as `HW` extra
+/// tokens after the `F_lat*HW` canvas (`VideoConditionByKeyframeIndex`) —
+/// a standalone-frame latent dropped into slot `F_lat-1` decodes as eight
+/// pixel frames of noise on the causal VAE (#260). This is the ONE place
+/// keyframe token ranges are computed; strength 1.
 pub fn keyframeMask(alloc: std.mem.Allocator, HW: u32, F_lat: u32, has_first: bool, has_last: bool) ![]f32 {
     if (F_lat < 2 and (has_first or has_last)) return error.KeyframeCanvasTooShort;
     const Nv = F_lat * HW;
-    const mask = try alloc.alloc(f32, Nv);
+    const n = Nv + if (has_last) HW else 0;
+    const mask = try alloc.alloc(f32, n);
     @memset(mask, 1.0);
     if (has_first) @memset(mask[0..HW], 0.0);
-    if (has_last) @memset(mask[Nv - HW .. Nv], 0.0);
+    if (has_last) @memset(mask[Nv..n], 0.0);
     return mask;
 }
 
-/// VAE-encode the present anchors and pin them as clean latent frames over
-/// `base` (the noise / noisy tokens for the rest of the canvas).
-fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?mlx.mlx_array, last: ?mlx.mlx_array, base: mlx.mlx_array, HW: u32, F_lat: u32, s: S) !KeyframeCond {
+/// `base` video positions plus `H*W` appended keyframe positions: frame-0's
+/// spatial grid at pixel frame `num_frames-1`, ONE frame wide (reference
+/// `get_pixel_coords(causal_fix=False)` + `frame_idx`, end narrowed to
+/// start+1 for a single-pixel-frame latent, midpoint / fps).
+pub fn keyframePositions(alloc: std.mem.Allocator, base: []const f32, H: u32, W: u32, num_frames: u32, frame_rate: f32) ![]f32 {
+    const HW = H * W;
+    const out = try alloc.alloc(f32, base.len + HW * 3);
+    @memcpy(out[0..base.len], base);
+    const t = (@as(f32, @floatFromInt(num_frames - 1)) + 0.5) / frame_rate;
+    for (0..HW) |i| {
+        const src = base[i * 3 ..][0..3];
+        const dst = out[base.len + i * 3 ..][0..3];
+        dst[0] = t;
+        dst[1] = src[1];
+        dst[2] = src[2];
+    }
+    return out;
+}
+
+/// VAE-encode the present anchors: the first is pinned clean over `base`'s
+/// latent frame 0, the last rides appended clean tokens (see `keyframeMask`).
+/// `positions` is the sampler's video position table for the whole stream.
+fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?mlx.mlx_array, last: ?mlx.mlx_array, base: mlx.mlx_array, vpos: []const f32, H: u32, W: u32, F_lat: u32, num_frames: u32, frame_rate: f32, s: S) !KeyframeCond {
+    const HW = H * W;
     const mask = try keyframeMask(alloc, HW, F_lat, first != null, last != null);
     errdefer alloc.free(mask);
+    const positions = if (last != null) try keyframePositions(alloc, vpos, H, W, num_frames, frame_rate) else try alloc.dupe(f32, vpos);
+    errdefer alloc.free(positions);
     const Nv = F_lat * HW;
 
     const zv = mlx.mlx_array_new_float(0.0);
@@ -4278,24 +4273,35 @@ fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?m
     var clean = try sliceTokens(zeros, 0, Nv, s);
     errdefer _ = mlx.mlx_array_free(clean);
 
-    const anchors = [_]struct { img: ?mlx.mlx_array, start: u32 }{
-        .{ .img = first, .start = 0 },
-        .{ .img = last, .start = Nv - HW },
-    };
-    for (anchors) |a| {
-        const img = a.img orelse continue;
-        const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
-        defer _ = mlx.mlx_array_free(ref_lat);
-        const tokens = try patchifyVideo(ref_lat, s); // [1,HW,128]
+    if (first) |img| {
+        const tokens = try encodeAnchorTokens(venc, img, s);
         defer _ = mlx.mlx_array_free(tokens);
-        const ni = try spliceTokens(init_latent, tokens, a.start, Nv, s);
+        const ni = try spliceTokens(init_latent, tokens, 0, Nv, s);
         _ = mlx.mlx_array_free(init_latent);
         init_latent = ni;
-        const nc = try spliceTokens(clean, tokens, a.start, Nv, s);
+        const nc = try spliceTokens(clean, tokens, 0, Nv, s);
         _ = mlx.mlx_array_free(clean);
         clean = nc;
     }
-    return .{ .init_latent = init_latent, .clean = clean, .mask = mask };
+    if (last) |img| {
+        const tokens = try encodeAnchorTokens(venc, img, s);
+        defer _ = mlx.mlx_array_free(tokens);
+        // Strength 1 ⇒ x_t == clean for these tokens from the first forward on.
+        const ni = try concatTokens(init_latent, tokens, s);
+        _ = mlx.mlx_array_free(init_latent);
+        init_latent = ni;
+        const nc = try concatTokens(clean, tokens, s);
+        _ = mlx.mlx_array_free(clean);
+        clean = nc;
+    }
+    return .{ .init_latent = init_latent, .clean = clean, .mask = mask, .positions = positions, .canvas_tokens = Nv };
+}
+
+/// One anchor image → `[1,HW,128]` clean latent tokens.
+fn encodeAnchorTokens(venc: *const Component, img: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
+    defer _ = mlx.mlx_array_free(ref_lat);
+    return patchifyVideo(ref_lat, s); // [1,HW,128]
 }
 
 /// `x` with tokens `[start, start+len(ins))` replaced by `ins`.
@@ -4310,24 +4316,40 @@ fn spliceTokens(x: mlx.mlx_array, ins: mlx.mlx_array, start: u32, Nv: u32, s: S)
     return concatTokens(head, tail, s);
 }
 
-test "ltx keyframeMask pins first and last latent frames only" {
+test "ltx keyframeMask: first replaces latent frame 0, last is APPENDED" {
     const a = testing.allocator;
     const HW: u32 = 4;
     const m_first = try keyframeMask(a, HW, 3, true, false);
     defer a.free(m_first);
     try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 }, m_first);
+    // A last anchor never touches latent slot F_lat-1 (a standalone-frame
+    // latent there decodes as 8 pixel frames of noise, #260): it rides HW
+    // appended tokens after the canvas, VideoConditionByKeyframeIndex.
     const m_last = try keyframeMask(a, HW, 3, false, true);
     defer a.free(m_last);
-    try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_last);
+    try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_last);
     const m_both = try keyframeMask(a, HW, 3, true, true);
     defer a.free(m_both);
-    try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0 }, m_both);
+    try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_both);
     const m_none = try keyframeMask(a, HW, 1, false, false);
     defer a.free(m_none);
     try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1 }, m_none);
-    // One latent frame cannot hold two anchors (or even one and still generate).
     try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, true, true));
     try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, false, true));
+}
+
+test "ltx keyframePositions: appended tokens sit at pixel frame num_frames-1, one frame wide" {
+    const a = testing.allocator;
+    const base = try computeVideoPositions(a, 2, 1, 2, 24.0);
+    defer a.free(base);
+    const pos = try keyframePositions(a, base, 1, 2, 9, 24.0);
+    defer a.free(pos);
+    try testing.expectEqual(@as(usize, (2 * 2 + 2) * 3), pos.len);
+    try testing.expectEqualSlices(f32, base, pos[0..base.len]);
+    // get_pixel_coords without causal_fix, +frame_idx, end narrowed to
+    // start+1 (num_pixel_frames=1), midpoint / fps; spatial = frame-0 grid.
+    const t: f32 = (8.0 + 0.5) / 24.0;
+    try testing.expectEqualSlices(f32, &[_]f32{ t, 16, 16, t, 16, 48 }, pos[base.len..]);
 }
 
 /// `noise*sigma + clean*(1-sigma)` (flow-matching renoise), bf16 out.
@@ -4455,16 +4477,17 @@ pub fn generateVideoFramesTwoStage(
     defer if (cond1) |*c| c.deinit(alloc);
     if (cond_image_half != null or last_image_half != null) {
         if (progress) |p| p.emit("Encoding image", 0, total);
-        cond1 = try buildKeyframeCond(alloc, vae_encoder, cond_image_half, last_image_half, noise_v1, H1 * W1, F, s);
+        cond1 = try buildKeyframeCond(alloc, vae_encoder, cond_image_half, last_image_half, noise_v1, vpos1, H1, W1, F, num_frames, frame_rate, s);
         log.info("[ltx] keyframe conditioning (stage 1): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_half != null, last_image_half != null, H1 * W1 * (@as(u32, @intFromBool(cond_image_half != null)) + @intFromBool(last_image_half != null)), Nv1 });
     }
 
     const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
+    const stage1_vpos = if (cond1) |c| c.positions else vpos1;
     const win1 = ProgressWindow{ .label = "Stage 1", .base = 0, .total = total };
     const out1 = if (opts.hq)
-        try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, seed, progress, win1, s)
+        try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, stage1_vpos, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, seed, progress, win1, s)
     else
-        try ditSampleCfg(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, progress, win1, s);
+        try ditSampleCfg(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, stage1_vpos, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, progress, win1, s);
     var audio1: ?mlx.mlx_array = out1.a;
     defer if (audio1) |a| {
         _ = mlx.mlx_array_free(a);
@@ -4473,8 +4496,10 @@ pub fn generateVideoFramesTwoStage(
     // ── boundary: unpatchify → denormalize → x2 upsample → renormalize ──
     if (progress) |p| p.emit("Upscaling", opts.stage1_steps, total);
     const video_tokens2 = blk: {
-        const half = try unpatchifyVideo(out1.v, F, H1, W1, s);
-        _ = mlx.mlx_array_free(out1.v);
+        const canvas1 = if (cond1) |c| try c.trim(out1.v, s) else out1.v;
+        if (cond1 != null) _ = mlx.mlx_array_free(out1.v);
+        const half = try unpatchifyVideo(canvas1, F, H1, W1, s);
+        _ = mlx.mlx_array_free(canvas1);
         defer _ = mlx.mlx_array_free(half);
         const denorm = try latentDenormalize(vae_encoder, half, s);
         defer _ = mlx.mlx_array_free(denorm);
@@ -4502,10 +4527,13 @@ pub fn generateVideoFramesTwoStage(
     const noisy_v2 = try lerpToSigma(video_tokens2, noise_v2, start_sigma, s);
     defer _ = mlx.mlx_array_free(noisy_v2);
 
+    const vpos2 = try computeVideoPositions(alloc, F, H2, W2, frame_rate);
+    defer alloc.free(vpos2);
+
     var cond2: ?KeyframeCond = null;
     defer if (cond2) |*c| c.deinit(alloc);
     if (cond_image_full != null or last_image_full != null) {
-        cond2 = try buildKeyframeCond(alloc, vae_encoder, cond_image_full, last_image_full, noisy_v2, H2 * W2, F, s);
+        cond2 = try buildKeyframeCond(alloc, vae_encoder, cond_image_full, last_image_full, noisy_v2, vpos2, H2, W2, F, num_frames, frame_rate, s);
         log.info("[ltx] keyframe conditioning (stage 2): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_full != null, last_image_full != null, H2 * W2 * (@as(u32, @intFromBool(cond_image_full != null)) + @intFromBool(last_image_full != null)), Nv2 });
     }
 
@@ -4515,11 +4543,9 @@ pub fn generateVideoFramesTwoStage(
     const noisy_a2 = try lerpToSigma(audio1.?, noise_a2, start_sigma, s);
     defer _ = mlx.mlx_array_free(noisy_a2);
 
-    const vpos2 = try computeVideoPositions(alloc, F, H2, W2, frame_rate);
-    defer alloc.free(vpos2);
-
     const stage2_v = if (cond2) |c| c.init_latent else noisy_v2;
-    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, vpos2, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
+    const stage2_vpos = if (cond2) |c| c.positions else vpos2;
+    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, stage2_vpos, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
     defer _ = mlx.mlx_array_free(out2.v);
     // stage-2 audio replaces stage-1 as the decoded track.
     _ = mlx.mlx_array_free(audio1.?);
@@ -4531,7 +4557,11 @@ pub fn generateVideoFramesTwoStage(
 
     // ── decode ──
     if (progress) |p| p.emit("Decoding video", total, total);
-    const latent = try unpatchifyVideo(out2.v, F, H2, W2, s);
+    const canvas2 = if (cond2) |c| try c.trim(out2.v, s) else out2.v;
+    defer if (cond2 != null) {
+        _ = mlx.mlx_array_free(canvas2);
+    };
+    const latent = try unpatchifyVideo(canvas2, F, H2, W2, s);
     defer _ = mlx.mlx_array_free(latent);
     const pixels = try vae.decode(alloc, latent, s);
     defer _ = mlx.mlx_array_free(pixels);

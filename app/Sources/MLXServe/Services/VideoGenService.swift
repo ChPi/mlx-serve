@@ -553,6 +553,9 @@ final class VideoGenService: ObservableObject {
         if let path = request.firstFrameImagePath, !path.isEmpty {
             lines.append("first_frame: \(basename(path))")
         }
+        if let path = request.lastFrameImagePath, !path.isEmpty {
+            lines.append("last_frame: \(basename(path))")
+        }
         if hasAudio, let path = request.audioPath {
             lines.append("input_audio: \(basename(path))")
         }
