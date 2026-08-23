@@ -933,6 +933,15 @@ class DownloadManager: ObservableObject {
     /// once the mirrors actually carry the file — before then every tick
     /// alerted on a 404 nobody could fix.
     func startTurboLora(repoId: String, onFinish: @escaping @MainActor () -> Void = {}) {
+        startPackFile(repoId: repoId, fileName: TurboLoraFetch.fileName, onFinish: onFinish)
+    }
+
+    /// Fetch ONE file of a pack that is already on disk, beside its weights:
+    /// the Turbo adapter above, and the ACE-Step cover tokenizer
+    /// (`fsq.safetensors`) for packs downloaded before cover mode — that one
+    /// is TEMPORARY migration code (2026-08-22), to go once installs have
+    /// re-downloaded. Same contract as `startTurboLora`.
+    func startPackFile(repoId: String, fileName: String, onFinish: @escaping @MainActor () -> Void = {}) {
         if let running = activeTasks[repoId] {
             Task { @MainActor in
                 _ = await running.value
@@ -949,10 +958,10 @@ class DownloadManager: ObservableObject {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.download(repoId: repoId,
-                                selection: FileSelection(keepSafetensors: [TurboLoraFetch.fileName]),
+                                selection: FileSelection(keepSafetensors: [fileName]),
                                 alertOnFailure: true,
                                 destDirOverride: packDir)
-            self.finalizeCancelledTurboLora(repoId: repoId, packDir: packDir)
+            self.finalizeCancelledPackFile(repoId: repoId, fileName: fileName, packDir: packDir)
             self.turboLoraFetches.remove(repoId)
             self.activeTasks.removeValue(forKey: repoId)
             onFinish()
@@ -973,13 +982,13 @@ class DownloadManager: ObservableObject {
         activeTasks[repoId]?.cancel()
     }
 
-    /// Cancel cleanup for a Turbo-adapter fetch: drop the ONE file's partials,
-    /// never the directory — the destination is the pack itself.
-    private func finalizeCancelledTurboLora(repoId: String, packDir: String?) {
+    /// Cancel cleanup for a single-file pack fetch: drop the ONE file's
+    /// partials, never the directory — the destination is the pack itself.
+    private func finalizeCancelledPackFile(repoId: String, fileName: String, packDir: String?) {
         guard Task.isCancelled else { return }
         downloads.removeValue(forKey: repoId)
         let dir = packDir ?? newLayoutDir(for: repoId)
-        let base = (dir as NSString).appendingPathComponent(TurboLoraFetch.fileName)
+        let base = (dir as NSString).appendingPathComponent(fileName)
         try? FileManager.default.removeItem(atPath: base + ".partial")
         try? FileManager.default.removeItem(atPath: base + ".partial.parts")
     }
