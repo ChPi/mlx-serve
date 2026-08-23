@@ -5137,6 +5137,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // out of prefill_ns below (the decoding slots got the time).
     var interleave_ctx = InterleaveCtx{ .sch = sch };
 
+    // Ownership of the restored spec caches transfers AT THE CALL:
+    // initWithOptions adopts them and frees them via its own errdefers on
+    // any failure past adoption (a mid-prefill disconnect throws
+    // error.Cancelled from its chunk loop). MtpCacheRef/DflashCtx hold the
+    // KVCache BY VALUE, so a second deinit from our errdefers walked freed
+    // mlx handles — SIGSEGV in freeKVEntry (issue #266). Clear FIRST.
+    const dflash_pass = dflash_restored;
+    dflash_restored = null;
+    const mtp_pass = mtp_restored;
+    mtp_restored = null;
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -5180,8 +5190,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // `server.pinPrefillChunk` writes and `checkAttentionMemory`
             // reads, so the forward can never run wider than the bill.
             .pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,
-            .dflash_ctx_restored = dflash_restored,
-            .mtp_cache_restored = mtp_restored,
+            .dflash_ctx_restored = dflash_pass,
+            .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
             // when the client disconnects; the chunk loop checks it between
             // chunks so a ghost 40K prefill stops within one chunk.
@@ -5197,8 +5207,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .logprobs_n = slot.logprobs_n,
         },
     );
-    dflash_restored = null; // ownership transferred to the Generator
-    mtp_restored = null; // ownership transferred to the Generator
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
@@ -5708,6 +5716,27 @@ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefi
     const cp_body = source[cp_start..cp_end];
     try testing.expect(std.mem.indexOf(u8, cp_body, "ssm_entries != null") != null);
     try testing.expect(std.mem.indexOf(u8, cp_body, "cancelledPrefillCommitLen") != null);
+}
+
+test "runPrefill clears restored spec-cache ownership BEFORE Generator.initWithOptions (issue #266)" {
+    // Generator.initWithOptions ADOPTS the hot-cache-restored DFlash/MTP
+    // caches and frees them via its own errdefers on any failure past the
+    // adoption point — a mid-prefill client disconnect throws
+    // error.Cancelled from its chunk loop. MtpCacheRef/DflashCtx hold their
+    // KVCache BY VALUE, so runPrefill's own errdefers then walked the same
+    // entries slice + mlx handles a second time: SIGSEGV in
+    // KVCache.deinit -> freeKVEntry (issue #266, disconnect storms on long
+    // agent prompts). Ownership transfers AT THE CALL, so the locals must
+    // be cleared before the try, never after it.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn runPrefill(") orelse return error.MissingRunPrefill;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingRunPrefillEnd;
+    const body = source[start..end];
+    const call = std.mem.indexOf(u8, body, "try Generator.initWithOptions(") orelse return error.MissingInitCall;
+    const dfl = std.mem.indexOf(u8, body, "dflash_restored = null") orelse return error.MissingDflashClear;
+    const mtp = std.mem.indexOf(u8, body, "mtp_restored = null") orelse return error.MissingMtpClear;
+    try testing.expect(dfl < call);
+    try testing.expect(mtp < call);
 }
 
 test "DFlash gate policy follows effective block width and resolved thinking" {
