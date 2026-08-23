@@ -1584,6 +1584,10 @@ struct ChatDetailView: View {
     // id — the view is reused across tabs).
     @State private var pendingIntentPrompt: IntentPrompt?
     @State private var intentSuppress = SessionIntentSuppression()
+    // Issue #227: built once per messages change, not per body pass. Rebuilding
+    // inside the ForEach handed SwiftUI a fresh array on every layout pass and
+    // the LazyVStack could spin forever.
+    @State private var rows: [ChatRow] = []
 
 
     private var session: ChatSession? {
@@ -2091,7 +2095,7 @@ struct ChatDetailView: View {
             // Messages
                 ScrollView {
                     LazyVStack(spacing: ChatMetrics.transcriptSpacing) {
-                        ForEach(ChatRowBuilder.rows(from: session?.messages ?? [])) { row in
+                        ForEach(rows) { row in
                             switch row {
                             case .message(let m):
                                 MessageBubble(
@@ -2506,6 +2510,9 @@ struct ChatDetailView: View {
                       in: sessionId, selection: appState.sidebarSelection)
             else { return }
             appState.sidebarSelection = collapsed
+        }
+        .onChange(of: session?.messages, initial: true) { _, msgs in
+            rows = ChatRowBuilder.rows(from: msgs ?? [])
         }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
@@ -3946,7 +3953,7 @@ struct MessageBubble: View {
 
 /// A renderable transcript row: a normal message, or a tool call paired with its
 /// result(s) so they show as a single collapsible row instead of two bubbles.
-enum ChatRow: Identifiable {
+enum ChatRow: Identifiable, Equatable {
     case message(ChatMessage)
     case toolCall(call: ChatMessage, results: [ChatMessage])
     var id: UUID {

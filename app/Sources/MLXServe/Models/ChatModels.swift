@@ -232,7 +232,7 @@ struct ChatVideo: Identifiable, Codable, Equatable {
     var frameCount: Int { frames.count }
 }
 
-struct ChatMessage: Identifiable, Codable {
+struct ChatMessage: Identifiable, Codable, Equatable {
     let id: UUID
     var role: Role
     var content: String
