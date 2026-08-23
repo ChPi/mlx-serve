@@ -62,7 +62,6 @@ struct ImageGenSettings: Codable, Equatable {
     var resolutionId: String = ImageModelPreset.flux2Klein4B_Q4.defaultResolution.id
     var steps: Int = 8
     var seed: Int = -1
-    var safeMode: Bool = true
     var keepResident: Bool = false
     /// img2img renoise strength (the source image path itself is transient —
     /// not persisted, like video's first-frame).
@@ -152,7 +151,6 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(String.self, forKey: .resolutionId) { resolutionId = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .steps) { steps = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .safeMode) { safeMode = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .strength) { strength = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .editMode) { editMode = v }

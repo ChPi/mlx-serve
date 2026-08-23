@@ -920,7 +920,7 @@ struct LocalModel: Identifiable, Hashable {
     /// Offerable by chat-model pickers (tray menu, task sheet, auto-select):
     /// a base checkpoint whose architecture serves chat completions. Excludes
     /// drafters, media models (LTX "AudioVideo", FLUX/Krea, Qwen3-TTS,
-    /// Hunyuan3D, AceStep), the Falconsai NSFW classifier ("vit"), and
+    /// Hunyuan3D, AceStep), image classifiers ("vit"), and
     /// embeddings-only "bert" encoders — those live under ~/.mlx-serve/models
     /// as gen-pane / doc-RAG dependencies and load by path, never as the
     /// tray's primary model. The Model Browser's Downloaded tab still lists

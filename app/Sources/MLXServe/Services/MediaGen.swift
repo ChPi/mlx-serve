@@ -1697,9 +1697,6 @@ struct ImageGenRequest {
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
-    /// Apply the server's NSFW content filter (on by default). Off → sends
-    /// `"safety": false` so the server skips it for this request.
-    var safeMode: Bool = true
     /// Image-to-image: path to a source PNG/JPEG. The server resizes it to the
     /// requested resolution, VAE-encodes it, and partially renoises.
     var initImagePath: String? = nil

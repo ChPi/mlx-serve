@@ -13,6 +13,7 @@
 - **Cover a song, or build a track around a vocal.** ACE-Step gained Cover and Vocal to BGM modes plus reference audio for style, all in the Music tab.
 - **Videos that start and end where you say.** LTX takes a last frame next to the first one.
 - **Rewrite with LLM** in the Music tab: the chat model reshapes your style prompt or lyrics to match the loaded model's format, and you edit before applying.
+- **Image content filter removed.** The Safe mode toggle, the `--no-safety` flag and the classifier download are gone. Both are still accepted (`"safety"` in a request, `--no-safety` on the command line) and ignored.
 
 Same models, same Macs, 26.8.9 vs 26.8.10:
 

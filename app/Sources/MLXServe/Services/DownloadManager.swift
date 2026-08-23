@@ -459,36 +459,6 @@ class DownloadManager: ObservableObject {
         return nil
     }
 
-    /// Shared NSFW content-filter classifier (Apache-2.0). The server applies it
-    /// to ALL image generation (Krea license §4.2); auto-downloaded once into
-    /// `~/.mlx-serve/models` and shared across every image model. Original
-    /// public repo — no conversion/hosting; the Zig engine reads it directly.
-    static let nsfwClassifierRepo = "Falconsai/nsfw_image_detection"
-
-    func nsfwClassifierReady() -> Bool {
-        guard let dir = existingModelDir(for: Self.nsfwClassifierRepo) else { return false }
-        return FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("model.safetensors"))
-    }
-
-    /// Best-effort: provision the NSFW classifier in the background if missing.
-    /// Idempotent + quiet (tracked under its own repoId, so it doesn't disturb a
-    /// model's bundle progress); the server fails OPEN until it's present. Safe to
-    /// call on every Image-tab appearance.
-    func ensureNsfwClassifier() {
-        if nsfwClassifierReady() { return }
-        if activeTasks[Self.nsfwClassifierRepo] != nil { return } // already downloading
-        start(repoId: Self.nsfwClassifierRepo) {}
-    }
-
-    /// Repos the app auto-provisions for its own internal use (a "vit"
-    /// architecture the model picker already flags red as "Unsupported",
-    /// since it isn't a chat model) — never something the user chose to
-    /// download, so `discoverLocalModels` drops them before anything renders.
-    /// Matched by `LocalModel.name`, which for the standard nested layout
-    /// (`<root>/<org>/<repo>`) is exactly the `org/repo` string these repoIds
-    /// already are.
-    nonisolated static let internalHelperRepos: Set<String> = [nsfwClassifierRepo]
-
     /// User-configurable extra discovery root. Persisted in UserDefaults under
     /// `customModelPath` so it survives app restarts. The raw stored value is
     /// kept verbatim (we don't erase a broken path) so the user can see and
@@ -1817,7 +1787,6 @@ class DownloadManager: ObservableObject {
         let inFlight = Set(downloads.filter { $0.value.status == .downloading }
             .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
         return Self.clearingInFlightDefects(out, activeDirs: inFlight)
-            .filter { !Self.internalHelperRepos.contains($0.name) }
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.
