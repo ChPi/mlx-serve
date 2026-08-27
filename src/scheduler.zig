@@ -2099,13 +2099,23 @@ fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     return t.ownsModuleDecodeState();
 }
 
+/// Per-SLOT exclusivity: the model's own bit, OR a slot that will drive a
+/// module-owned MTP head (qwen4: `Qwen4Mtp.cache` is one per model). Plain
+/// slots on the same model keep interleaving/batching beside it; two MTP
+/// slots serialize.
+fn slotExclusiveDecode(slot: *const Slot) bool {
+    if (modelExclusiveDecode(slot.model)) return true;
+    const t = slot.model.transformer orelse return false;
+    return slot.enable_mtp and t.qwen4_mtp != null;
+}
+
 /// One pending-drain candidate (or live decoding slot), reduced to what
 /// admission needs: an opaque model identity + the exclusive-decode bit.
 pub const AdmitCand = struct { model: usize, exclusive: bool };
 
-/// FIFO admission for one drain tick. A candidate on an EXCLUSIVE model
-/// admits only if its model is neither among `active` (live decoding slots)
-/// nor already claimed by an earlier admitted exclusive candidate this tick
+/// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
+/// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
+/// admitted exclusive candidate claimed it this tick
 /// (a same-tick sibling is not in `decoding` yet — the claim covers the
 /// window). Non-exclusive candidates always admit — no head-of-line
 /// blocking behind a held exclusive request. Writes admitted candidate
@@ -2117,7 +2127,7 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
     outer: for (cands, 0..) |c, i| {
         if (n >= out.len) break;
         if (c.exclusive) {
-            for (active) |a| if (a.model == c.model) continue :outer;
+            for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
             for (out[0..n]) |j| {
                 if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
             }
@@ -3867,7 +3877,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             var n_live: usize = 0;
             for (sch.decoding.items) |s| {
                 if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
-                if (!modelExclusiveDecode(s.model)) continue;
+                if (!slotExclusiveDecode(s)) continue;
                 if (n_live >= live_buf.len) break;
                 live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
                 n_live += 1;
@@ -3875,7 +3885,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             var cand_buf: [32]AdmitCand = undefined;
             const n_cands = @min(sch.pending.items.len, cand_buf.len);
             for (sch.pending.items[0..n_cands], 0..) |s, i| {
-                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = modelExclusiveDecode(s.model) };
+                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
             }
             var admit_idx: [to_prefill.len]usize = undefined;
             const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
@@ -5056,8 +5066,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // "model's native head" semantics): the server defaults enable_mtp ON for a
     // stage-bearing dsv4, the n-gram prompt gate never touches it, and
     // enable_mtp:false opts out.
+    // Module CLASS (owned or shared-readonly), not ownership alone: qwen4
+    // batches its plain slots but its spec wiring stays the module one.
     const owns_module_state = slot.model.transformer != null and
-        slot.model.transformer.?.ownsModuleDecodeState();
+        slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
         slot.model.transformer.?.dsv4 != null;
     const module_spec_rollback = slot.model.transformer != null and
@@ -5939,7 +5951,6 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         const gen = &slot.legacy_gen.?;
         next_tokens[i] = gen.next_token_id;
         ctxs[i] = &gen.ctx;
-        rope_offsets[i] = @intCast(slot.cache.step);
     }
 
     // Two batched kernels: the standard one, and the GatedDeltaNet twin for
@@ -5947,6 +5958,11 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // the gate — a slot that has not prefilled yet carries no recurrent state
     // to merge, so that tick stays serial rather than merging a wrong width.
     const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
+    // Position source is per PATH: a GDN trunk positions from the slot's
+    // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
+    // linear layer there, so it reads 0 forever and every batched token was
+    // roped at position 0 (qwen3_5 batched diverged from serial at token 14).
+    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn) slot.moe_seq_offset else slot.cache.step);
     if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
         // A slot with no recurrent state yet cannot join the merge. Decode the
         // group serially this tick instead of skipping it — skipping advances
@@ -5962,6 +5978,10 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         for (logits_arr) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits_arr);
     }
+    // The batched forward advances only its scratch offset; each slot's own
+    // position moves here so a slot leaving the batch resumes serial from
+    // the right place (qwen4's QSA reads it for kv length + tail rule).
+    for (batch) |slot| slot.moe_seq_offset += 1;
 
     // Sample per slot, emit prev id, set new next_token_id.
     for (batch, 0..) |slot, i| {
@@ -6251,6 +6271,38 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         dense.model_type = "qwen3";
         try testing.expect(!dense.supportsBatchedGdnDecode());
     }
+    {
+        // qwen4_exp: MoE, but every per-slot piece is on the SSMCacheEntry.
+        var q4 = std.mem.zeroes(model_mod.ModelConfig);
+        q4.model_type = "qwen4_exp";
+        q4.full_attention_interval = 4;
+        q4.num_experts = 256;
+        q4.num_experts_per_tok = 8;
+        try testing.expect(q4.supportsBatchedGdnDecode());
+    }
+}
+
+test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its own class" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    // An MTP candidate beside a live PLAIN slot on the same model admits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = false }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+    }
+    // An MTP candidate beside a live MTP slot holds.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+    }
+    // A plain candidate beside a live MTP slot admits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+    }
 }
 
 test "admitPendingTick: exclusive single-flight FIFO contract" {
@@ -6341,8 +6393,9 @@ test "inferenceLoop pending drain routes through admitPendingTick" {
     const src = @embedFile("scheduler.zig");
     const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
     try testing.expect(std.mem.indexOf(u8, src, call) != null);
-    // The candidates' exclusive bit must come from the model predicate.
-    const pred = ".exclusive = modelExclusiveDecode(" ++ "s.model)";
+    // The candidates' exclusive bit must come from the per-slot predicate
+    // (model bit OR a module-owned MTP head on this slot).
+    const pred = ".exclusive = slotExclusiveDecode(" ++ "s)";
     try testing.expect(std.mem.indexOf(u8, src, pred) != null);
     // The pre-gate unconditional drain shape must be GONE — its survival
     // would mean a path still admits without the gate.
@@ -6649,7 +6702,7 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
     }
     // The exclusion must come from the shared predicate, not a new arch list.
-    const from_predicate = "transformer.?.ownsModuleDecode" ++ "State()";
+    const from_predicate = "transformer.?.moduleSpec" ++ "Wiring()";
     try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);
     // The hand-written per-arch conjuncts must be GONE — their survival is how
     // a second module-owned arch gets missed.

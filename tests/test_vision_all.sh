@@ -37,7 +37,7 @@ ARCHS=(
   "qwen3-vl|Vision encoder: Qwen3-VL ViT|mlx-community/Qwen3.5-0.8B-MLX-4bit mlx-community/Qwen3.5-4B-MLX-4bit"
   "muse-glimmer|Vision encoder: Muse-Glimmer ViT|ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit mlx-community/Muse-Glimmer-30B-4bit"
   "lfm2-vl|Vision encoder: LFM2-VL SigLIP2-NaFlex ViT|LiquidAI/LFM2.5-VL-3B-MLX-4bit LiquidAI/LFM2.5-VL-3B-MLX-8bit mlx-community/LFM2.5-VL-1.6B-4bit"
-  "qwen4-exp|Vision encoder: Qwen3-VL ViT|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit-all ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit"
+  "qwen4-exp|Vision encoder: Qwen3-VL ViT|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
 )
 
 if [ ! -f "$IMAGE" ]; then echo "SKIP: fixture $IMAGE missing"; exit 0; fi

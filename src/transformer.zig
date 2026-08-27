@@ -9069,13 +9069,36 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "qwen4" };
+    pub const module_owned_state_fields = [_][]const u8{"dsv4"};
+
+    /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
+    /// n-gram hash + mmapped table). Every per-request thing lives on the
+    /// slot's `SSMCacheEntry` (GDN pair, PLE window + tokens, QSA keys +
+    /// pooled blocks), so slots interleave AND batch freely. The one
+    /// module-owned piece on this arch is the MTP head's cache, and the
+    /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
+    pub const module_shared_readonly_fields = [_][]const u8{"qwen4"};
 
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         inline for (module_owned_state_fields) |f| {
             if (@field(self, f) != null) return true;
         }
         return false;
+    }
+
+    pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
+        inline for (module_shared_readonly_fields) |f| {
+            if (@field(self, f) != null) return true;
+        }
+        return false;
+    }
+
+    /// Spec wiring class: module archs run only their OWN MTP head
+    /// (`moduleStateSpecRollback`), PLD/drafters stay off — unmeasured there.
+    /// Covers both the owned and the shared-readonly lists so a shared arch
+    /// does not fall onto the generic wiring and pick up PLD by default.
+    pub fn moduleSpecWiring(self: *const Transformer) bool {
+        return self.ownsModuleDecodeState() or self.sharesModuleReadonlyState();
     }
 
     /// Can this arch's MODULE-owned decode state be rolled back across a
@@ -10641,9 +10664,10 @@ pub const Transformer = struct {
         defer for (merged) |*m| {
             if (m.conv_state.ctx != null) _ = mlx.mlx_array_free(m.conv_state);
             if (m.ssm_state.ctx != null) _ = mlx.mlx_array_free(m.ssm_state);
+            if (m.aux_state.ctx != null) _ = mlx.mlx_array_free(m.aux_state);
         };
         for (ml, 0..) |*lw, l| {
-            if (!lw.is_linear) continue;
+            if (!lw.is_linear and lw.ple == null) continue;
             merged[l] = try self.mergeSsmAcrossSlots(ctxs, l);
         }
 
@@ -10662,13 +10686,15 @@ pub const Transformer = struct {
             .batch_rope_offsets = rope_offset_arr,
         };
 
-        const logits = try self.forwardMoeWith(&bctx, token_arr);
+        // qwen4_exp rides the same driver: GDN + PLE window merged here, QSA
+        // key histories reached per slot through `batch_slots` (kv differs).
+        const logits = if (self.qwen4 != null) try self.forwardQwen4With(&bctx, token_arr) else try self.forwardMoeWith(&bctx, token_arr);
         defer _ = mlx.mlx_array_free(logits);
 
         // Hand the advanced state back to the slots it came from, as views,
         // and record the handles so next tick can prove nothing moved.
         for (merged, 0..) |*m, li| {
-            if (!ml[li].is_linear) continue;
+            if (!ml[li].is_linear and ml[li].ple == null) continue;
             try self.splitSsmToSlots(m, ctxs, li);
         }
 
@@ -10691,26 +10717,49 @@ pub const Transformer = struct {
     /// `[N, …]` entry. Both halves are concatenated on axis 0 — the batch axis
     /// the recurrence kernel already indexes with `b_idx`.
     fn mergeSsmAcrossSlots(self: *Transformer, ctxs: []const *ForwardCtx, layer: usize) !SSMCacheEntry {
-        var out: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+        const lw = &self.moe_layers.?[layer];
+        var out: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = lw.is_linear };
         errdefer {
-            _ = mlx.mlx_array_free(out.conv_state);
-            _ = mlx.mlx_array_free(out.ssm_state);
+            if (out.conv_state.ctx != null) _ = mlx.mlx_array_free(out.conv_state);
+            if (out.ssm_state.ctx != null) _ = mlx.mlx_array_free(out.ssm_state);
+            if (out.aux_state.ctx != null) _ = mlx.mlx_array_free(out.aux_state);
         }
-        const conv = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
-        defer self.allocator.free(conv);
-        const ssm = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
-        defer self.allocator.free(ssm);
-        for (ctxs, 0..) |c, i| {
-            const e = &c.ssm_entries.?[layer];
-            conv[i] = e.conv_state;
-            ssm[i] = e.ssm_state;
+        const parts = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        defer self.allocator.free(parts);
+        if (lw.is_linear) {
+            for (ctxs, 0..) |c, i| parts[i] = c.ssm_entries.?[layer].conv_state;
+            out.conv_state = try concatAxis0(self.s, parts);
+            for (ctxs, 0..) |c, i| parts[i] = c.ssm_entries.?[layer].ssm_state;
+            out.ssm_state = try concatAxis0(self.s, parts);
         }
-        const cvec = mlx.mlx_vector_array_new_data(conv.ptr, conv.len);
-        defer _ = mlx.mlx_vector_array_free(cvec);
-        try mlx.check(mlx.mlx_concatenate_axis(&out.conv_state, cvec, 0, self.s));
-        const svec = mlx.mlx_vector_array_new_data(ssm.ptr, ssm.len);
-        defer _ = mlx.mlx_vector_array_free(svec);
-        try mlx.check(mlx.mlx_concatenate_axis(&out.ssm_state, svec, 0, self.s));
+        // qwen4 PLE layer: the dilated-conv window rides the same merge.
+        if (lw.ple != null) {
+            for (ctxs, 0..) |c, i| parts[i] = c.ssm_entries.?[layer].aux_state;
+            out.aux_state = try concatAxis0(self.s, parts);
+        }
+        return out;
+    }
+
+    fn concatAxis0(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
+        const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
+        return out;
+    }
+
+    /// Row `i` of a merged `[N, …]` state as an owned view handle.
+    fn rowView(s: mlx.mlx_stream, arr: mlx.mlx_array, i: usize) !mlx.mlx_array {
+        const shape = mlx.getShape(arr);
+        var start: [4]c_int = .{ @intCast(i), 0, 0, 0 };
+        var stop: [4]c_int = .{ @intCast(i + 1), 0, 0, 0 };
+        const strides: [4]c_int = .{ 1, 1, 1, 1 };
+        for (1..shape.len) |d| stop[d] = shape[d];
+        _ = &start;
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_slice(&out, arr, &start, @intCast(shape.len), &stop, @intCast(shape.len), &strides, @intCast(shape.len), s));
         return out;
     }
 
@@ -10735,35 +10784,23 @@ pub const Transformer = struct {
     /// the rollback window closes. Bounded, but it is the same retention
     /// shape as the 3.4x hot-cache under-count.
     fn splitSsmToSlots(self: *Transformer, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize) !void {
-        const cshape = mlx.getShape(m.conv_state);
-        const sshape = mlx.getShape(m.ssm_state);
+        const lw = &self.moe_layers.?[layer];
         for (ctxs, 0..) |c, i| {
-            const i_c: c_int = @intCast(i);
             var e = &c.ssm_entries.?[layer];
-
-            var conv_slice = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(conv_slice);
-            const c_start = [_]c_int{ i_c, 0, 0 };
-            const c_stop = [_]c_int{ i_c + 1, cshape[1], cshape[2] };
-            const c_str = [_]c_int{ 1, 1, 1 };
-            try mlx.check(mlx.mlx_slice(&conv_slice, m.conv_state, &c_start, 3, &c_stop, 3, &c_str, 3, self.s));
-            var conv_own = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&conv_own, conv_slice);
-            if (e.conv_state.ctx != null) _ = mlx.mlx_array_free(e.conv_state);
-            e.conv_state = conv_own;
-
-            var ssm_slice = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(ssm_slice);
-            const s_start = [_]c_int{ i_c, 0, 0, 0 };
-            const s_stop = [_]c_int{ i_c + 1, sshape[1], sshape[2], sshape[3] };
-            const s_str = [_]c_int{ 1, 1, 1, 1 };
-            try mlx.check(mlx.mlx_slice(&ssm_slice, m.ssm_state, &s_start, 4, &s_stop, 4, &s_str, 4, self.s));
-            var ssm_own = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&ssm_own, ssm_slice);
-            if (e.ssm_state.ctx != null) _ = mlx.mlx_array_free(e.ssm_state);
-            e.ssm_state = ssm_own;
-
-            e.initialized = true;
+            if (lw.is_linear) {
+                const conv_own = try rowView(self.s, m.conv_state, i);
+                if (e.conv_state.ctx != null) _ = mlx.mlx_array_free(e.conv_state);
+                e.conv_state = conv_own;
+                const ssm_own = try rowView(self.s, m.ssm_state, i);
+                if (e.ssm_state.ctx != null) _ = mlx.mlx_array_free(e.ssm_state);
+                e.ssm_state = ssm_own;
+                e.initialized = true;
+            }
+            if (lw.ple != null) {
+                const aux_own = try rowView(self.s, m.aux_state, i);
+                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
+                e.aux_state = aux_own;
+            }
         }
     }
 
@@ -10777,6 +10814,9 @@ pub const Transformer = struct {
             const entries = c.ssm_entries orelse return false;
             if (entries.len != ml.len) return false;
             for (ml, 0..) |*lw, i| {
+                // The PLE layer merges its conv window too and reads the
+                // slot's token history — both exist after any prefill.
+                if (lw.ple != null and (entries[i].aux_state.ctx == null or !entries[i].ple_prev_valid)) return false;
                 if (!lw.is_linear) continue;
                 if (!entries[i].initialized) return false;
                 if (entries[i].conv_state.ctx == null or entries[i].ssm_state.ctx == null) return false;
@@ -10804,7 +10844,10 @@ pub const Transformer = struct {
         for (self.moe_layers.?) |*lw| {
             switch (lw.mlp) {
                 .dense => {},
-                .moe => return false,
+                // Routed experts are row-generic (`moeMLP` prefills S rows);
+                // qwen4_exp is the one MoE trunk whose per-slot state this
+                // path models (GDN pair + PLE window + QSA keys).
+                .moe => if (self.qwen4 == null) return false,
             }
         }
         return true;
@@ -11073,44 +11116,9 @@ pub const Transformer = struct {
         return next;
     }
 
-    /// Host-side n-gram gather: `[1, S, ple_embed_dim]` bf16 for this chunk's
-    /// token ids, advancing the entry's 2-token history. Batch 1 only.
-    fn pleEmbedding(self: *Transformer, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, seq_len: c_int) !mlx.mlx_array {
-        const st = self.qwen4.?;
-        const ctx_len: usize = st.hash.ngram_size - 1;
-        // Draft ids arrive as lazy graphs of whatever dtype the sampler
-        // produced: cast + materialize contiguous before the host read.
-        var ids_i32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ids_i32);
-        try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
-        var ids_c = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ids_c);
-        try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, self.s));
-        try mlx.check(mlx.mlx_array_eval(ids_c));
-        const n: usize = @intCast(seq_len);
-        const ids = try self.allocator.alloc(u32, n);
-        defer self.allocator.free(ids);
-        const src = mlx.mlx_array_data_int32(ids_c) orelse return error.TokenIdsUnreadable;
-        for (0..n) |i| ids[i] = @intCast(src[i]);
-        var prev: [8]u32 = @splat(st.hash.eos);
-        if (entry.ple_prev_valid) prev = entry.ple_prev;
-        if (self.spec_capture_ssm and ctx_len + n <= entry.spec_ple_tokens.len) {
-            for (0..ctx_len) |i| entry.spec_ple_tokens[i] = prev[i];
-            for (0..n) |i| entry.spec_ple_tokens[ctx_len + i] = ids[i];
-            entry.spec_ple_len = @intCast(ctx_len + n);
-        } else entry.spec_ple_len = 0;
-        const rows = try self.allocator.alloc(i64, n * st.hash.n_heads);
-        defer self.allocator.free(rows);
-        st.hash.rowIds(prev[0..ctx_len], ids, rows);
-        const emb_dim: usize = st.table.dim * st.hash.n_heads;
-        const host = try self.allocator.alloc(f32, n * emb_dim);
-        defer self.allocator.free(host);
-        var gclk: ProfClock = if (diagEnvOn("QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
-        st.table.gather(rows, host);
-        if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
-        // Advance the history: the last ctx_len tokens of prev ++ ids.
-        var hist: [16]u32 = undefined;
-        for (0..ctx_len) |i| hist[i] = prev[i];
+    /// Advance a PLE entry's (ngram_size-1)-token history past `ids`.
+    fn advancePlePrev(entry: *SSMCacheEntry, prev: [8]u32, ids: []const u32, ctx_len: usize) void {
+        const n = ids.len;
         const tail_from: usize = if (n >= ctx_len) n - ctx_len else 0;
         var k: usize = 0;
         if (n < ctx_len) {
@@ -11123,11 +11131,65 @@ pub const Transformer = struct {
             k += 1;
         }
         entry.ple_prev_valid = true;
+    }
+
+    /// Host-side n-gram gather: `[B, S, ple_embed_dim]` bf16 for this chunk's
+    /// token ids, advancing the token history. Serial: `entry`'s history over
+    /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
+    /// against ITS slot's history (`slots[i].ssm_entries[layer]`), ONE gather
+    /// for all N·heads rows.
+    fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
+        const st = self.qwen4.?;
+        const ctx_len: usize = st.hash.ngram_size - 1;
+        // Draft ids arrive as lazy graphs of whatever dtype the sampler
+        // produced: cast + materialize contiguous before the host read.
+        var ids_i32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_i32);
+        try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
+        var ids_c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_c);
+        try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, self.s));
+        try mlx.check(mlx.mlx_array_eval(ids_c));
+        const n: usize = mlx.mlx_array_size(ids_c);
+        const batch: c_int = @intCast(n / @as(usize, @intCast(seq_len)));
+        const ids = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(ids);
+        const src = mlx.mlx_array_data_int32(ids_c) orelse return error.TokenIdsUnreadable;
+        for (0..n) |i| ids[i] = @intCast(src[i]);
+        const nh = st.hash.n_heads;
+        const rows = try self.allocator.alloc(i64, n * nh);
+        defer self.allocator.free(rows);
+        if (ctx.batch_slots) |slots| {
+            std.debug.assert(seq_len == 1 and n == slots.len);
+            for (slots, 0..) |sc, i| {
+                const e = &sc.ssm_entries.?[layer];
+                std.debug.assert(e.ple_prev_valid); // batchedGdnReady
+                const prev = e.ple_prev;
+                st.hash.rowIds(prev[0..ctx_len], ids[i .. i + 1], rows[i * nh ..][0..nh]);
+                advancePlePrev(e, prev, ids[i .. i + 1], ctx_len);
+            }
+        } else {
+            var prev: [8]u32 = @splat(st.hash.eos);
+            if (entry.ple_prev_valid) prev = entry.ple_prev;
+            if (self.spec_capture_ssm and ctx_len + n <= entry.spec_ple_tokens.len) {
+                for (0..ctx_len) |i| entry.spec_ple_tokens[i] = prev[i];
+                for (0..n) |i| entry.spec_ple_tokens[ctx_len + i] = ids[i];
+                entry.spec_ple_len = @intCast(ctx_len + n);
+            } else entry.spec_ple_len = 0;
+            st.hash.rowIds(prev[0..ctx_len], ids, rows);
+            advancePlePrev(entry, prev, ids, ctx_len);
+        }
+        const emb_dim: usize = st.table.dim * nh;
+        const host = try self.allocator.alloc(f32, n * emb_dim);
+        defer self.allocator.free(host);
+        var gclk: ProfClock = if (diagEnvOn("QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
+        st.table.gather(rows, host);
+        if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
 
         // Pack bf16 on the host (RNE) so the upload is one copy — no
         // mid-graph eval, no GPU sync inside the layer loop.
         if (std.c.getenv("QWEN4_PLE_GPU_CAST") != null) {
-            const shape0 = [_]c_int{ 1, seq_len, @intCast(emb_dim) };
+            const shape0 = [_]c_int{ batch, seq_len, @intCast(emb_dim) };
             const f32_arr = mlx.mlx_array_new_data(host.ptr, &shape0, 3, .float32);
             defer _ = mlx.mlx_array_free(f32_arr);
             var out0 = mlx.mlx_array_new();
@@ -11142,17 +11204,17 @@ pub const Transformer = struct {
             const rounded = u +% 0x7FFF +% ((u >> 16) & 1);
             pk[i] = @intCast(rounded >> 16);
         }
-        const shape = [_]c_int{ 1, seq_len, @intCast(emb_dim) };
+        const shape = [_]c_int{ batch, seq_len, @intCast(emb_dim) };
         return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
     }
 
-    /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend.
-    fn pleForward(self: *Transformer, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, batch: c_int, seq_len: c_int) !mlx.mlx_array {
-        if (batch != 1) return error.Qwen4BatchUnsupported;
+    /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
+    /// decode hands in the MERGED conv window as `entry.aux_state`.
+    fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
         const cfg = &self.config;
         const hc: c_int = @intCast(cfg.hc_count);
         const hidden: c_int = @intCast(cfg.hidden_size);
-        const emb = try self.pleEmbedding(token_ids, entry, seq_len);
+        const emb = try self.pleEmbedding(ctx, token_ids, entry, layer, seq_len);
         defer _ = mlx.mlx_array_free(emb);
         if (qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_emb, emb);
 
@@ -11360,7 +11422,70 @@ pub const Transformer = struct {
     /// coordinates; RoPE angles use absolute positions — the SAME M-RoPE table
     /// as attention on an image request (queries from the chunk's cos/sin,
     /// pooled block keys at 3-D block-start positions), scalar rope otherwise.
-    fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    fn qsaMask(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+        const qk = try self.qmatmul(x, fa.idx_qk_w, fa.idx_qk_s, fa.idx_qk_b); // [B,S,(n+1)*hd]
+        defer _ = mlx.mlx_array_free(qk);
+        if (ctx.batch_slots) |slots| return self.qsaMaskBatched(slots, qk, fa, layer);
+        return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len);
+    }
+
+    /// Batched decode: the indexer projection ran once on `[N,1,·]`; each row
+    /// then walks the serial per-slot body against ITS slot's key history and
+    /// position, and the per-slot masks are false-padded to the group's
+    /// longest kv and stacked to `[N,1,1,kv_max]`. Null-ctx when no slot is
+    /// past the budget (dense group — the plain batched mask suffices).
+    fn qsaMaskBatched(self: *Transformer, slots: []const *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, layer: u32) !mlx.mlx_array {
+        const N = slots.len;
+        const w: c_int = mlx.getShape(qk)[2];
+        const masks = try self.allocator.alloc(mlx.mlx_array, N);
+        defer self.allocator.free(masks);
+        for (masks) |*m| m.* = .{ .ctx = null };
+        defer for (masks) |m| {
+            if (m.ctx != null) _ = mlx.mlx_array_free(m);
+        };
+        const kv_lens = try self.allocator.alloc(c_int, N);
+        defer self.allocator.free(kv_lens);
+        var kv_max: c_int = 0;
+        var any = false;
+        for (slots, 0..) |sc, i| {
+            const e = &sc.ssm_entries.?[layer];
+            const cache_len: c_int = @intCast(sc.moe_seq_offset.*);
+            const i_c: c_int = @intCast(i);
+            var qk_i = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(qk_i);
+            try mlx.check(mlx.mlx_slice(&qk_i, qk, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
+            masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, 0, 1, 1);
+            kv_lens[i] = cache_len + 1;
+            if (kv_lens[i] > kv_max) kv_max = kv_lens[i];
+            if (masks[i].ctx != null) any = true;
+        }
+        if (!any) return mlx.mlx_array_new();
+        const padded = try self.allocator.alloc(mlx.mlx_array, N);
+        defer self.allocator.free(padded);
+        for (padded) |*m| m.* = .{ .ctx = null };
+        defer for (padded) |m| {
+            if (m.ctx != null) _ = mlx.mlx_array_free(m);
+        };
+        const false_v = mlx.mlx_array_new_bool(false);
+        defer _ = mlx.mlx_array_free(false_v);
+        for (0..N) |i| {
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            if (masks[i].ctx != null) {
+                try mlx.check(mlx.mlx_array_set(&row, masks[i]));
+            } else {
+                try mlx.check(mlx.mlx_ones(&row, &[_]c_int{ 1, 1, 1, kv_lens[i] }, 4, .bool_, self.s));
+            }
+            const pad_axes = [_]c_int{3};
+            const low = [_]c_int{0};
+            const high = [_]c_int{kv_max - kv_lens[i]};
+            try mlx.check(mlx.mlx_pad(&padded[i], row, &pad_axes, 1, &low, 1, &high, 1, false_v, "constant", self.s));
+        }
+        return concatAxis0(self.s, padded);
+    }
+
+    /// Serial per-slot body of `qsaMask` over the projected `qk` rows.
+    fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
         const offset = cache_len;
         const cfg = &self.config;
         const n_idx: c_int = @intCast(cfg.indexer_n_heads);
@@ -11369,9 +11494,6 @@ pub const Transformer = struct {
         const budget: c_int = @intCast(cfg.indexer_budget);
         const block_topk: c_int = @divTrunc(budget, ratio);
         const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
-
-        const qk = try self.qmatmul(x, fa.idx_qk_w, fa.idx_qk_s, fa.idx_qk_b); // [B,S,(n+1)*hd]
-        defer _ = mlx.mlx_array_free(qk);
         const strides3 = [_]c_int{ 1, 1, 1 };
         var k_raw = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_raw);
@@ -11394,7 +11516,7 @@ pub const Transformer = struct {
 
         const kv: c_int = offset + seq_len;
         if (kv <= budget + ratio - 1) return mlx.mlx_array_new(); // every block fits: dense
-        if (batch != 1) return error.Qwen4BatchUnsupported;
+        std.debug.assert(batch == 1);
         if (!qsa_engaged_logged) {
             qsa_engaged_logged = true;
             log.info("[qsa] sparse attention engaged: kv={d} blocks={d} top-{d} (budget {d}, ratio {d})\n", .{ kv, @divTrunc(kv, ratio), block_topk, budget, ratio });
@@ -11655,7 +11777,7 @@ pub const Transformer = struct {
     /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).
     fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
         if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
-            ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, cache_len, pos_base, batch, seq_len);
+            ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
         }
         if (layer == 3) if (qwen4_trace) |tr| {
             if (ctx.qsa_mask.ctx != null) Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);
@@ -11914,7 +12036,7 @@ pub const Transformer = struct {
 
             if (lw.ple) |*pw| {
                 try self.hcFlush(&h, batch, seq_len, &pending);
-                const add = try self.pleForward(h, token_ids, pw, entry, batch, seq_len);
+                const add = try self.pleForward(ctx, h, token_ids, pw, entry, layer_idx, batch, seq_len);
                 defer _ = mlx.mlx_array_free(add);
                 var h_ple = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_add(&h_ple, h, add, self.s));
@@ -13865,8 +13987,18 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(stacked_k);
                 const stacked_v = try self.padAndStackBatchedKV(dense_views, false, kv_max);
                 defer _ = mlx.mlx_array_free(stacked_v);
-                const stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max);
+                var stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max);
                 defer _ = mlx.mlx_array_free(stacked_mask);
+                if (ctx.qsa_mask.ctx != null) {
+                    // qwen4 QSA: the per-slot block selection (bool, false-
+                    // padded to kv_max) narrows the additive pad mask.
+                    const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+                    defer _ = mlx.mlx_array_free(neg_inf);
+                    var narrowed = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_where(&narrowed, ctx.qsa_mask, stacked_mask, neg_inf, self.s));
+                    _ = mlx.mlx_array_free(stacked_mask);
+                    stacked_mask = narrowed;
+                }
 
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
             }
@@ -16862,7 +16994,10 @@ pub const Transformer = struct {
         const inds_shape = mlx.getShape(inds);
         const K = inds_shape[inds_shape.len - 1];
         const total_inds: c_int = B * S * K;
-        const do_sort = S > 1 or total_inds >= 64;
+        // Any multi-row input (prefill S>1 OR a batched-decode group B>1)
+        // takes the sort path: the gather_qmm arm below squeezes EVERY
+        // singleton axis, which is only unambiguous at B*S == 1.
+        const do_sort = B * S > 1 or total_inds >= 64;
         const no_idx = mlx.mlx_array{ .ctx = null };
 
         var down_out = mlx.mlx_array_new();
@@ -35804,13 +35939,16 @@ test "every optional arch-module pointer on Transformer is a declared module-own
         for (Transformer.module_owned_state_fields) |f| {
             if (std.mem.eql(u8, f, name)) listed = true;
         }
+        for (Transformer.module_shared_readonly_fields) |f| {
+            if (std.mem.eql(u8, f, name)) listed = true;
+        }
         if (!listed) {
-            std.debug.print("module-owned arch field not declared: {s}\n", .{name});
+            std.debug.print("module arch field declared in neither list: {s}\n", .{name});
             return error.UndeclaredModuleOwnedArch;
         }
     }
     // A scan that matches nothing passes vacuously — pin the known count.
-    try testing.expectEqual(Transformer.module_owned_state_fields.len, found);
+    try testing.expectEqual(Transformer.module_owned_state_fields.len + Transformer.module_shared_readonly_fields.len, found);
 }
 
 test "every generative forward arm splices vision embeddings" {
@@ -36643,6 +36781,166 @@ fn qwen4CompareRows(a: []const f32, b: []const f32, rows: usize, v: usize) Qwen4
         if (ia == ib) r.argmax_agree += 1;
     }
     return r;
+}
+
+/// One per-request slot for the qwen4 batched-vs-serial test.
+const Qwen4TestSlot = struct {
+    cache: KVCache,
+    off: usize = 0,
+    entries: []SSMCacheEntry,
+    ctx: ForwardCtx = undefined,
+
+    fn init(alloc: std.mem.Allocator, n_layers: u32) !*Qwen4TestSlot {
+        const sl = try alloc.create(Qwen4TestSlot);
+        const cache = try KVCache.init(alloc, n_layers);
+        sl.* = .{ .cache = cache, .entries = try alloc.alloc(SSMCacheEntry, n_layers) };
+        for (sl.entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        sl.ctx = .{ .cache = &sl.cache, .moe_seq_offset = &sl.off, .ssm_entries = sl.entries, .capture_hidden = null, .vision_embeddings = null };
+        return sl;
+    }
+    fn deinit(sl: *Qwen4TestSlot, alloc: std.mem.Allocator) void {
+        for (sl.entries) |*e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+            if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
+            if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
+        }
+        alloc.free(sl.entries);
+        sl.cache.deinit();
+        alloc.destroy(sl);
+    }
+    fn forward(sl: *Qwen4TestSlot, xfm: *Transformer, ids: []const i32) !mlx.mlx_array {
+        const shape = [_]c_int{ 1, @intCast(ids.len) };
+        const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(arr);
+        return xfm.forwardWith(&sl.ctx, arr);
+    }
+};
+
+fn qwen4Rows(arr: mlx.mlx_array) c_int {
+    return if (arr.ctx != null) mlx.getShape(arr)[1] else -1;
+}
+
+test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks (GDN + PLE history + QSA keys/mask)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("QWEN4_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.supportsBatchedGdnDecode());
+    xfm.qwen4_stream_f32 = true;
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    try mlx.check(mlx.mlx_array_eval(ids_arr));
+    const T: usize = mlx.mlx_array_size(ids_arr);
+    const ids = (mlx.mlx_array_data_int32(ids_arr) orelse return error.Unreadable)[0..T];
+    const v: usize = @intCast(config.vocab_size);
+    const n_layers = config.num_hidden_layers;
+
+    // Two prompts of DIFFERENT length (pads the shorter slot's KV) whose
+    // continuations run every slot past the indexer budget.
+    const pa: usize = T / 2;
+    const pb: usize = pa - 3;
+    const K: usize = T - pa;
+    const a_ids = ids[0 .. pa + K];
+    const b_ids = ids[3 .. 3 + pb + K];
+
+    const a_s = try Qwen4TestSlot.init(allocator, n_layers);
+    defer a_s.deinit(allocator);
+    const b_s = try Qwen4TestSlot.init(allocator, n_layers);
+    defer b_s.deinit(allocator);
+    const a_b = try Qwen4TestSlot.init(allocator, n_layers);
+    defer a_b.deinit(allocator);
+    const b_b = try Qwen4TestSlot.init(allocator, n_layers);
+    defer b_b.deinit(allocator);
+    _ = mlx.mlx_array_free(try a_s.forward(&xfm, a_ids[0..pa]));
+    _ = mlx.mlx_array_free(try b_s.forward(&xfm, b_ids[0..pb]));
+    _ = mlx.mlx_array_free(try a_b.forward(&xfm, a_ids[0..pa]));
+    _ = mlx.mlx_array_free(try b_b.forward(&xfm, b_ids[0..pb]));
+    std.debug.print("[qwen4 batched] prefill A {d} B {d}: cache.step A {d}, offset A {d}\n", .{ pa, pb, a_s.cache.step, a_s.off });
+
+    var min_cos: f64 = 1.0;
+    var checked: usize = 0;
+    var agreed: usize = 0;
+    for (0..K) |k| {
+        const ta = a_ids[pa + k];
+        const tb = b_ids[pb + k];
+        const la = try a_s.forward(&xfm, &.{ta});
+        defer _ = mlx.mlx_array_free(la);
+        const lb = try b_s.forward(&xfm, &.{tb});
+        defer _ = mlx.mlx_array_free(lb);
+
+        const ctxs = [_]*ForwardCtx{ &a_b.ctx, &b_b.ctx };
+        const offs = [_]u32{ @intCast(a_b.off), @intCast(b_b.off) };
+        const out = try xfm.forwardMoeBatchedDecode(&.{ @intCast(ta), @intCast(tb) }, &ctxs, &offs);
+        defer {
+            for (out) |o| _ = mlx.mlx_array_free(o);
+            allocator.free(out);
+        }
+        // The scheduler advances each slot's own position after the tick.
+        a_b.off += 1;
+        b_b.off += 1;
+        try testing.expectEqual(a_s.off, a_b.off);
+        try testing.expectEqual(b_s.off, b_b.off);
+
+        inline for (.{ la, lb }, .{ out[0], out[1] }, .{ "A", "B" }) |ser, bat, tag| {
+            const sh = try qwen4ReadF32(allocator, ser, s);
+            defer allocator.free(sh);
+            const bh = try qwen4ReadF32(allocator, bat, s);
+            defer allocator.free(bh);
+            try testing.expectEqual(sh.len, bh.len);
+            const rc = qwen4CompareRows(sh, bh, 1, v);
+            if (rc.min_cos < min_cos) min_cos = rc.min_cos;
+            // argmax must agree wherever the serial top-2 is decisive (3%).
+            var top: f32 = -std.math.inf(f32);
+            var second: f32 = -std.math.inf(f32);
+            for (sh) |x| {
+                if (x > top) {
+                    second = top;
+                    top = x;
+                } else if (x > second) second = x;
+            }
+            if (@abs(top - second) > 0.03 * @abs(top)) {
+                checked += 1;
+                agreed += rc.argmax_agree;
+            }
+            if (rc.min_cos < 0.999) std.debug.print("[qwen4 batched] step {d} slot {s}: cos {d:.5} argmax {d}\n", .{ k, tag, rc.min_cos, rc.argmax_agree });
+        }
+        // Per-slot state moved identically: PLE history, QSA key rows, pooled blocks.
+        for (0..n_layers) |l| {
+            inline for (.{ .{ a_s, a_b }, .{ b_s, b_b } }) |pair| {
+                const es = &pair[0].entries[l];
+                const eb = &pair[1].entries[l];
+                try testing.expectEqual(es.ple_prev_valid, eb.ple_prev_valid);
+                try testing.expectEqualSlices(u32, &es.ple_prev, &eb.ple_prev);
+                try testing.expectEqual(qwen4Rows(es.aux_state), qwen4Rows(eb.aux_state));
+                try testing.expectEqual(qwen4Rows(es.qsa_pooled), qwen4Rows(eb.qsa_pooled));
+            }
+        }
+    }
+    std.debug.print("[qwen4 batched] {d} ticks x 2 slots: min cos {d:.5}, argmax {d}/{d} decisive rows\n", .{ K, min_cos, agreed, checked });
+    try testing.expect(min_cos > 0.995);
+    try testing.expect(checked >= 2 and agreed == checked);
+    // Both slots crossed the budget: the batched QSA mask path ran.
+    var pooled = false;
+    for (b_b.entries) |*e| if (e.qsa_pooled.ctx != null) {
+        pooled = true;
+    };
+    try testing.expect(pooled);
 }
 
 test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget match the HF reference" {

@@ -16,10 +16,29 @@ mkdir -p "$(dirname "$LOG")"
 [ -f "$MODEL/config.json" ] || { echo "SKIP: no pack at $MODEL"; exit 0; }
 [ -f "$MODEL/ngram_table.bin" ] || { echo "SKIP: pack has no ngram_table.bin"; exit 0; }
 pass=0; fail=0
+# Tie-aware equivalence (test_mtp_equivalence.sh bar): prints 1 when `other`
+# equals the serial greedy answer for body `$1`, or first diverges at a token
+# whose serial top-2 gap is <= 0.15 nats.
+same_or_tie() {
+  local body="$1" other="$2"
+  local lp; lp=$(echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); d['logprobs']=True; d['top_logprobs']=2; d['enable_mtp']=False; print(json.dumps(d))")
+  curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$lp" | python3 -c "
+import sys,json; d=json.load(sys.stdin); other=sys.argv[1]; acc=''; ok=1
+for n,e in enumerate(d['choices'][0]['logprobs']['content'][:30]):
+    if not other.startswith(acc+e['token']):
+        t=e['top_logprobs']; gap=(t[0]['logprob']-t[1]['logprob']) if len(t)>1 else 99
+        print('  diverged at token %d, serial top-2 gap %.3f nats' % (n, gap), file=sys.stderr)
+        ok=1 if gap <= 0.15 else 0; break
+    acc+=e['token']
+print(ok)" "$other"
+}
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
 # MTP_FORCE_DEPTH=3: every MTP round verifies 4 rows, so [5b] exercises the
 # array-mask row split (S >= 3 at gqa 12 is MLX's unfused fallback).
-MLX_SERVE_MTP_FORCE_DEPTH=3 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
+# --max-concurrent 4: [8]-[10] batch plain slots; --prefix-cache-entries 0: the
+# serial reruns those arms compare against must not restore (hybrid restore
+# class 0.14-0.30 nats > the near-tie bar).
+MLX_SERVE_MTP_FORCE_DEPTH=3 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 for _ in $(seq 1 600); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
@@ -96,5 +115,57 @@ print(json.dumps({'messages':[{'role':'user','content':[{'type':'text','text':'W
 else
   echo "  SKIP: pack has no model-vision.safetensors"
 fi
+echo "[8] two concurrent plain requests batch-decode (one forward for both slots)"
+nb0=$(grep -c 'gdn batched decode engaged' "$LOG")
+pa='{"messages":[{"role":"user","content":"Write a short story about a lighthouse keeper who finds a message in a bottle."}],"max_tokens":400,"temperature":0,"enable_thinking":false,"enable_mtp":false}'
+pb='{"messages":[{"role":"user","content":"Explain how a bicycle stays upright while moving, step by step."}],"max_tokens":400,"temperature":0,"enable_thinking":false,"enable_mtp":false}'
+curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$pa" > "$LOG.8a" &
+c1=$!
+curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$pb" > "$LOG.8b" &
+c2=$!
+wait $c1 $c2
+ta=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.8a")
+tb=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.8b")
+echo "  A: $(echo "$ta" | tr '\n' ' ' | cut -c1-70)"
+echo "  B: $(echo "$tb" | tr '\n' ' ' | cut -c1-70)"
+check "batched decode engaged (slots=2)" "$(grep -c 'gdn batched decode engaged (slots=2)' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
+check "A == serial (30 tokens, tie-aware)" "$(same_or_tie "$pa" "$ta")" "1"
+check "B == serial (30 tokens, tie-aware)" "$(same_or_tie "$pb" "$tb")" "1"
+echo "[9] two concurrent long prompts: batched decode under the QSA mask"
+mk_long() { python3 -c "
+import json,sys
+code=sys.argv[1]; nonce=sys.argv[2]
+filler=' '.join(f'Note {i}: the {nonce} river near town number {i} runs east.' for i in range(700))
+print(json.dumps({'messages':[{'role':'user','content':filler+' The secret code is '+code+'. '+filler+' What is the secret code? Answer with the code only.'}],'max_tokens':24,'temperature':0,'enable_thinking':False,'enable_mtp':False}))" "$1" "$2"; }
+la9=$(mk_long HERON-77 amber); lb9=$(mk_long OTTER-31 cobalt)
+curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$la9" > "$LOG.9a" &
+c1=$!
+curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$lb9" > "$LOG.9b" &
+c2=$!
+wait $c1 $c2
+ta=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.9a")
+tb=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.9b")
+echo "  A: $(echo "$ta" | tr '\n' ' ' | cut -c1-60)  B: $(echo "$tb" | tr '\n' ' ' | cut -c1-60)"
+check "needle A" "$(echo "$ta" | grep -c 'HERON-77')" "1"
+check "needle B" "$(echo "$tb" | grep -c 'OTTER-31')" "1"
+check "batched decode engaged again past the budget" "$(python3 -c "print(1 if $(grep -c 'gdn batched decode engaged' "$LOG") > $nb0 else 0)")" "1"
+check "A == serial (tie-aware)" "$(same_or_tie "$la9" "$ta")" "1"
+check "B == serial (tie-aware)" "$(same_or_tie "$lb9" "$tb")" "1"
+echo "[10] an MTP slot stays exclusive while a plain slot decodes beside it"
+nm0=$(grep -c 'spec-stats\] mode=mtp' "$LOG")
+pm='{"messages":[{"role":"user","content":"List ten European capitals with one fact each."}],"max_tokens":200,"temperature":0,"enable_thinking":false,"enable_mtp":true}'
+pp='{"messages":[{"role":"user","content":"Describe the water cycle in five sentences."}],"max_tokens":200,"temperature":0,"enable_thinking":false,"enable_mtp":false}'
+curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$pm" > "$LOG.10m" &
+c1=$!
+sleep 0.5
+curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$pp" > "$LOG.10p" &
+c2=$!
+wait $c1 $c2
+tm=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.10m")
+tp=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$LOG.10p")
+echo "  mtp: $(echo "$tm" | tr '\n' ' ' | cut -c1-60)  plain: $(echo "$tp" | tr '\n' ' ' | cut -c1-60)"
+check "exactly one more mtp engagement" "$(python3 -c "print($(grep -c 'spec-stats\] mode=mtp' "$LOG") - $nm0)")" "1"
+check "mtp answer == serial (tie-aware)" "$(same_or_tie "$pm" "$tm")" "1"
+check "plain answer == serial (tie-aware)" "$(same_or_tie "$pp" "$tp")" "1"
 echo "passed $pass failed $fail"
 [ "$fail" = 0 ]

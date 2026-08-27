@@ -4028,7 +4028,7 @@ same speed" would have been the only other evidence.
 ## qwen4_exp serial decode: the f32 scalar, the latency-bound kernel, the SSD fault (2026-08-26)
 
 Three separate findings from one afternoon on Qwen3.8-Flash-Next, all on the
-serial decode path (M4 Max 128 GB, 4bit-all pack, `MLX_SERVE_DECODE_FWD_UBENCH=30`).
+serial decode path (M4 Max 128 GB, 4bit pack (then named -4bit-all), `MLX_SERVE_DECODE_FWD_UBENCH=30`).
 
 ### 1. One f32 scalar widened the whole residual stream
 
@@ -4196,12 +4196,12 @@ position) was bookkeeping, head quantization, or the prompt. Three probes:
 
 | pack (head width) | depth | 8.4k repetitive prompt | code (LRU cache) | prose (essay) |
 |---|---|---|---|---|
-| -4bit-all (4-bit) | 1 | 0.65 · 33.7 ms · 49.7 tok/s | 0.93 · 28.0 ms · 69.4 | 0.61 · 28.0 ms · 57.4 |
-| -4bit-all (4-bit) | 2 | 0.64/0.42 · 51.2 ms · 40.3 | 0.88/0.76 · 34.1 ms · 78.5 | 0.76/0.46 · 34.0 ms · 65.2 |
-| -4bit-all (4-bit) | 3 | 0.62/0.41/0.22 · 60.0 ms · 39.3 | 0.91/0.80/0.68 · 40.0 ms · 84.7 | 0.65/0.37/0.25 · 40.0 ms · 55.8 |
-| -4bit (8-bit head) | 1 | 0.62 · 37.7 ms · 44.1 | 0.94 · 31.8 ms · 61.3 | 0.74 · 31.9 ms · 54.8 |
-| -4bit (8-bit head) | 2 | 0.61/0.38 · 56.4 ms · 35.5 | 0.96/0.87 · 38.5 ms · 74.2 | 0.66/0.40 · 38.6 ms · 53.7 |
-| -4bit (8-bit head) | 3 | 0.66/0.34/0.15 · 63.1 ms · 36.2 | 0.91/0.83/0.79 · 43.0 ms · 83.7 | 0.68/0.38/0.25 · 43.2 ms · 53.2 |
+| -4bit (4-bit) | 1 | 0.65 · 33.7 ms · 49.7 tok/s | 0.93 · 28.0 ms · 69.4 | 0.61 · 28.0 ms · 57.4 |
+| -4bit (4-bit) | 2 | 0.64/0.42 · 51.2 ms · 40.3 | 0.88/0.76 · 34.1 ms · 78.5 | 0.76/0.46 · 34.0 ms · 65.2 |
+| -4bit (4-bit) | 3 | 0.62/0.41/0.22 · 60.0 ms · 39.3 | 0.91/0.80/0.68 · 40.0 ms · 84.7 | 0.65/0.37/0.25 · 40.0 ms · 55.8 |
+| mixed-4-8bit (8-bit head) | 1 | 0.62 · 37.7 ms · 44.1 | 0.94 · 31.8 ms · 61.3 | 0.74 · 31.9 ms · 54.8 |
+| mixed-4-8bit (8-bit head) | 2 | 0.61/0.38 · 56.4 ms · 35.5 | 0.96/0.87 · 38.5 ms · 74.2 | 0.66/0.40 · 38.6 ms · 53.7 |
+| mixed-4-8bit (8-bit head) | 3 | 0.66/0.34/0.15 · 63.1 ms · 36.2 | 0.91/0.83/0.79 · 43.0 ms · 83.7 | 0.68/0.38/0.25 · 43.2 ms · 53.2 |
 
 Cells: acceptance per draft index (`acc_idx`) · round ms · client tok/s. Serial: 60.4 short / 54.7 at 8.5k. M4 Max 128 GB, temp 0, `MLX_SERVE_MTP_FORCE_DEPTH=n`, 2026-08-26.
 
@@ -4216,7 +4216,7 @@ with their measured ceiling; a prose-vs-code acceptance difference of this
 size is a property of the head, not of the engine.
 
 Re-measured 2026-08-27 after the QSA verify-row split (`splitMaskedSdpa256`),
-same boot MTP vs serial, 3 reps, `-4bit-all` pack, M4 Max:
+same boot MTP vs serial, 3 reps, `-4bit` pack (local dirs renamed to the HF names on 08-27; was `-4bit-all`), M4 Max:
 
 | depth | code | prose | 8.5k prompt |
 |---|---|---|---|
@@ -4246,3 +4246,22 @@ Two arms, both kill-switched:
 Hermetic bars: `fusedSdpa256Masked: QSA bool-mask parity`, `splitMaskedSdpa256: verify-width array-mask rows split` (transformer.zig), both vs the composed array-mask sdpa at 0.005. Live engagement lines in `tests/test_qwen4_exp.sh` [5]/[5b]. The tiny fixture is hd 32, so it never reaches either arm. The live prefill/verify A/B on the real pack is still owed (written with the GPU occupied); the expectation from the profile is up to ~1.8x on prefill past 2048 tokens and the S=3..4 verify rounds at 8.5k dropping toward the S=2 cost.
 
 Measured (2026-08-26, `tests/prefill_ab.sh <pack> MLX_SERVE_QSA_FUSED 1 0`, M4 Max, 4-bit pack): 8.1k tokens on 11.36/11.80/11.90 vs off 11.93/12.01/12.07 s; 24.9k tokens on 40.66/41.13/40.56/41.24 vs off 41.49/41.88/42.20/42.43 s — ~1% and ~2.7%. Far from the 1.8x the profile suggested: the per-tile skip table rarely skips (64 queries' top-512 blocks union to most of the KV), so the arm only buys the fused-vs-materialized difference, and MLX's unfused path is already matmul-bound at these shapes. A per-QUERY block-list kernel (gather the 512 selected blocks per row instead of masking) is the remaining lever; not started. Kept default-on (parity-tested, small positive both lengths).
+
+## "Module-owned" was a property of the pointer, not the state (qwen4 batched decode, 2026-08-27)
+
+qwen4_exp shipped serial: `Transformer.qwen4` sat in `module_owned_state_fields` beside dsv4, so admission was single-flight and `supportsBatchedGdnDecode` refused the MoE trunk. But the field only holds the n-gram hash and the mmapped table, both read-only. Every per-request thing was already on the slot's `SSMCacheEntry`: the GDN pair, the PLE conv window + token history, the QSA key history + pooled blocks. The one module-owned piece is the MTP head's cache, and only the slot driving it needs exclusivity.
+
+What it took to batch it:
+
+- Two lists: `module_owned_state_fields` (dsv4) and `module_shared_readonly_fields` (qwen4); the class scan accepts either. Admission exclusivity moved to the SLOT (`slotExclusiveDecode` = model bit OR `enable_mtp` on a model with a qwen4 head); `admitPendingTick` blocks an exclusive candidate only against exclusive active slots. Spec wiring keys on `moduleSpecWiring()` (both lists), otherwise the shared arch would fall onto the generic wiring and pick up PLD/drafters nobody measured.
+- `forwardMoeBatchedDecode` dispatches `forwardQwen4With`; the PLE layer's conv window merges/splits with the GDN pair (`mergeSsmAcrossSlots` reads the layer's shape). `pleEmbedding` hashes row i against slot i's history through `ctx.batch_slots` and gathers all N·heads rows in ONE table read. `qsaMask` projects once, then runs the serial per-slot body (`qsaMaskFromQk`) per row against that slot's keys/pooled blocks/offset, false-pads to kv_max and stacks; the batched attention branch ANDs it into the additive pad mask. A group where nobody is past the budget returns no mask at all.
+- `moeMLP` at `[N,1,·]` took the gather_qmm arm, whose `mlx_squeeze` drops EVERY singleton axis, so B=2 came out `[2,K,hidden]` and the residual write got `[2,2,64]`. Any `B*S > 1` now takes the sort path (serial unchanged).
+
+Two pre-existing GDN batching bugs surfaced on the way, on qwen3_5 too:
+
+- `KVCache.step` advances only on layer 0. On a GDN trunk layer 0 is linear, so `step` reads 0 forever, and the batched tick's `rope_offsets[i] = slot.cache.step` roped every batched decode token at position 0. Forced N=1 on Qwen3.5-0.8B diverged from serial at token 14, on HEAD. Offsets now come from the slot's `moe_seq_offset` on the GDN arm.
+- Nothing advanced `moe_seq_offset` for a batched slot (the forward moves only the driver's scratch), so a slot leaving a batch resumed serial from a stale position, and qwen4's QSA read the wrong kv length. The batched tick advances every slot by 1.
+
+Bars: hermetic `qwen4 batched decode` fixture test (two slots of different length, 10 ticks, cos 1.00000, 19/19 decisive argmax, PLE history / key rows / pooled blocks equal per slot); `test_batched_equivalence.sh` on the 4-bit pack 4/4 (forced N=1 byte-identical, two streams byte-identical); on Qwen3.5-0.8B forced N=1 byte-identical, the N=2 arm diverges at a 0.125-nat near-tie (prefix-cache restore + B=2 tiles) and is acquitted by the new ≤0.15 rule. `test_qwen4_exp.sh` [8]-[10] cover batched short, batched past the QSA budget, and an MTP slot beside a plain one.
+
+Measured (M4 Max, 4-bit pack, one boot per binary, 3 reps, `~/claude-tmp/qwen4-batched/ab.sh`): serial unchanged (code 63.7 vs 62.4, prose 61.8 vs 61.3, 8.5k 54.4 vs 54.3 tok/s, new vs HEAD). Aggregate prose: 2 streams 70.5 tok/s (HEAD queued: 59.6) = 1.18x; 4 streams 103.7 vs 60.0 = 1.73x. 2 streams at 8.5k: 28 + 28 = 56 vs 54 serial, ~1.03x (wall-clock 13.9 either way: two 8.5k prefills dominate). MTP serial unchanged (code 73-88 both binaries); an MTP request beside a plain one interleaves at 40 + 31 = 71 per-stream, wall aggregate 60 (same as HEAD's queue). Below the qwen3_5 ratio (2.8x at 4) because every fused decode kernel declines at batch > 1 (`hcReadFusedFor` / `hcWriteOrDefer` `batch*seq != 1`, `gdnPreworkFused` `qsh[0] != 1`, MoE `gatherQmv` `B*S == 1`), so the group runs the op chains it was fused away from; the per-slot QSA loop (12 layers x N small concats + top-k) is the 8.5k term. Both are kernel work for a later round, not a correctness question.

@@ -20,7 +20,7 @@
 | Qwen3.6 35B-A3B 4b | 104 | 106 | 128 | 175 mtp | 210 mtp | 215 mtp | 227 mtp | 237 mtp | 191 mtp | · | +84% |
 | Laguna XS 2.1 NVFP4 | · | · | · | · | · | · | 25 | 121 | · | · | +384% |
 | Qwen3.8 27B 4b (ddalcu MTP) | · | · | · | · | · | · | · | · | · | 69 mtp | · |
-| Qwen3.8 Flash-Next 4b (MTP) | · | · | · | · | · | · | · | · | · | 78 mtp | · |
+| Qwen3.8 Flash-Next mixed-4-8b (MTP) | · | · | · | · | · | · | · | · | · | 78 mtp | · |
 
 (Note, testing harness changed in last release, so numbers differ)
 

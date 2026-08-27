@@ -844,7 +844,7 @@ pub const ModelConfig = struct {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
-        if (self.isMoe()) return false; // routed experts: not modelled yet
+        if (self.isMoe() and !self.isQwen4()) return false; // routed experts: only qwen4_exp's per-slot state is modelled
         if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
@@ -6028,7 +6028,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
-    try testing.expect(c.isMoe() and !c.supportsBatchedGdnDecode());
+    try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
     try testing.expectEqual(@as(f32, 10000000.0), c.rope_theta);
     try testing.expect(!c.qwen_vision and !c.has_vision);

@@ -4,9 +4,11 @@
 
 ### Highlights
 
-- **Qwen 3.8 Flash Next runs natively.** The 125B-A6B hybrid with its 51B n-gram table and 4B speculative head: hyper-connection residual streams, n-gram embeddings gathered from disk, sparse attention past 2k tokens, all on custom kernels. **About 60 tok/s serial on an M4 Max, 78 tok/s with MTP**, ~75 GB resident for the 4-bit pack (`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit`).
+- **Qwen 3.8 Flash Next runs natively.** The 125B-A6B hybrid with its 51B n-gram table and 4B speculative head: hyper-connection residual streams, n-gram embeddings gathered from disk, sparse attention past 2k tokens, all on custom kernels. **About 60 tok/s serial on an M4 Max, 78 tok/s with MTP**, ~70 GB resident for the 4-bit pack (`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit`).
 - **It sees images and video too.** The checkpoint's own vision tower is in the pack, with M-RoPE through both attention and the sparse-attention indexer. Follow-up questions about the same picture reuse the prefix cache instead of re-encoding it.
 - **Long prompts on Flash Next stay on the fast path.** Sparse attention now has fused kernels for prefill and for multi-token verify, so MTP at an 8.5k-token prompt no longer loses to serial decode (was -28%).
+- **Flash Next serves concurrent requests in one forward.** Text requests batch-decode like Qwen 3.5 (`--max-concurrent N`); an MTP request keeps its own lane. Single-request speed is unchanged.
+- **Fix: batched decode on Qwen 3.5 roped every generated token at position 0.** Two concurrent requests drifted from the single-request answer after a dozen tokens; now byte-identical.
 - **MTP on Flash Next is opt-in** (`--mtp` or `"enable_mtp": true`): +41% on code, a few percent slower on prose, so you pick.
 - **MLX 0.32.2.** Up to +3% decode on MoE models at long context.
 - **Fix: video input on Qwen 3.5/3.8 never reached the model.** The frames were encoded but never spliced into the prompt, so the model described a clip it had not seen.
