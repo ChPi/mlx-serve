@@ -450,6 +450,24 @@ const ImageBackend = union(enum) {
 /// bounds attention memory; the official sampler tops out around 10.
 pub const MAX_EDIT_IMAGES = 4;
 
+/// Ceiling on one video response's raw RGB volume. The whole `frames.rgb`
+/// buffer is base64'd into ONE JSON body and the app decodes it in memory;
+/// past this the client drops the socket and a finished render dies as
+/// `WriteFailed` (#283: 5 chained windows = 701f at 1056x864 = 1.9 GB).
+/// Twin of the app's `VideoModelPreset.maxFramePayloadBytes`; refuse at
+/// admission, by name, before any denoise step.
+pub const MAX_VIDEO_RGB_BYTES: u64 = 768 * 1024 * 1024;
+
+pub fn videoRgbTransportReason(delivered_frames: u32, width: u32, height: u32) ?[]const u8 {
+    const bytes: u64 = @as(u64, delivered_frames) * @as(u64, width) * @as(u64, height) * 3;
+    if (bytes <= MAX_VIDEO_RGB_BYTES) return null;
+    const S = struct {
+        var buf: [192]u8 = undefined;
+    };
+    return std.fmt.bufPrint(&S.buf, "{d} frames at {d}x{d} is {d} MB of raw RGB; one response carries at most {d} MB — fewer frames or windows, or a smaller canvas", .{ delivered_frames, width, height, bytes / (1024 * 1024), MAX_VIDEO_RGB_BYTES / (1024 * 1024) }) catch "video too large for one response";
+}
+
+
 /// Per-request image-generation options shared by both backends.
 pub const ImageGenOpts = struct {
     /// img2img source pixels [1,3,H,W] f32 [0,1], pre-resized to the target
@@ -3031,6 +3049,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // Snap to the model's own ladder and SAY SO: silently generating a
     // different length than asked is how a client's audio mux drifts.
     const shape = minimax_h3.temporalShape(requested_frames);
+    if (videoRgbTransportReason(minimax_h3.chainDeliveredFrames(chain_windows, shape.frame_count), width, height)) |reason|
+        return sendError(conn, 400, reason);
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream });
 
@@ -3192,6 +3212,8 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     const num_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 9);
     const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
     const width: u32 = @intCast(extractJsonInt(body, "width") orelse 384);
+    if (videoRgbTransportReason(num_frames, width, height)) |reason|
+        return sendError(conn, 400, reason);
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
     const frame_rate: f32 = 24.0;
 
@@ -5397,4 +5419,11 @@ test "instrumental is parsed off the body only when spelled true" {
     try testing.expect(sse.bodyWantsTrue("{\"instrumental\": true}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"instrumental\":false}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"prompt\":\"x\"}", "instrumental"));
+}
+
+test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {
+    // 141f/window x 5 windows at 1056x864 = 701 frames = 1.9 GB raw: refused by name.
+    try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141), 1056, 864) != null);
+    // One window of the same shape fits.
+    try std.testing.expect(videoRgbTransportReason(141, 1056, 864) == null);
 }

@@ -680,10 +680,12 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// Frame counts offerable at this canvas: the `8N+1` ladder trimmed to what
     /// one response can carry. Always returns at least the first rung, so the
     /// picker can never render blank.
-    func frameOptions(width: Int, height: Int) -> [Int] {
+    func frameOptions(width: Int, height: Int, chainWindows: Int = 1) -> [Int] {
         let perFrame = max(1, width * height * 3)
         let budget = Self.maxFramePayloadBytes / perFrame
-        let fits = frameOptions.filter { $0 <= budget }
+        // Chained windows deliver `w*n - (w-1)` frames in ONE response (#283).
+        let w = max(1, chainWindows)
+        let fits = frameOptions.filter { $0 * w - (w - 1) <= budget }
         return fits.isEmpty ? Array(frameOptions.prefix(1)) : fits
     }
 

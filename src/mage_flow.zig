@@ -452,7 +452,7 @@ fn layerNormLast(x: mlx.mlx_array, weight: ?mlx.mlx_array, bias: ?mlx.mlx_array,
 // ── Weight loaders (reference the physical `pipeline.*` checkpoint keys) ──
 fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     const a = w.get(key) orelse {
-        log.err("[mageflow] MISSING VAE WEIGHT: {s}\n", .{key});
+        log.err("[mageflow] MISSING WEIGHT: {s} (an Edit pack needs the Qwen3-VL vision tower in text_encoder/model.safetensors — 1425 tensors; the Turbo text encoder has 902 and none)\n", .{key});
         return error.MissingMageFlowWeight;
     };
     var o = mlx.mlx_array_new();

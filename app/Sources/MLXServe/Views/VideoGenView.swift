@@ -452,7 +452,7 @@ struct VideoGenView: View {
     /// pick longer than RAM suggests — we just hint at it in the warning
     /// below the dropdown rather than removing the option.
     private var availableFrameOptions: [Int] {
-        model.frameOptions(width: effectiveSize.width, height: effectiveSize.height)
+        model.frameOptions(width: effectiveSize.width, height: effectiveSize.height, chainWindows: chainWindows)
     }
 
     /// Soft hint when the chosen length looks too aggressive for the Mac's
@@ -1018,7 +1018,7 @@ struct VideoGenView: View {
             // Chained windows. Already wired end to end — this is the control
             // that never existed, which is why long clips were unreachable.
             if model.supportsChainedWindows {
-                Stepper(value: $chainWindows, in: 1...8) {
+                Stepper(value: $chainWindows, in: 1...6) {
                     Text("Chained windows: \(chainWindows)").font(.caption)
                 }
                 .help("Join several generations end to end, each starting from the last frame of the one before.")
@@ -1410,7 +1410,7 @@ struct VideoGenView: View {
         // would otherwise sit off-scale, and 0 stays Auto.
         stage2Steps = min(6, max(0, s.stage2Steps))
         cfgAudioScale = min(12, max(1, s.cfgAudioScale))
-        chainWindows = model.supportsChainedWindows ? min(8, max(1, s.chainWindows)) : 1
+        chainWindows = model.supportsChainedWindows ? min(6, max(1, s.chainWindows)) : 1
         seed = s.seed
         keepResident = s.keepResident
         bestQuality = s.bestQuality
