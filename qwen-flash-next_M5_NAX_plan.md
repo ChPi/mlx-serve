@@ -50,6 +50,20 @@ numbers are the baseline you compare against, not a target.
    `MTP_FORCE_ENABLE=1 MTP_TEST_MODEL=<pack> tests/test_mtp_equivalence.sh` 11/11.
    If either is red on M5 before any change, stop and report; the NAX dense lane may already be
    engaging on shapes it never saw.
+6. llmprobe, the number the PR is judged on: boot the pack (`--mtp`, `--prefix-cache-entries 0`) and
+   run `npx llmprobe --bench-only` against it (`tests/bench.sh --only Flash-Next` does the boot + probe
+   for you and prints the markdown row). Medians of 3. Current M5 Max, 4-bit pack, before this work —
+   these are the numbers to beat, and the same run goes in the PR beside them:
+
+   | cell | M5 Max today |
+   |---|---|
+   | decode | 91.2 tok/s (90.9 / 92.7 / 91.2) |
+   | prefill | 1633 tok/s (1644.9 / 1633.1 / 1604.9) |
+   | spec:predictable | 105.3 tok/s (105.7 / 105.3 / 104.2) |
+   | spec:novel | 66.0 tok/s (60.9 / 66.4 / 65.9) |
+
+   Same box, same pack, same flags, one boot per arm, or the comparison is worthless. A cell that
+   moved by less than the spread of its three samples is noise, not a win.
 
 ### 1. Calibrated MTP cost profile for qwen4 on G17 (small, high value)
 - `src/mtp.zig` `m5NaxCostProfileForFingerprint` / `MtpCostProfile`: add a qwen4 surface
@@ -122,6 +136,8 @@ that are not trivially draftable. Prose and 8.5k are the cells that have to stop
   The vision fixture has no MTP reference; `test_qwen4_exp.sh` [7b] (tie-aware == serial) is the bar.
 
 ## Deliverables back
+- The llmprobe `--bench-only` table from step 0.6, before AND after, in the PR description, plus
+  `[spec-stats]` acceptance and the `[...] engaged` lines from the after arm's log.
 - Numbers, same boot, 3 reps, per prompt, engine named, engaged lines quoted from the arm's own log.
 - Kill switches for every new lane; defaults flipped only by a measured win on M5, and stated as
   M5-only (M1-M4 stay on the probe-gated path).
