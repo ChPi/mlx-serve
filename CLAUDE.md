@@ -256,6 +256,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **Ownership by PROVENANCE, never content**: `{slice, owned}` returns, never free-unless-equals-literal.
 - **LAN robustness**: per-INTERFACE dns_sd callbacks, loopback-first fetches (Local Network privacy blackholes LAN SYNs), eviction only via `attemptKnown` after `PEER_DROP_FAILS`, dead refs revived by the browser loop, raw-body id compares canonicalize `\/`.
 - **@peer proxying is bounded by the TUNNEL MARKER**: any direct client gets ONE hop; `X-MLX-LAN` requests never proxy again (`isTunneledRequest` at gate AND dispatch). List filters key on the discovery fetch's marker; `lan_peer` entries never re-export; self-fetch → `error.SelfFetch`.
+- **A llama session trim is FALLIBLE on recurrent/hybrid GGUFs** (#286 + #287; `mlx_llama_session_trim` returns 1 = cleared): `llama_memory_seq_rm` refuses a partial tail past the recurrent snapshot window and mutates NOTHING, so a trimmed mirror over an untrimmed KV served the PREVIOUS request's tool calls (qwen35, qwen3next, nemotron_h). Cold-prefill on refusal; PLD was never involved. Guard: `llama: re-sync after a long generated tail`.
 - **A READY model never advertises LESS capability than its stub** (`readyHasChat` counts embedded engines; app `lanAdvertises` tolerates empty caps).
 - **Default bind is 0.0.0.0 and serve mode WARNS** (`server.shouldWarnOpenBind`); flips to 127.0.0.1 in a future release. The app always passes `--host` explicitly.
 
