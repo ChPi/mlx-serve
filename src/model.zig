@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 
 pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
@@ -3184,6 +3185,12 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
 
+    // The index names the shards; anything else is dead weight (issue #274:
+    // a pack shipped two shards no weight_map entry names — RAM for nothing)
+    // or a foreign file whose parse failure would be an uncatchable MLX abort.
+    var referenced = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -3192,6 +3199,10 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         // resolves the link at the OS level, so a symlinked *.safetensors loads fine.
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) {
+            log.warn("skipping {s}: not named by model.safetensors.index.json\n", .{entry.name});
+            continue;
+        };
 
         const path_slice = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, entry.name });
         defer allocator.free(path_slice);
@@ -3472,6 +3483,31 @@ test "loadWeights on a weightless dir (incomplete download) errors clearly, not 
         error.NoWeightFiles,
         loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", false),
     );
+}
+
+test "loadWeights reads only the shards the index names (issue #274)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // One real (hand-built) shard + one garbage file that mlx would abort on.
+    const hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var st: [8 + hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+    @memcpy(st[8 .. 8 + hdr.len], hdr);
+    @memset(st[8 + hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &st });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stray.safetensors", .data = "not a safetensors file" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-00001.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 1), w.count());
 }
 
 test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {

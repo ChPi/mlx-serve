@@ -10,7 +10,25 @@
 - **Several chats at once.** Concurrent requests on Flash Next share one pass: 2 streams give 1.3x total throughput, 4 streams 1.8x. A single chat is as fast as before.
 - **Speculative decoding on Flash Next is opt-in** (`--mtp` or the MoE toggle in Settings): +41% on code, a wash on prose, so you choose. It also works on image questions now.
 - **MLX 0.32.2.** Up to +3% faster on MoE models at long context.
-- **Fixes:** two concurrent chats on Qwen 3.5 drifted from the single-chat answer; video input on Qwen 3.5/3.8 never reached the model; `--no-vision` still answered image questions (now a clear error); `--no-mtp` was ignored on Flash Next; very long prompts on Flash Next could run out of GPU memory instead of being refused up front.
+
+### Fixes
+
+- Two concurrent chats on Qwen 3.5 drifted from the single-chat answer.
+- Video input on Qwen 3.5/3.8 never reached the model.
+- `--no-vision` still answered image questions; now a clear error.
+- `--no-mtp` was ignored on Flash Next.
+- Very long prompts on Flash Next could run out of GPU memory instead of being refused up front.
+- A checkpoint the loader cannot read fails that one load instead of taking the server down (#217).
+- Shards not named by the model index are no longer loaded or counted toward `--max-resident-mem` (#274).
+- `POST /v1/images/edits` honours `lora_paths` / `lora_scales` (#268).
+- A tool call cut off mid-JSON keeps its tool name instead of vanishing from the reply.
+- A video whose mp4 encode dropped frames reports an error instead of saving a black clip (#170).
+- Thinking models whose `generation_config.json` declares a thinking default now use it (#219, thanks @Fe2-O3).
+- Request image/video/audio buffers no longer leak (#273, thanks @Fe2-O3).
+- Unit tests no longer assume non-NAX silicon (#277, thanks @lojza3d).
+- `--api-key-strict` and `--api-key-env` (#264, thanks @uxsmedjan).
+- Video pane: H3 steps and frames reach the ranges the server accepts (#263, thanks @justinluque).
+- Music tab: Cover offers the missing `fsq.safetensors` download on older ACE-Step packs (#276, thanks @Fe2-O3).
 
 ## v26.8.10 — Neural Engine prefill offload, batched decode, DFlash 2
 

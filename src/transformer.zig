@@ -6368,7 +6368,7 @@ pub const Transformer = struct {
             "embed_tokens";
         const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
             log.err("MISSING WEIGHT: {s}.{s}.weight\n", .{ prefix, emb_base });
-            unreachable;
+            return error.MissingWeight;
         };
         // Dense bf16 (quant_bits==0): no scales/biases exist → null-ctx arrays
         // signal "plain bf16" to embedding()/dequantTake().
@@ -6388,7 +6388,7 @@ pub const Transformer = struct {
         else
             getNamedWeight(weights, &name_buf, prefix, emb_base, "scales") orelse {
                 log.err("MISSING WEIGHT: {s}.{s}.scales\n", .{ prefix, emb_base });
-                unreachable;
+                return error.MissingWeight;
             };
         const emb_b_arr = if (config.quant_bits == 0 or emb_dense)
             mlx.mlx_array_new()
@@ -6396,7 +6396,7 @@ pub const Transformer = struct {
             getNamedWeight(weights, &name_buf, prefix, emb_base, "biases") orelse blk: {
                 if (bias_mandatory) {
                     log.err("MISSING WEIGHT: {s}.{s}.biases\n", .{ prefix, emb_base });
-                    unreachable;
+                    return error.MissingWeight;
                 }
                 break :blk mlx.mlx_array_new();
             };
@@ -6412,11 +6412,11 @@ pub const Transformer = struct {
         if (!config.has_final_norm) {
             final_norm = mlx.mlx_array_new(); // placeholder, unused
         } else if (is_lfm2) {
-            final_norm = getWeightFmt(weights, &name_buf, "{s}.embedding_norm.weight", prefix);
+            final_norm = try getWeightFmt(weights, &name_buf, "{s}.embedding_norm.weight", prefix);
         } else if (is_nemotron) {
-            final_norm = getWeightFmt(weights, &name_buf, "{s}.norm_f.weight", prefix);
+            final_norm = try getWeightFmt(weights, &name_buf, "{s}.norm_f.weight", prefix);
         } else {
-            const final_norm_raw = getWeightFmt(weights, &name_buf, "{s}.norm.weight", prefix);
+            const final_norm_raw = try getWeightFmt(weights, &name_buf, "{s}.norm.weight", prefix);
             const fold_final = config.norm_has_offset and !config.final_norm_plain;
             if (fold_final) {
                 final_norm = try addOne(final_norm_raw, s);
@@ -6456,16 +6456,16 @@ pub const Transformer = struct {
                 lm_head_s = if (head_dense)
                     mlx.mlx_array_new()
                 else if (is_inkling)
-                    getWeightFmt(weights, &name_buf, "{s}.unembed.scales", lm_prefix)
+                    try getWeightFmt(weights, &name_buf, "{s}.unembed.scales", lm_prefix)
                 else
-                    getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
+                    try getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
                 lm_head_b = if (head_dense)
                     mlx.mlx_array_new()
                 else if (bias_mandatory)
                     (if (is_inkling)
-                        getWeightFmt(weights, &name_buf, "{s}.unembed.biases", lm_prefix)
+                        try getWeightFmt(weights, &name_buf, "{s}.unembed.biases", lm_prefix)
                     else
-                        getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix))
+                        try getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix))
                 else
                     getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix) orelse mlx.mlx_array_new();
                 owns_lm_head = !config.tie_word_embeddings;
@@ -6480,7 +6480,7 @@ pub const Transformer = struct {
                 lm_head_b = emb_b_arr;
             } else {
                 log.err("MISSING WEIGHT: lm_head.weight\n", .{});
-                unreachable;
+                return error.MissingWeight;
             }
         }
 
@@ -6566,26 +6566,26 @@ pub const Transformer = struct {
         var ple_proj_norm = mlx.mlx_array_new();
         var ple_proj_quantized = false;
         if (config.hidden_size_per_layer_input > 0) {
-            ple_emb_w = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.weight", prefix);
+            ple_emb_w = try getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.weight", prefix);
             // Dense bf16: no scales/biases → null-ctx; dequantTake takes its dense path.
-            ple_emb_s = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
+            ple_emb_s = if (config.quant_bits == 0) mlx.mlx_array_new() else try getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
             ple_emb_b = if (config.quant_bits == 0)
                 mlx.mlx_array_new()
             else if (bias_mandatory)
-                getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix)
+                try getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix)
             else
                 getWeightFmtOpt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix) orelse mlx.mlx_array_new();
-            ple_proj_w_g = getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.weight", prefix);
+            ple_proj_w_g = try getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.weight", prefix);
             // per_layer_model_projection may be unquantized (no scales/biases)
             if (getWeightFmtOpt(weights, &name_buf, "{s}.per_layer_model_projection.scales", prefix)) |sc| {
                 ple_proj_s_g = sc;
                 ple_proj_b_g = if (bias_mandatory)
-                    getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.biases", prefix)
+                    try getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.biases", prefix)
                 else
                     getWeightFmtOpt(weights, &name_buf, "{s}.per_layer_model_projection.biases", prefix) orelse mlx.mlx_array_new();
                 ple_proj_quantized = true;
             }
-            ple_proj_norm = getWeightFmt(weights, &name_buf, "{s}.per_layer_projection_norm.weight", prefix);
+            ple_proj_norm = try getWeightFmt(weights, &name_buf, "{s}.per_layer_projection_norm.weight", prefix);
         }
 
         // Gemma 4: logit softcapping scalar
@@ -6633,14 +6633,14 @@ pub const Transformer = struct {
         }
         if (config.isDiffusion()) {
             self_cond = .{
-                .pre_norm = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.pre_norm.weight", prefix),
-                .gate_w = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.gate_proj.weight", prefix),
+                .pre_norm = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.pre_norm.weight", prefix),
+                .gate_w = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.gate_proj.weight", prefix),
                 .gate_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.gate_proj.scales", prefix) orelse mlx.mlx_array_new(),
                 .gate_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.gate_proj.biases", prefix) orelse mlx.mlx_array_new(),
-                .up_w = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.up_proj.weight", prefix),
+                .up_w = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.up_proj.weight", prefix),
                 .up_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.up_proj.scales", prefix) orelse mlx.mlx_array_new(),
                 .up_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.up_proj.biases", prefix) orelse mlx.mlx_array_new(),
-                .down_w = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.down_proj.weight", prefix),
+                .down_w = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.down_proj.weight", prefix),
                 .down_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.scales", prefix) orelse mlx.mlx_array_new(),
                 .down_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.biases", prefix) orelse mlx.mlx_array_new(),
             };
@@ -17369,15 +17369,15 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         lw.kv_source = config.getKVSourceLayer(li);
         const kv_shared = lw.kv_source != null;
 
-        const input_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
+        const input_norm_raw = try getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
         lw.input_norm = if (config.norm_has_offset) try addOne(input_norm_raw, s) else input_norm_raw;
-        const post_attn_raw = getLayerWeight(weights, name_buf, prefix, li, "post_attention_layernorm.weight");
+        const post_attn_raw = try getLayerWeight(weights, name_buf, prefix, li, "post_attention_layernorm.weight");
         lw.post_attn_norm = if (config.norm_has_offset) try addOne(post_attn_raw, s) else post_attn_raw;
 
         if (config.has_pre_ff_norm) {
-            const pre_ff_raw = getLayerWeight(weights, name_buf, prefix, li, "pre_feedforward_layernorm.weight");
+            const pre_ff_raw = try getLayerWeight(weights, name_buf, prefix, li, "pre_feedforward_layernorm.weight");
             lw.pre_ff_norm = if (config.norm_has_offset) try addOne(pre_ff_raw, s) else pre_ff_raw;
-            const post_ff_raw = getLayerWeight(weights, name_buf, prefix, li, "post_feedforward_layernorm.weight");
+            const post_ff_raw = try getLayerWeight(weights, name_buf, prefix, li, "post_feedforward_layernorm.weight");
             lw.post_ff_norm = if (config.norm_has_offset) try addOne(post_ff_raw, s) else post_ff_raw;
         } else {
             lw.pre_ff_norm = null;
@@ -17385,13 +17385,13 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         }
 
         if (config.has_qk_norm) {
-            const q_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight");
+            const q_norm_raw = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight");
             lw.q_norm = if (config.norm_has_offset) try addOne(q_norm_raw, s) else q_norm_raw;
             // KV-shared layers compute no K, so they carry no k_norm.
             if (kv_shared) {
                 lw.k_norm = null;
             } else {
-                const k_norm_raw = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight");
+                const k_norm_raw = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight");
                 lw.k_norm = if (config.norm_has_offset) try addOne(k_norm_raw, s) else k_norm_raw;
             }
         } else if (config.qk_norm_weightless) {
@@ -17413,9 +17413,9 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             lw.k_norm = null;
         }
 
-        lw.q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
-        lw.q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
-        lw.q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config);
+        lw.q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
+        lw.q_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
+        lw.q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config);
         // Additive q-proj bias (Qwen2). Optional — empty for archs without it.
         lw.q_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.bias") orelse mlx.mlx_array_new();
         if (kv_shared) {
@@ -17430,9 +17430,9 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             lw.v_b = mlx.mlx_array_new();
             lw.v_bias = mlx.mlx_array_new();
         } else {
-            lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-            lw.k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
-            lw.k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
+            lw.k_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
+            lw.k_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
+            lw.k_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
             lw.k_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.bias") orelse mlx.mlx_array_new();
             // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
             // Sliding_attention layers still have separate V.
@@ -17443,37 +17443,37 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
                 lw.v_b = lw.k_b;
                 lw.v_bias = lw.k_bias;
             } else {
-                lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
-                lw.v_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.scales", config.quant_bits);
-                lw.v_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.v_proj.biases", &config);
+                lw.v_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
+                lw.v_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.scales", config.quant_bits);
+                lw.v_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.v_proj.biases", &config);
                 lw.v_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.bias") orelse mlx.mlx_array_new();
             }
         }
-        lw.o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
-        lw.o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits);
-        lw.o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config);
+        lw.o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
+        lw.o_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits);
+        lw.o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config);
 
         // MuseGlimmer sigmoid attention output gate. `layers` comes from a raw
         // alloc, so the struct-default nulls never apply — set every field.
         if (config.attn_sigmoid_gate) {
-            lw.ag_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.gate_proj.weight");
-            lw.ag_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.gate_proj.scales", config.quant_bits);
-            lw.ag_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.gate_proj.biases", &config);
+            lw.ag_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.gate_proj.weight");
+            lw.ag_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.gate_proj.scales", config.quant_bits);
+            lw.ag_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.gate_proj.biases", &config);
         } else {
             lw.ag_w = null;
             lw.ag_s = mlx.mlx_array_new();
             lw.ag_b = mlx.mlx_array_new();
         }
 
-        lw.gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight");
-        lw.gate_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.scales", config.quant_bits);
-        lw.gate_b = getLayerBias(weights, name_buf, prefix, li, "mlp.gate_proj.biases", &config);
-        lw.up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight");
-        lw.up_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.scales", config.quant_bits);
-        lw.up_b = getLayerBias(weights, name_buf, prefix, li, "mlp.up_proj.biases", &config);
-        lw.down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight");
-        lw.down_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.scales", config.quant_bits);
-        lw.down_b = getLayerBias(weights, name_buf, prefix, li, "mlp.down_proj.biases", &config);
+        lw.gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight");
+        lw.gate_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.scales", config.quant_bits);
+        lw.gate_b = try getLayerBias(weights, name_buf, prefix, li, "mlp.gate_proj.biases", &config);
+        lw.up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight");
+        lw.up_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.scales", config.quant_bits);
+        lw.up_b = try getLayerBias(weights, name_buf, prefix, li, "mlp.up_proj.biases", &config);
+        lw.down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight");
+        lw.down_s = try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.scales", config.quant_bits);
+        lw.down_b = try getLayerBias(weights, name_buf, prefix, li, "mlp.down_proj.biases", &config);
 
         // Dense bf16: pre-transpose [out,in]→[in,out] so qmatmulBits dispatches to
         // a plain matmul. No-ops on quantized weights (scales non-null).
@@ -17513,10 +17513,10 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             // `.?` then feeds qmatmul, so supply a null-ctx array (not Zig-null) →
             // qmatmulBits sees the bf16 path.
             lw.ple_gate_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_input_gate.scales", config.quant_bits);
-            lw.ple_gate_b = getLayerBias(weights, name_buf, prefix, li, "per_layer_input_gate.biases", &config);
+            lw.ple_gate_b = try getLayerBias(weights, name_buf, prefix, li, "per_layer_input_gate.biases", &config);
             lw.ple_proj_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.weight");
             lw.ple_proj_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_projection.scales", config.quant_bits);
-            lw.ple_proj_b = getLayerBias(weights, name_buf, prefix, li, "per_layer_projection.biases", &config);
+            lw.ple_proj_b = try getLayerBias(weights, name_buf, prefix, li, "per_layer_projection.biases", &config);
             lw.ple_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "post_per_layer_input_norm.weight");
             // bf16: pre-transpose the two PLE projections (used via qmatmul).
             if (lw.ple_gate_w) |*w| try maybeTransposeForBf16(w, lw.ple_gate_s.?, &owned_bf16, allocator, s);
@@ -17719,7 +17719,7 @@ fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []const u
         .norm_key = try groupedNormView(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.norm_key.weight", .{ prefix, li }) catch unreachable, hc, hidden, owned_bf16, allocator, s),
         .norm_query = try groupedNormView(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.norm_query.weight", .{ prefix, li }) catch unreachable, hc, hidden, owned_bf16, allocator, s),
         .norm_conv = try groupedNormView(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.norm_conv.weight", .{ prefix, li }) catch unreachable, hc, hidden, owned_bf16, allocator, s),
-        .conv_w = getLayerWeight(weights, name_buf, prefix, li, "ple.conv1d.weight"),
+        .conv_w = try getLayerWeight(weights, name_buf, prefix, li, "ple.conv1d.weight"),
     };
 }
 
@@ -17752,15 +17752,15 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         lw.input_norm = if (is_qwen4)
             mlx.mlx_array_new()
         else if (is_inkling)
-            getLayerWeight(weights, name_buf, prefix, li, "attn_norm.weight")
+            try getLayerWeight(weights, name_buf, prefix, li, "attn_norm.weight")
         else
-            getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
+            try getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
         lw.post_attn_norm = if (is_qwen4)
             mlx.mlx_array_new()
         else if (is_inkling)
-            getLayerWeight(weights, name_buf, prefix, li, "mlp_norm.weight")
+            try getLayerWeight(weights, name_buf, prefix, li, "mlp_norm.weight")
         else
-            getLayerWeight(weights, name_buf, prefix, li, "post_attention_layernorm.weight");
+            try getLayerWeight(weights, name_buf, prefix, li, "post_attention_layernorm.weight");
         lw.is_linear = is_linear;
 
         // `moe_layers` comes from `allocator.alloc` which skips struct defaults, so every
@@ -17794,8 +17794,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // Post-attention / post-MLP short-conv taps on every layer; the
             // dense bottom layers additionally carry mlp.global_scale (absent
             // on MoE layers, whose scale is mlp.gate.global_scale).
-            lw.attn_sconv_w = getLayerWeight(weights, name_buf, prefix, li, "attn_sconv.weight");
-            lw.mlp_sconv_w = getLayerWeight(weights, name_buf, prefix, li, "mlp_sconv.weight");
+            lw.attn_sconv_w = try getLayerWeight(weights, name_buf, prefix, li, "attn_sconv.weight");
+            lw.mlp_sconv_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp_sconv.weight");
             lw.mlp_global_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.global_scale");
         }
 
@@ -17816,13 +17816,13 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             lw.post_ff_norm_2 = getLayerWeightOpt(weights, name_buf, prefix, li, "post_feedforward_layernorm_2.weight");
             lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
             lw.shared_mlp = .{
-                .gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
+                .gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
                 .gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
+                .up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
                 .up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
                 .up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
+                .down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
                 .down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
                 .down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
             };
@@ -17848,7 +17848,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             var any_scales = false;
             for (qkv_names, 0..) |base, n| {
                 var nb: [256]u8 = undefined;
-                qkv_w[n] = getLayerWeight(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.weight", .{base}) catch unreachable);
+                qkv_w[n] = try getLayerWeight(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.weight", .{base}) catch unreachable);
                 qkv_s[n] = getLayerWeightOpt(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.scales", .{base}) catch unreachable) orelse mlx.mlx_array_new();
                 qkv_b[n] = getLayerWeightOpt(weights, name_buf, prefix, li, std.fmt.bufPrint(&nb, "{s}.biases", .{base}) catch unreachable) orelse mlx.mlx_array_new();
                 if (qkv_s[n].ctx != null) any_scales = true;
@@ -17873,7 +17873,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     else => "attention.v_conv1d.weight",
                 };
                 conv_w[n] = getLayerWeightOpt(weights, name_buf, prefix, li, conv_nested) orelse
-                    getLayerWeight(weights, name_buf, prefix, li, conv_flat);
+                    try getLayerWeight(weights, name_buf, prefix, li, conv_flat);
             }
             // The three projections must be quantized IDENTICALLY to join. A
             // dense q beside a quantized k gives a triple whose scales cover
@@ -17912,7 +17912,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // A_log is [Hv] but the gate is per KEY CHANNEL — expand once here
             // so the hot path stays elementwise over flat [B,S,Hv*Dk] arrays
             // (no reshape, no per-head broadcast, per layer per token).
-            const a_log_raw = getLayerWeight(weights, name_buf, prefix, li, "attention.A_log");
+            const a_log_raw = try getLayerWeight(weights, name_buf, prefix, li, "attention.A_log");
             const dk_c: c_int = @intCast(config.linear_key_head_dim);
             const hv_c: c_int = @intCast(config.linear_num_value_heads);
             var a_log_exp = mlx.mlx_array_new();
@@ -17932,20 +17932,20 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .qkv_w = joined_w,
                 .qkv_s = joined_s,
                 .qkv_b = joined_b,
-                .z_w = getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
+                .z_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
                 .z_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.scales") orelse mlx.mlx_array_new(),
                 .z_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.biases") orelse mlx.mlx_array_new(),
-                .a_w = getLayerWeight(weights, name_buf, prefix, li, "attention.f_proj.weight"),
+                .a_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.f_proj.weight"),
                 .a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.f_proj.scales") orelse mlx.mlx_array_new(),
                 .a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.f_proj.biases") orelse mlx.mlx_array_new(),
-                .b_w = getLayerWeight(weights, name_buf, prefix, li, "attention.b_proj.weight"),
+                .b_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.b_proj.weight"),
                 .b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.b_proj.scales") orelse mlx.mlx_array_new(),
                 .b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.b_proj.biases") orelse mlx.mlx_array_new(),
                 .conv1d_w = joined_conv,
                 .A_log = a_log_exp,
-                .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "attention.dt_bias"),
-                .norm_w = getLayerWeight(weights, name_buf, prefix, li, "attention.o_norm.weight"),
-                .out_w = getLayerWeight(weights, name_buf, prefix, li, "attention.o_proj.weight"),
+                .dt_bias = try getLayerWeight(weights, name_buf, prefix, li, "attention.dt_bias"),
+                .norm_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.o_norm.weight"),
+                .out_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.o_proj.weight"),
                 .out_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.o_proj.scales") orelse mlx.mlx_array_new(),
                 .out_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.o_proj.biases") orelse mlx.mlx_array_new(),
             } };
@@ -17966,7 +17966,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             if (combined) {
                 lw.attn = .{ .linear = .{
                     .combined_proj = true,
-                    .qkv_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.weight"),
+                    .qkv_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.weight"),
                     .qkv_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.scales") orelse mlx.mlx_array_new(),
                     .qkv_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.biases") orelse mlx.mlx_array_new(),
                     .z_w = mlx.mlx_array_new(),
@@ -17975,14 +17975,14 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     .a_w = mlx.mlx_array_new(),
                     .a_s = mlx.mlx_array_new(),
                     .a_b = mlx.mlx_array_new(),
-                    .b_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.weight"),
+                    .b_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.weight"),
                     .b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.scales") orelse mlx.mlx_array_new(),
                     .b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.biases") orelse mlx.mlx_array_new(),
-                    .conv1d_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.conv1d.weight"),
-                    .A_log = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.A_log"),
-                    .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.dt_bias"),
-                    .norm_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.norm.weight"),
-                    .out_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.weight"),
+                    .conv1d_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.conv1d.weight"),
+                    .A_log = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.A_log"),
+                    .dt_bias = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.dt_bias"),
+                    .norm_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.norm.weight"),
+                    .out_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.weight"),
                     .out_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.scales") orelse mlx.mlx_array_new(),
                     .out_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.biases") orelse mlx.mlx_array_new(),
                 } };
@@ -17992,23 +17992,23 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
             } else {
                 lw.attn = .{ .linear = .{
-                    .qkv_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.weight"),
+                    .qkv_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.weight"),
                     .qkv_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.scales") orelse mlx.mlx_array_new(),
                     .qkv_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.biases") orelse mlx.mlx_array_new(),
-                    .z_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_z.weight"),
+                    .z_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_z.weight"),
                     .z_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_z.scales") orelse mlx.mlx_array_new(),
                     .z_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_z.biases") orelse mlx.mlx_array_new(),
-                    .a_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_a.weight"),
+                    .a_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_a.weight"),
                     .a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_a.scales") orelse mlx.mlx_array_new(),
                     .a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_a.biases") orelse mlx.mlx_array_new(),
-                    .b_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_b.weight"),
+                    .b_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_b.weight"),
                     .b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_b.scales") orelse mlx.mlx_array_new(),
                     .b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_b.biases") orelse mlx.mlx_array_new(),
-                    .conv1d_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.conv1d.weight"),
-                    .A_log = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.A_log"),
-                    .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.dt_bias"),
-                    .norm_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.norm.weight"),
-                    .out_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.weight"),
+                    .conv1d_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.conv1d.weight"),
+                    .A_log = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.A_log"),
+                    .dt_bias = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.dt_bias"),
+                    .norm_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.norm.weight"),
+                    .out_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.weight"),
                     .out_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.scales") orelse mlx.mlx_array_new(),
                     .out_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.biases") orelse mlx.mlx_array_new(),
                 } };
@@ -18035,33 +18035,33 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     .v_w = mlx.mlx_array_new(),
                     .v_s = mlx.mlx_array_new(),
                     .v_b = mlx.mlx_array_new(),
-                    .o_w = getLayerWeight(weights, name_buf, prefix, li, "attention.dense.weight"),
+                    .o_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.dense.weight"),
                     .o_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.dense.scales") orelse mlx.mlx_array_new(),
                     .o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.dense.biases") orelse mlx.mlx_array_new(),
                     // MLA norms the LATENTS, not the per-head q/k.
                     .q_norm = mlx.mlx_array_new(),
                     .k_norm = mlx.mlx_array_new(),
-                    .g_w = getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
+                    .g_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
                     .g_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.scales") orelse mlx.mlx_array_new(),
                     .g_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.biases") orelse mlx.mlx_array_new(),
                     // Exactly ONE Q arm per checkpoint: the low-rank pair
                     // (tiny) or a direct q_proj (flash, `q_lora_rank: null`).
                     // Asking for the absent one would abort the load.
-                    .mla_q_direct_w = if (config.mlaHasQLora()) mlx.mlx_array_new() else getLayerWeight(weights, name_buf, prefix, li, "attention.q_proj.weight"),
+                    .mla_q_direct_w = if (config.mlaHasQLora()) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, "attention.q_proj.weight"),
                     .mla_q_direct_s = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.scales") orelse mlx.mlx_array_new()),
                     .mla_q_direct_b = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.biases") orelse mlx.mlx_array_new()),
-                    .mla_q_a_w = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_proj.weight") else mlx.mlx_array_new(),
+                    .mla_q_a_w = if (config.mlaHasQLora()) try getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_proj.weight") else mlx.mlx_array_new(),
                     .mla_q_a_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
                     .mla_q_a_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
-                    .mla_q_a_norm = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_layernorm.weight") else mlx.mlx_array_new(),
-                    .mla_q_b_w = if (config.mlaHasQLora()) getLayerWeight(weights, name_buf, prefix, li, "attention.q_b_proj.weight") else mlx.mlx_array_new(),
+                    .mla_q_a_norm = if (config.mlaHasQLora()) try getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_layernorm.weight") else mlx.mlx_array_new(),
+                    .mla_q_b_w = if (config.mlaHasQLora()) try getLayerWeight(weights, name_buf, prefix, li, "attention.q_b_proj.weight") else mlx.mlx_array_new(),
                     .mla_q_b_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
                     .mla_q_b_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
-                    .mla_kv_a_w = getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.weight"),
+                    .mla_kv_a_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.weight"),
                     .mla_kv_a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.scales") orelse mlx.mlx_array_new(),
                     .mla_kv_a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.biases") orelse mlx.mlx_array_new(),
-                    .mla_kv_a_norm = getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_layernorm.weight"),
-                    .mla_kv_b_w = getLayerWeight(weights, name_buf, prefix, li, "attention.kv_b_proj.weight"),
+                    .mla_kv_a_norm = try getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_layernorm.weight"),
+                    .mla_kv_b_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.kv_b_proj.weight"),
                     .mla_kv_b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_b_proj.scales") orelse mlx.mlx_array_new(),
                     .mla_kv_b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_b_proj.biases") orelse mlx.mlx_array_new(),
                 },
@@ -18084,26 +18084,26 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // to f32 at use). No biases exist on any projection (q_bias/o_bias
             // false in every shipped config).
             lw.attn = .{ .full = .{
-                .q_w = getLayerWeight(weights, name_buf, prefix, li, "attn.wq_du.weight"),
+                .q_w = try getLayerWeight(weights, name_buf, prefix, li, "attn.wq_du.weight"),
                 .q_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wq_du.scales") orelse mlx.mlx_array_new(),
                 .q_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wq_du.biases") orelse mlx.mlx_array_new(),
-                .k_w = getLayerWeight(weights, name_buf, prefix, li, "attn.wk_dv.weight"),
+                .k_w = try getLayerWeight(weights, name_buf, prefix, li, "attn.wk_dv.weight"),
                 .k_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wk_dv.scales") orelse mlx.mlx_array_new(),
                 .k_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wk_dv.biases") orelse mlx.mlx_array_new(),
-                .v_w = getLayerWeight(weights, name_buf, prefix, li, "attn.wv_dv.weight"),
+                .v_w = try getLayerWeight(weights, name_buf, prefix, li, "attn.wv_dv.weight"),
                 .v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wv_dv.scales") orelse mlx.mlx_array_new(),
                 .v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wv_dv.biases") orelse mlx.mlx_array_new(),
-                .o_w = getLayerWeight(weights, name_buf, prefix, li, "attn.wo_ud.weight"),
+                .o_w = try getLayerWeight(weights, name_buf, prefix, li, "attn.wo_ud.weight"),
                 .o_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wo_ud.scales") orelse mlx.mlx_array_new(),
                 .o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wo_ud.biases") orelse mlx.mlx_array_new(),
-                .q_norm = getLayerWeight(weights, name_buf, prefix, li, "attn.q_norm.weight"),
-                .k_norm = getLayerWeight(weights, name_buf, prefix, li, "attn.k_norm.weight"),
-                .rel_w = getLayerWeight(weights, name_buf, prefix, li, "attn.wr_du.weight"),
+                .q_norm = try getLayerWeight(weights, name_buf, prefix, li, "attn.q_norm.weight"),
+                .k_norm = try getLayerWeight(weights, name_buf, prefix, li, "attn.k_norm.weight"),
+                .rel_w = try getLayerWeight(weights, name_buf, prefix, li, "attn.wr_du.weight"),
                 .rel_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wr_du.scales") orelse mlx.mlx_array_new(),
                 .rel_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attn.wr_du.biases") orelse mlx.mlx_array_new(),
-                .rel_proj = getLayerWeight(weights, name_buf, prefix, li, "attn.rel_logits_proj.proj"),
-                .k_sconv_w = getLayerWeight(weights, name_buf, prefix, li, "attn.k_sconv.weight"),
-                .v_sconv_w = getLayerWeight(weights, name_buf, prefix, li, "attn.v_sconv.weight"),
+                .rel_proj = try getLayerWeight(weights, name_buf, prefix, li, "attn.rel_logits_proj.proj"),
+                .k_sconv_w = try getLayerWeight(weights, name_buf, prefix, li, "attn.k_sconv.weight"),
+                .v_sconv_w = try getLayerWeight(weights, name_buf, prefix, li, "attn.v_sconv.weight"),
             } };
             const fa = &lw.attn.full;
             try maybeTransposeForBf16(&fa.q_w, fa.q_s, &owned_bf16, allocator, s);
@@ -18122,35 +18122,35 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             const k_s = if (is_laguna)
                 (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.scales") orelse mlx.mlx_array_new())
             else
-                getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
-            const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-            const k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
+                try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
+            const k_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
+            const k_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
             // Gemma 4 MoE: global layers use K=V (no separate v_proj)
             const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
             const v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse k_b;
             const v_aliases_k = v_w.ctx == k_w.ctx;
             lw.attn = .{ .full = .{
-                .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
+                .q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
                 .q_s = if (is_laguna)
                     (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
                 else
-                    getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
-                .q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
+                    try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
+                .q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
                 .k_w = k_w,
                 .k_s = k_s,
                 .k_b = k_b,
                 .v_w = v_w,
                 .v_s = v_s,
                 .v_b = v_b,
-                .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
+                .o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
                 .o_s = if (is_laguna)
                     (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
                 else
-                    getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
-                .o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
-                .q_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight"),
-                .k_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight"),
+                    try getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
+                .o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
+                .q_norm = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight"),
+                .k_norm = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight"),
             } };
             {
                 // Dense bf16 (null-ctx scales): pre-transpose [out,in]→[in,out] so
@@ -18171,17 +18171,17 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 // (scales absent → pre-transposed), quantized in the mlx-lm
                 // affine layout (scales+biases present → quant path). Probe.
                 if (is_laguna) {
-                    fa.g_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.g_proj.weight");
+                    fa.g_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.g_proj.weight");
                     fa.g_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.g_proj.scales") orelse mlx.mlx_array_new();
-                    fa.g_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.g_proj.biases", &config);
+                    fa.g_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.g_proj.biases", &config);
                     try maybeTransposeForBf16(&fa.g_w, fa.g_s, &owned_bf16, allocator, s);
                 }
                 if (is_qwen4 and config.indexer_n_heads > 0) {
-                    fa.idx_qk_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.index_qk_proj.weight");
+                    fa.idx_qk_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.index_qk_proj.weight");
                     fa.idx_qk_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.indexer.index_qk_proj.scales") orelse mlx.mlx_array_new();
                     fa.idx_qk_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.indexer.index_qk_proj.biases") orelse mlx.mlx_array_new();
-                    fa.idx_q_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.q_layernorm.weight");
-                    fa.idx_k_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.k_layernorm.weight");
+                    fa.idx_q_norm = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.q_layernorm.weight");
+                    fa.idx_k_norm = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.indexer.k_layernorm.weight");
                     try maybeTransposeForBf16(&fa.idx_qk_w, fa.idx_qk_s, &owned_bf16, allocator, s);
                 }
             }
@@ -18217,25 +18217,25 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             var exbuf: [64]u8 = undefined;
             lw.mlp = .{
                 .moe = .{
-                    .router_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
                     .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
                     .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
-                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
                     .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
                     .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
-                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
                     .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
                     .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
-                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
                     .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
                     .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
-                    .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
+                    .shared_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
                     .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.weight"),
+                    .shared_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.weight"),
                     .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.weight"),
+                    .shared_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.weight"),
                     .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.biases") orelse mlx.mlx_array_new(),
                     .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.expert_bias") orelse blk: {
@@ -18310,23 +18310,23 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     sw_gate_b = mlx.mlx_array_new();
                     sw_up_b = mlx.mlx_array_new();
                 }
-                sw_down_w = getLayerWeight(weights, name_buf, prefix, li, "experts.down_proj.weight");
+                sw_down_w = try getLayerWeight(weights, name_buf, prefix, li, "experts.down_proj.weight");
                 sw_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.down_proj.scales") orelse mlx.mlx_array_new();
                 sw_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.down_proj.biases") orelse mlx.mlx_array_new();
             } else {
-                sw_gate_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.weight");
+                sw_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.weight");
                 sw_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.scales") orelse mlx.mlx_array_new();
                 sw_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.biases") orelse mlx.mlx_array_new();
-                sw_up_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.weight");
+                sw_up_w = try getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.weight");
                 sw_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.scales") orelse mlx.mlx_array_new();
                 sw_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.biases") orelse mlx.mlx_array_new();
-                sw_down_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.weight");
+                sw_down_w = try getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.weight");
                 sw_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.scales") orelse mlx.mlx_array_new();
                 sw_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.biases") orelse mlx.mlx_array_new();
             }
             lw.mlp = .{
                 .moe = .{
-                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "router.proj.weight"),
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "router.proj.weight"),
                     .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.scales") orelse mlx.mlx_array_new(),
                     .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.biases") orelse mlx.mlx_array_new(),
                     .router_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.scale"),
@@ -18341,13 +18341,13 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     .switch_down_s = sw_down_s,
                     .switch_down_b = sw_down_b,
                     // Shared expert handled via lw.shared_mlp for Gemma 4 (separate branch in forward)
-                    .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
+                    .shared_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
                     .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
+                    .shared_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
                     .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
+                    .shared_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
                     .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
                 },
@@ -18386,25 +18386,25 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // the inkling forward arm — route_norm/shared_ungated are not read.
             lw.mlp = .{
                 .moe = .{
-                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                     .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                     .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
                     .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
                     .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
                     .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
                     .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
                     .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
+                    .shared_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
                     .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.weight"),
+                    .shared_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.weight"),
                     .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.weight"),
+                    .shared_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.weight"),
                     .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.biases") orelse mlx.mlx_array_new(),
                     .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.bias") orelse blk: {
@@ -18452,16 +18452,16 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             var rtbuf: [64]u8 = undefined;
             lw.mlp = .{
                 .moe = .{
-                    .router_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
                     .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
                     .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
-                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
                     .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
                     .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
                     .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
                     .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
                     .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
                     .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
@@ -18515,16 +18515,16 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             var exbuf: [64]u8 = undefined;
             lw.mlp = .{
                 .moe = .{
-                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.router.gate.weight"),
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.router.gate.weight"),
                     .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.scales") orelse mlx.mlx_array_new(),
                     .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.biases") orelse mlx.mlx_array_new(),
-                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
                     .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
                     .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
-                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
                     .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
                     .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
-                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
                     .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
                     .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
                     .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.weight") orelse mlx.mlx_array_new(),
@@ -18578,16 +18578,16 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // `[out, in]` → `[in, out]` so `qmatmulBits` can dispatch to plain
             // `mlx_matmul`; they no-op on already-quantized AND on empty handles.
             lw.mlp = .{ .moe = .{
-                .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
+                .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
+                .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
                 .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
+                .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
                 .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
                 .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
+                .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
                 .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
                 .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
@@ -18618,13 +18618,13 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             }
         } else {
             lw.mlp = .{ .dense = .{
-                .gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
+                .gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
                 .gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
+                .up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
                 .up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
                 .up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
+                .down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
                 .down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
                 .down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
             } };
@@ -18681,9 +18681,9 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
 
         // Input norm: LFM2 uses "operator_norm", Nemotron-H uses "norm"
         if (is_lfm2) {
-            lw.input_norm = getLayerWeight(weights, name_buf, prefix, li, "operator_norm.weight");
+            lw.input_norm = try getLayerWeight(weights, name_buf, prefix, li, "operator_norm.weight");
         } else {
-            lw.input_norm = getLayerWeight(weights, name_buf, prefix, li, "norm.weight");
+            lw.input_norm = try getLayerWeight(weights, name_buf, prefix, li, "norm.weight");
         }
 
         // Post norm (before MLP): LFM2 uses "ffn_norm", Nemotron-H single-op blocks have none
@@ -18703,13 +18703,13 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
         switch (block_type) {
             .gated_conv => {
                 lw.op = .{ .gated_conv = .{
-                    .in_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.weight"),
+                    .in_proj_w = try getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.weight"),
                     .in_proj_s = getLayerScaleOpt(weights, name_buf, prefix, li, "conv.in_proj.scales"),
-                    .in_proj_b = getLayerBias(weights, name_buf, prefix, li, "conv.in_proj.biases", &config),
-                    .conv_w = getLayerWeight(weights, name_buf, prefix, li, "conv.conv.weight"),
-                    .out_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.weight"),
+                    .in_proj_b = try getLayerBias(weights, name_buf, prefix, li, "conv.in_proj.biases", &config),
+                    .conv_w = try getLayerWeight(weights, name_buf, prefix, li, "conv.conv.weight"),
+                    .out_proj_w = try getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.weight"),
                     .out_proj_s = getLayerScaleOpt(weights, name_buf, prefix, li, "conv.out_proj.scales"),
-                    .out_proj_b = getLayerBias(weights, name_buf, prefix, li, "conv.out_proj.biases", &config),
+                    .out_proj_b = try getLayerBias(weights, name_buf, prefix, li, "conv.out_proj.biases", &config),
                 } };
                 try maybeTransposeDepthwiseConv(&lw.op.gated_conv.conv_w, &owned_bf16, allocator, s);
             },
@@ -18718,16 +18718,16 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     // Nemotron-H: mixer.{q,k,v,o}_proj, no QK norms
                     // Use Opt for biases — mxfp8 quantized layers may lack them
                     lw.op = .{ .full_attn = .{
-                        .q_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.q_proj.weight"),
+                        .q_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.q_proj.weight"),
                         .q_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.q_proj.scales"),
                         .q_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.q_proj.biases") orelse mlx.mlx_array_new(),
-                        .k_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.k_proj.weight"),
+                        .k_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.k_proj.weight"),
                         .k_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.k_proj.scales"),
                         .k_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.k_proj.biases") orelse mlx.mlx_array_new(),
-                        .v_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.v_proj.weight"),
+                        .v_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.v_proj.weight"),
                         .v_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.v_proj.scales"),
                         .v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.v_proj.biases") orelse mlx.mlx_array_new(),
-                        .o_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.o_proj.weight"),
+                        .o_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.o_proj.weight"),
                         .o_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.o_proj.scales"),
                         .o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.o_proj.biases") orelse mlx.mlx_array_new(),
                         .q_norm = mlx.mlx_array_new(),
@@ -18736,18 +18736,18 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                 } else {
                     // LFM2: self_attn.{q,k,v}_proj + out_proj, QK layernorms
                     lw.op = .{ .full_attn = .{
-                        .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
+                        .q_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
                         .q_s = getLayerScaleOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
-                        .q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
-                        .k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight"),
+                        .q_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
+                        .k_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight"),
                         .k_s = getLayerScaleOpt(weights, name_buf, prefix, li, "self_attn.k_proj.scales"),
-                        .k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config),
-                        .v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight"),
+                        .k_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config),
+                        .v_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight"),
                         .v_s = getLayerScaleOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales"),
-                        .v_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.v_proj.biases", &config),
-                        .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.weight"),
+                        .v_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.v_proj.biases", &config),
+                        .o_w = try getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.weight"),
                         .o_s = getLayerScaleOpt(weights, name_buf, prefix, li, "self_attn.out_proj.scales"),
-                        .o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.out_proj.biases", &config),
+                        .o_b = try getLayerBias(weights, name_buf, prefix, li, "self_attn.out_proj.biases", &config),
                         .q_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_layernorm.weight") orelse mlx.mlx_array_new(),
                         .k_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_layernorm.weight") orelse mlx.mlx_array_new(),
                     } };
@@ -18755,16 +18755,16 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             },
             .mamba2 => {
                 lw.op = .{ .mamba2 = .{
-                    .in_proj_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.in_proj.weight"),
+                    .in_proj_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.in_proj.weight"),
                     .in_proj_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.in_proj.scales"),
                     .in_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.in_proj.biases") orelse mlx.mlx_array_new(),
-                    .conv1d_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.conv1d.weight"),
+                    .conv1d_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.conv1d.weight"),
                     .conv1d_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.conv1d.bias"),
-                    .A_log = getLayerWeight(weights, name_buf, prefix, li, "mixer.A_log"),
-                    .D = getLayerWeight(weights, name_buf, prefix, li, "mixer.D"),
-                    .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "mixer.dt_bias"),
-                    .norm_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.norm.weight"),
-                    .out_proj_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.out_proj.weight"),
+                    .A_log = try getLayerWeight(weights, name_buf, prefix, li, "mixer.A_log"),
+                    .D = try getLayerWeight(weights, name_buf, prefix, li, "mixer.D"),
+                    .dt_bias = try getLayerWeight(weights, name_buf, prefix, li, "mixer.dt_bias"),
+                    .norm_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.norm.weight"),
+                    .out_proj_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.out_proj.weight"),
                     .out_proj_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.out_proj.scales"),
                     .out_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.out_proj.biases") orelse mlx.mlx_array_new(),
                 } };
@@ -18772,10 +18772,10 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             .mlp => {
                 // Nemotron-H standalone MLP (ReLU^2, ungated: up + down only)
                 lw.op = .{ .simple_mlp = .{
-                    .up_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.up_proj.weight"),
+                    .up_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.up_proj.weight"),
                     .up_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.up_proj.scales"),
                     .up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .down_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.down_proj.weight"),
+                    .down_w = try getLayerWeight(weights, name_buf, prefix, li, "mixer.down_proj.weight"),
                     .down_s = getLayerScaleOpt(weights, name_buf, prefix, li, "mixer.down_proj.scales"),
                     .down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.down_proj.biases") orelse mlx.mlx_array_new(),
                 } };
@@ -18795,16 +18795,16 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             lw.mlp = null;
             const none = mlx.mlx_array_new();
             lw.moe_mlp = .{
-                .router_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.gate.weight"),
+                .router_w = try getLayerWeight(weights, name_buf, prefix, li, "feed_forward.gate.weight"),
                 .router_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.gate.scales"),
                 .router_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.gate.biases"),
-                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.gate_proj.weight"),
+                .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.gate_proj.weight"),
                 .switch_gate_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.gate_proj.scales"),
                 .switch_gate_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.gate_proj.biases"),
-                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.up_proj.weight"),
+                .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.up_proj.weight"),
                 .switch_up_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.up_proj.scales"),
                 .switch_up_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.up_proj.biases"),
-                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.down_proj.weight"),
+                .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "feed_forward.switch_mlp.down_proj.weight"),
                 .switch_down_s = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.down_proj.scales"),
                 .switch_down_b = getLayerScaleOpt(weights, name_buf, prefix, li, "feed_forward.switch_mlp.down_proj.biases"),
                 // No shared expert on this family — null handles keep
@@ -18842,15 +18842,15 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                 [3][]const u8{ "gate_proj", "up_proj", "down_proj" };
             var kb: [64]u8 = undefined;
             lw.mlp = .{
-                .gate_w = getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "weight")),
+                .gate_w = try getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "weight")),
                 .gate_s = getLayerScaleOpt(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "scales")),
-                .gate_b = getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "biases"), &config),
-                .up_w = getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "weight")),
+                .gate_b = try getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[0], "biases"), &config),
+                .up_w = try getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "weight")),
                 .up_s = getLayerScaleOpt(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "scales")),
-                .up_b = getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "biases"), &config),
-                .down_w = getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "weight")),
+                .up_b = try getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[1], "biases"), &config),
+                .down_w = try getLayerWeight(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "weight")),
                 .down_s = getLayerScaleOpt(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "scales")),
-                .down_b = getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "biases"), &config),
+                .down_b = try getLayerBias(weights, name_buf, prefix, li, ffKey(&kb, gate_key[2], "biases"), &config),
             };
         } else {
             lw.mlp = null;
@@ -24145,12 +24145,20 @@ fn sliceTimestep3(arr: mlx.mlx_array, batch: c_int, heads: c_int, t: c_int, s: m
     return result;
 }
 
-fn getWeightFmt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const u8, prefix: []const u8) mlx.mlx_array {
+fn getWeightFmt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const u8, prefix: []const u8) error{MissingWeight}!mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, fmt, .{prefix}) catch unreachable;
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
-        unreachable;
+        return error.MissingWeight;
     };
+}
+
+test "a missing weight is a load ERROR, not a process exit (issue #217)" {
+    var w = model_mod.Weights.init(std.testing.allocator);
+    defer w.deinit();
+    var buf: [256]u8 = undefined;
+    try std.testing.expectError(error.MissingWeight, getLayerWeight(&w, &buf, "model", 0, "mlp.w1.weight"));
+    try std.testing.expectError(error.MissingWeight, getWeightFmt(&w, &buf, "{s}.norm.weight", "model"));
 }
 
 /// `{prefix}.{base}.{suffix}` with a RUNTIME base — the embedding table's name
@@ -24178,11 +24186,11 @@ fn ffKey(buf: *[64]u8, name: []const u8, suffix: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "feed_forward.{s}.{s}", .{ name, suffix }) catch unreachable;
 }
 
-fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) mlx.mlx_array {
+fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "{s}.layers.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
-        unreachable;
+        return error.MissingWeight;
     };
 }
 
@@ -24244,9 +24252,9 @@ fn bailingRouterBase(weights: *const Weights, buf: *[256]u8, prefix: []const u8,
 /// guards) reads as "this weight is plain bf16". quant_bits > 0 ⇒ a genuinely
 /// quantized model, so fetch mandatorily — a missing scale stays a clear
 /// MISSING WEIGHT error rather than silently degrading to a dense path.
-fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, quant_bits: u32) mlx.mlx_array {
+fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, quant_bits: u32) error{MissingWeight}!mlx.mlx_array {
     if (quant_bits == 0) return mlx.mlx_array_new();
-    return getLayerWeight(weights, buf, prefix, layer, suffix);
+    return try getLayerWeight(weights, buf, prefix, layer, suffix);
 }
 
 /// Fetch a `.biases` tensor with mode-aware mandatoriness:
@@ -24256,9 +24264,9 @@ fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []const 
 ///   tensors ship no biases, but mixed QAT checkpoints override some layers
 ///   to affine (e.g. shared MLP at 8-bit/gs64) and those overrides DO carry
 ///   biases that the affine matmul needs.
-fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) mlx.mlx_array {
+fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) error{MissingWeight}!mlx.mlx_array {
     if (config.quant_bits == 0) return mlx.mlx_array_new();
-    if (config.quant_mode.hasBiases()) return getLayerWeight(weights, buf, prefix, layer, suffix);
+    if (config.quant_mode.hasBiases()) return try getLayerWeight(weights, buf, prefix, layer, suffix);
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
 }
 
@@ -24287,19 +24295,19 @@ fn bf16Scalar(val: f32, s: mlx.mlx_stream) mlx.mlx_array {
     return bf16_arr;
 }
 
-fn getBertWeight(weights: *const Weights, buf: *[256]u8, name: []const u8) mlx.mlx_array {
+fn getBertWeight(weights: *const Weights, buf: *[256]u8, name: []const u8) error{MissingWeight}!mlx.mlx_array {
     const n = std.fmt.bufPrint(buf, "{s}", .{name}) catch unreachable;
     return weights.get(n) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{n});
-        unreachable;
+        return error.MissingWeight;
     };
 }
 
-fn getBertLayerWeight(weights: *const Weights, buf: *[256]u8, layer: u32, suffix: []const u8) mlx.mlx_array {
+fn getBertLayerWeight(weights: *const Weights, buf: *[256]u8, layer: u32, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "encoder.layer.{d}.{s}", .{ layer, suffix }) catch unreachable;
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
-        unreachable;
+        return error.MissingWeight;
     };
 }
 
@@ -24311,57 +24319,57 @@ fn initBertLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *c
         const li: u32 = @intCast(i);
         const lw = &layers[i];
 
-        lw.q_w = getBertLayerWeight(weights, name_buf, li, "attention.self.query.weight");
-        lw.q_s = getBertLayerWeight(weights, name_buf, li, "attention.self.query.scales");
-        lw.q_b = getBertLayerWeight(weights, name_buf, li, "attention.self.query.biases");
-        lw.q_bias = getBertLayerWeight(weights, name_buf, li, "attention.self.query.bias");
-        lw.k_w = getBertLayerWeight(weights, name_buf, li, "attention.self.key.weight");
-        lw.k_s = getBertLayerWeight(weights, name_buf, li, "attention.self.key.scales");
-        lw.k_b = getBertLayerWeight(weights, name_buf, li, "attention.self.key.biases");
-        lw.k_bias = getBertLayerWeight(weights, name_buf, li, "attention.self.key.bias");
-        lw.v_w = getBertLayerWeight(weights, name_buf, li, "attention.self.value.weight");
-        lw.v_s = getBertLayerWeight(weights, name_buf, li, "attention.self.value.scales");
-        lw.v_b = getBertLayerWeight(weights, name_buf, li, "attention.self.value.biases");
-        lw.v_bias = getBertLayerWeight(weights, name_buf, li, "attention.self.value.bias");
-        lw.o_w = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.weight");
-        lw.o_s = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.scales");
-        lw.o_b = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.biases");
-        lw.o_bias = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.bias");
-        lw.attn_norm_w = getBertLayerWeight(weights, name_buf, li, "attention.output.LayerNorm.weight");
-        lw.attn_norm_b = getBertLayerWeight(weights, name_buf, li, "attention.output.LayerNorm.bias");
-        lw.inter_w = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.weight");
-        lw.inter_s = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.scales");
-        lw.inter_b = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.biases");
-        lw.inter_bias = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.bias");
-        lw.out_w = getBertLayerWeight(weights, name_buf, li, "output.dense.weight");
-        lw.out_s = getBertLayerWeight(weights, name_buf, li, "output.dense.scales");
-        lw.out_b = getBertLayerWeight(weights, name_buf, li, "output.dense.biases");
-        lw.out_bias = getBertLayerWeight(weights, name_buf, li, "output.dense.bias");
-        lw.out_norm_w = getBertLayerWeight(weights, name_buf, li, "output.LayerNorm.weight");
-        lw.out_norm_b = getBertLayerWeight(weights, name_buf, li, "output.LayerNorm.bias");
+        lw.q_w = try getBertLayerWeight(weights, name_buf, li, "attention.self.query.weight");
+        lw.q_s = try getBertLayerWeight(weights, name_buf, li, "attention.self.query.scales");
+        lw.q_b = try getBertLayerWeight(weights, name_buf, li, "attention.self.query.biases");
+        lw.q_bias = try getBertLayerWeight(weights, name_buf, li, "attention.self.query.bias");
+        lw.k_w = try getBertLayerWeight(weights, name_buf, li, "attention.self.key.weight");
+        lw.k_s = try getBertLayerWeight(weights, name_buf, li, "attention.self.key.scales");
+        lw.k_b = try getBertLayerWeight(weights, name_buf, li, "attention.self.key.biases");
+        lw.k_bias = try getBertLayerWeight(weights, name_buf, li, "attention.self.key.bias");
+        lw.v_w = try getBertLayerWeight(weights, name_buf, li, "attention.self.value.weight");
+        lw.v_s = try getBertLayerWeight(weights, name_buf, li, "attention.self.value.scales");
+        lw.v_b = try getBertLayerWeight(weights, name_buf, li, "attention.self.value.biases");
+        lw.v_bias = try getBertLayerWeight(weights, name_buf, li, "attention.self.value.bias");
+        lw.o_w = try getBertLayerWeight(weights, name_buf, li, "attention.output.dense.weight");
+        lw.o_s = try getBertLayerWeight(weights, name_buf, li, "attention.output.dense.scales");
+        lw.o_b = try getBertLayerWeight(weights, name_buf, li, "attention.output.dense.biases");
+        lw.o_bias = try getBertLayerWeight(weights, name_buf, li, "attention.output.dense.bias");
+        lw.attn_norm_w = try getBertLayerWeight(weights, name_buf, li, "attention.output.LayerNorm.weight");
+        lw.attn_norm_b = try getBertLayerWeight(weights, name_buf, li, "attention.output.LayerNorm.bias");
+        lw.inter_w = try getBertLayerWeight(weights, name_buf, li, "intermediate.dense.weight");
+        lw.inter_s = try getBertLayerWeight(weights, name_buf, li, "intermediate.dense.scales");
+        lw.inter_b = try getBertLayerWeight(weights, name_buf, li, "intermediate.dense.biases");
+        lw.inter_bias = try getBertLayerWeight(weights, name_buf, li, "intermediate.dense.bias");
+        lw.out_w = try getBertLayerWeight(weights, name_buf, li, "output.dense.weight");
+        lw.out_s = try getBertLayerWeight(weights, name_buf, li, "output.dense.scales");
+        lw.out_b = try getBertLayerWeight(weights, name_buf, li, "output.dense.biases");
+        lw.out_bias = try getBertLayerWeight(weights, name_buf, li, "output.dense.bias");
+        lw.out_norm_w = try getBertLayerWeight(weights, name_buf, li, "output.LayerNorm.weight");
+        lw.out_norm_b = try getBertLayerWeight(weights, name_buf, li, "output.LayerNorm.bias");
     }
     return layers;
 }
 
 fn initBert(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !Transformer {
     // Word embeddings (reuse standard emb_w/s/b fields)
-    const emb_w = getBertWeight(weights, name_buf, "embeddings.word_embeddings.weight");
-    const emb_s = getBertWeight(weights, name_buf, "embeddings.word_embeddings.scales");
-    const emb_b = getBertWeight(weights, name_buf, "embeddings.word_embeddings.biases");
+    const emb_w = try getBertWeight(weights, name_buf, "embeddings.word_embeddings.weight");
+    const emb_s = try getBertWeight(weights, name_buf, "embeddings.word_embeddings.scales");
+    const emb_b = try getBertWeight(weights, name_buf, "embeddings.word_embeddings.biases");
 
     // Position embeddings
-    const pos_w = getBertWeight(weights, name_buf, "embeddings.position_embeddings.weight");
-    const pos_s = getBertWeight(weights, name_buf, "embeddings.position_embeddings.scales");
-    const pos_b = getBertWeight(weights, name_buf, "embeddings.position_embeddings.biases");
+    const pos_w = try getBertWeight(weights, name_buf, "embeddings.position_embeddings.weight");
+    const pos_s = try getBertWeight(weights, name_buf, "embeddings.position_embeddings.scales");
+    const pos_b = try getBertWeight(weights, name_buf, "embeddings.position_embeddings.biases");
 
     // Token type embeddings
-    const toktype_w = getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.weight");
-    const toktype_s = getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.scales");
-    const toktype_b = getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.biases");
+    const toktype_w = try getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.weight");
+    const toktype_s = try getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.scales");
+    const toktype_b = try getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.biases");
 
     // Embedding LayerNorm
-    const emb_norm_w = getBertWeight(weights, name_buf, "embeddings.LayerNorm.weight");
-    const emb_norm_b = getBertWeight(weights, name_buf, "embeddings.LayerNorm.bias");
+    const emb_norm_w = try getBertWeight(weights, name_buf, "embeddings.LayerNorm.weight");
+    const emb_norm_b = try getBertWeight(weights, name_buf, "embeddings.LayerNorm.bias");
 
     const bert_layers = try initBertLayers(allocator, config, weights, name_buf);
 

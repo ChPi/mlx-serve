@@ -1365,6 +1365,10 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     var prompt: ?[]const u8 = null;
     var model: ?[]const u8 = null;
     var size: ?[]const u8 = null;
+    var lora_paths: ?[]const u8 = null;
+    var lora_scales: ?[]const u8 = null;
+    var lora_path: ?[]const u8 = null;
+    var lora_scale: ?[]const u8 = null;
 
     while (it.next()) |part| {
         // `image`, `image[]` and `image[0]` are all in the wild.
@@ -1391,6 +1395,14 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
             if (part.data.len != 0 and !std.mem.eql(u8, part.data, "png")) return error.OutputFormatUnsupported;
         } else if (std.mem.eql(u8, part.name, "stream")) {
             if (std.mem.eql(u8, part.data, "true")) return error.StreamUnsupported;
+        } else if (std.mem.eql(u8, part.name, "lora_paths")) {
+            if (part.data.len != 0) lora_paths = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_scales")) {
+            if (part.data.len != 0) lora_scales = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_path")) {
+            if (part.data.len != 0) lora_path = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_scale")) {
+            if (part.data.len != 0) lora_scale = part.data;
         }
         // background / quality / input_fidelity / output_compression / user /
         // partial_images: accepted and ignored — they don't change what we'd
@@ -1414,6 +1426,25 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     if (size) |sz| {
         try out.appendSlice(allocator, ",\"size\":");
         try chat_mod.appendJsonString(allocator, &out, sz);
+    }
+    // LoRA fields ride through to `parseLoraFields` (issue #268: they were
+    // silently dropped). The array forms are JSON text and pass as-is — a
+    // malformed array is that parser's named 400, not ours.
+    if (lora_paths) |v| {
+        try out.appendSlice(allocator, ",\"lora_paths\":");
+        try out.appendSlice(allocator, v);
+    }
+    if (lora_scales) |v| {
+        try out.appendSlice(allocator, ",\"lora_scales\":");
+        try out.appendSlice(allocator, v);
+    }
+    if (lora_path) |v| {
+        try out.appendSlice(allocator, ",\"lora_path\":");
+        try chat_mod.appendJsonString(allocator, &out, v);
+    }
+    if (lora_scale) |v| {
+        try out.appendSlice(allocator, ",\"lora_scale\":");
+        try out.appendSlice(allocator, v);
     }
     try out.appendSlice(allocator, ",\"image\":\"");
     try appendBase64(allocator, &out, images[0]);
@@ -4408,6 +4439,18 @@ test "openaiEditFormToJson: OpenAI multipart becomes our edit request" {
     const j3 = try openaiEditFormToJson(a, auto, CT);
     defer a.free(j3);
     try testing.expect(std.mem.indexOf(u8, j3, "\"size\"") == null);
+
+    // LoRA fields reach the edit body (issue #268: they were rebuilt away).
+    const lora = "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\np\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"lora_paths\"\r\n\r\n[\"/l/a.safetensors\"]\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"lora_scales\"\r\n\r\n[0.8]\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nAAA\r\n--X--\r\n";
+    const j4 = try openaiEditFormToJson(a, lora, CT);
+    defer a.free(j4);
+    var p4 = try std.json.parseFromSlice(std.json.Value, a, j4, .{});
+    defer p4.deinit();
+    try testing.expectEqualStrings("/l/a.safetensors", p4.value.object.get("lora_paths").?.array.items[0].string);
+    try testing.expectEqual(@as(f64, 0.8), p4.value.object.get("lora_scales").?.array.items[0].float);
 }
 
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {

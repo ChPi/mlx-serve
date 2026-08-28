@@ -1475,3 +1475,15 @@ The second half is the splice: a restored prefix already holds its image rows, s
 Guard: `tests/test_vision_prefix_cache.sh` (not yet run live as of 2026-08-26) + the `vision_key` arms of the `findBestMatch` unit test.
 
 First live run on qwen4_exp: `[hot-cache] hybrid miss (no checkpoint <= 514 of 514)` — the tokens matched, but `shouldCheckpointSsmPrefill` still returned false for any vision prompt (from before #197, when vision prefilled in one un-chunked forward and had no boundary to snapshot at). It now follows `visionChunkedPrefillEnabled()`. After that: 483/514 reused, the warm answer moved by one token (the hybrid restore class, so the script asserts content, not bytes).
+
+## A missing tensor ended the process (issue #217, 2026-08-28)
+
+`transformer.zig`'s weight getters logged `MISSING WEIGHT: <name>` and hit `unreachable`. In ReleaseFast that is a process exit: one checkpoint the loader cannot read (a converter's tensor naming we don't probe, one shard short from a bad download) took the server down with every request queued behind it — three times in one reporter's benchmark run. The scheduler already crosses load failures by name (`req.error_name` → `loadErrorFromName` → 503), so the fix is only that the getters return `error.MissingWeight` and the ~200 call sites `try`. Guard: `test "a missing weight is a load ERROR, not a process exit (issue #217)"`. Not covered: a weight that is PRESENT but the wrong shape still dies inside MLX (uncatchable, see the Metal OOM story).
+
+## `--max-resident-mem` billed shards nothing reads (issue #274, 2026-08-28)
+
+`scheduler.modelDiskBytes` summed every `*.safetensors` in the directory. A third-party gemma-4 E4B pack shipped two shards no `weight_map` entry references; the bill was 2x the loaded size, so loading a small image model evicted the chat model. The index is the truth when present: `indexShardSet` reads `model.safetensors.index.json` and only named shards count. Guard: `test "modelDiskBytes bills only the shards the index names (issue #274)"`.
+
+## The edit form dropped LoRA fields (issue #268, 2026-08-28)
+
+`gen.openaiEditFormToJson` rebuilds the multipart body into the JSON `mode:"edit"` request field by field; `lora_paths`/`lora_scales` were not in the list, so a client attaching adapters through the OpenAI surface got an un-adapted edit with a 200. Now forwarded verbatim (array forms as raw JSON text, scalar `lora_path` JSON-escaped) so `parseLoraFields` sees the same body the native endpoint would. Guard: the lora case in `test "openaiEditFormToJson: OpenAI multipart becomes our edit request"`.

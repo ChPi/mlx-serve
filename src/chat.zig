@@ -2866,6 +2866,17 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
                 search_pos = effective_text.len;
                 continue;
             }
+            // JSON dialect cut off INSIDE the object (EOS mid-string on a
+            // large edit): nothing balances, but a top-level `"name"` key is
+            // still the tool. NAME + `{}`, never a fragment.
+            if (truncatedJsonCallName(effective_text[content_start..])) |name| {
+                const name_owned = try allocator.dupe(u8, name);
+                errdefer allocator.free(name_owned);
+                const args_owned = try allocator.dupe(u8, "{}");
+                try calls.append(allocator, .{ .name = name_owned, .arguments = args_owned });
+                search_pos = effective_text.len;
+                continue;
+            }
             break;
         }
         const content = std.mem.trim(u8, effective_text[content_start .. content_start + close_rel.?], " \t\n\r");
@@ -3854,6 +3865,57 @@ fn parseSelfClosingToolTag(slice: []const u8) ?struct { name: []const u8, argume
             if (w + m.len <= slice.len and std.mem.eql(u8, slice[w .. w + m.len], m)) {
                 return .{ .name = name.?, .arguments = args.?, .consumed = w + m.len };
             }
+        }
+    }
+    return null;
+}
+
+/// The value of a depth-1 `"name"` key in an UNBALANCED JSON object (a tool
+/// call truncated mid-body). String-aware, so a `"name"` inside a nested
+/// value or a string never counts. Null when the text is not an object or
+/// carries no complete top-level name.
+fn truncatedJsonCallName(content: []const u8) ?[]const u8 {
+    const t = std.mem.trimStart(u8, content, " \t\n\r");
+    if (!std.mem.startsWith(u8, t, "{")) return null;
+    var depth: usize = 0;
+    var i: usize = 0;
+    var last_str: ?[]const u8 = null; // most recent complete string at depth 1
+    var after_name_colon = false;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == '"') {
+            const start = i + 1;
+            var j = start;
+            while (j < t.len and t[j] != '"') : (j += 1) {
+                if (t[j] == '\\') j += 1;
+            }
+            if (j >= t.len) return null; // unterminated string = the cut
+            const str = t[start..j];
+            if (depth == 1) {
+                if (after_name_colon) return if (str.len > 0) str else null;
+                last_str = str;
+            }
+            i = j;
+            continue;
+        }
+        switch (c) {
+            '{', '[' => {
+                depth += 1;
+                after_name_colon = false;
+            },
+            '}', ']' => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            ':' => if (depth == 1) {
+                if (last_str) |k| after_name_colon = std.mem.eql(u8, k, "name");
+            },
+            ',' => {
+                after_name_colon = false;
+                if (depth == 1) last_str = null;
+            },
+            ' ', '\t', '\n', '\r' => {},
+            else => after_name_colon = false,
         }
     }
     return null;
@@ -12072,4 +12134,26 @@ test "streamContentLead never touches whitespace inside the answer" {
     // A token is never cut in half: one carrying whitespace AND text rides
     // whole, so its logprobs entry still describes bytes that reached content.
     try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
+}
+
+
+test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)" {
+    // A 4 KB edit call that hit EOS inside a string value. The object never
+    // balances, so the balanced-snap arm declines; without a name salvage the
+    // whole turn was dropped at the flush (empty `stop`, nothing for the client
+    // to nudge on). Same rule as every other dialect: NAME + `{}`.
+    const allocator = testing.allocator;
+    const text = "Fixing it.\n<tool_call>\n{\"name\": \"edit\", \"arguments\": {\"path\": \"a.ts\", \"oldText\": \"function foo() {\\n  return 1;";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("edit", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+    // Reversed key order + whitespace variants still find the name.
+    const text2 = "<tool_call>{ \"arguments\" : {\"name\": \"nope\", \"s\": \"a}b\"}, \"name\" : \"real\", \"extra\": \"unterm";
+    const c2 = (try parseToolCalls(allocator, text2)) orelse return error.NoCalls;
+    defer freeParsedCalls(c2);
+    try testing.expectEqualStrings("real", c2[0].name);
+    // No name anywhere: still nothing (no invented call).
+    try testing.expect((try parseToolCalls(allocator, "<tool_call>\n{\"arguments\": {\"path\": \"a")) == null);
 }
