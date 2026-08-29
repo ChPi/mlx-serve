@@ -10,6 +10,7 @@
 - **Several chats at once.** Concurrent requests on Flash Next share one pass: 2 streams give 1.3x total throughput, 4 streams 1.8x. A single chat is as fast as before.
 - **Speculative decoding on Flash Next is opt-in** (`--mtp` or the MoE toggle in Settings): +41% on code, a wash on prose, so you choose. It also works on image questions now.
 - **MLX 0.32.2.** Up to +3% faster on MoE models at long context.
+- **gpt-oss 20B and 120B** (OpenAI MoE, harmony format) run natively (#247, thanks @justinluque).
 
 ### Fixes
 
@@ -29,6 +30,15 @@
 - `--api-key-strict` and `--api-key-env` (#264, thanks @uxsmedjan).
 - Video pane: H3 steps and frames reach the ranges the server accepts (#263, thanks @justinluque).
 - Music tab: Cover offers the missing `fsq.safetensors` download on older ACE-Step packs (#276, thanks @Fe2-O3).
+- A hybrid (Qwen 3.5/3.8, Nemotron) GGUF served the previous request's tool calls after a long reply: llama.cpp refuses to trim its KV mid-tail, so we cold-prefill instead (#286, #287, thanks @twotonetobi).
+- Tool-call arguments keep their own whitespace: an `old_string` with leading indentation no longer loses it, so edits land at the right nesting (#294, thanks @Agnik47).
+- A cancelled prefill on a hybrid model now keeps the prefix it already computed, so the retry resumes instead of starting over (#270, thanks @codysk).
+- A chained 5-window H3 video no longer renders for half a minute and then fails to deliver; over-cap requests are refused up front (#283, thanks @ClackShen).
+- Image edits with an explicit output size get exactly that size (#290, thanks @justinluque).
+- The max resident models setting is exposed in Settings (#289, thanks @justinluque).
+- Stopping the server resets every loaded model so the model picker pill is correct (#291, thanks @justinluque).
+- Chat: a generated image is drawn from its file instead of a second copy kept in the history (#293, thanks @lojza3d).
+- `seed` now replays a sampled reply byte for byte. It was only honoured with `logprobs` on, and even then every token drew from the same key.
 
 ## v26.8.10 — Neural Engine prefill offload, batched decode, DFlash 2
 

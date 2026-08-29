@@ -12,15 +12,15 @@
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | Gemma 4 E2B 4b | 206 drafter | 202 drafter | 231 drafter | 239 drafter | · | · | · | · | · | · | +16% |
 | Gemma 4 E4B 8b | 136 drafter | 131 drafter | 154 drafter | 194 drafter | 189 drafter | 174 drafter | 167 drafter | 177 drafter | · | · | +30% |
-| Gemma 4 E4B 4b | · | · | · | · | · | · | · | · | 115 | 115 | · |
-| Gemma 4 26B-A4B 4b | · | · | · | 124 pld | 126 pld | 127 pld | 126 pld | 125 pld | 116 | 119 | -6% |
-| Gemma 4 31B 4b | 19 drafter | 20 | 24 | 31 drafter | 31 drafter | 32 drafter | 32 drafter | 33 drafter | 25 | 25 | +32% |
+| Gemma 4 E4B 4b | · | · | · | · | · | · | · | · | 115 | 117 | +2% |
+| Gemma 4 26B-A4B 4b | · | · | · | 124 pld | 126 pld | 127 pld | 126 pld | 125 pld | 116 | 120 | -4% |
+| Gemma 4 31B 4b | 19 drafter | 20 | 24 | 31 drafter | 31 drafter | 32 drafter | 32 drafter | 33 drafter | 25 | 24 | +26% |
 | Qwen3.6 27B 4b | 24 | 24 | 29 | 58 mtp | 74 mtp | 76 mtp | 76 mtp | 76 mtp | 69 mtp | · | +188% |
 | Qwen3.6 27B MTPLX-opt | · | · | · | · | 80 mtp | 78 mtp | 80 mtp | 79 mtp | 73 mtp | · | -9% |
 | Qwen3.6 35B-A3B 4b | 104 | 106 | 128 | 175 mtp | 210 mtp | 215 mtp | 227 mtp | 237 mtp | 191 mtp | · | +84% |
 | Laguna XS 2.1 NVFP4 | · | · | · | · | · | · | 25 | 121 | · | · | +384% |
-| Qwen3.8 27B 4b (ddalcu MTP) | · | · | · | · | · | · | · | · | · | 69 mtp | · |
-| Qwen3.8 Flash-Next mixed-4-8b (MTP) | · | · | · | · | · | · | · | · | · | 78 mtp | · |
+| Qwen3.8 27B 4b (ddalcu MTP) | · | · | · | · | · | · | · | · | · | 70 mtp | · |
+| Qwen3.8 Flash-Next 4b (MTP) | · | · | · | · | · | · | · | · | · | 85 mtp | · |
 
 (Note, testing harness changed in last release, so numbers differ)
 

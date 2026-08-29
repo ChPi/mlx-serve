@@ -6067,7 +6067,7 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // the initWithOptions chokepoint and carries the model's
         // reserved-token suppression mask; the slot's copy is the raw
         // request params.
-        const lazy = generate_mod.sampleTokenLazy(logits_arr[i], gen.sampling, xfm_ptr.s);
+        const lazy = gen.sampleLazy(logits_arr[i]);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));

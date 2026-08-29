@@ -460,6 +460,8 @@ pub const SamplingParams = struct {
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
     seed: ?u64 = null,
+    /// Draw index under `seed`: every sample takes a fresh key.
+    draw: u64 = 0,
     /// When non-null, generation is constrained to outputs that satisfy the
     /// grammar at byte level. Forces a synchronous sampling path (no lazy
     /// pipeline) since grammar advancement requires the realized token id.
@@ -2402,7 +2404,11 @@ pub const Generator = struct {
                 .next_token_id = @intCast(first_val),
                 .step = 0,
                 .max_tokens = max_tokens,
-                .sampling = sampling,
+                .sampling = blk: {
+                    var sp = sampling;
+                    sp.draw = 1; // t1 above was draw 0
+                    break :blk sp;
+                },
                 .prompt_tokens = @intCast(prompt_ids.len),
                 .completion_tokens = 0,
                 .finish_reason = "length",
@@ -2474,7 +2480,11 @@ pub const Generator = struct {
                 .next_token_id = @intCast(first_val),
                 .step = 0,
                 .max_tokens = max_tokens,
-                .sampling = sampling,
+                .sampling = blk: {
+                    var sp = sampling;
+                    sp.draw = 1; // t1 above was draw 0
+                    break :blk sp;
+                },
                 .prompt_tokens = @intCast(prompt_ids.len),
                 .completion_tokens = 0,
                 .finish_reason = "length",
@@ -2526,7 +2536,11 @@ pub const Generator = struct {
             .next_token_id = @intCast(val),
             .step = 0,
             .max_tokens = max_tokens,
-            .sampling = sampling,
+            .sampling = blk: {
+                var sp = sampling;
+                sp.draw = 1; // t1 above was draw 0
+                break :blk sp;
+            },
             .prompt_tokens = @intCast(prompt_ids.len),
             .completion_tokens = 0,
             .finish_reason = "length",
@@ -2688,7 +2702,7 @@ pub const Generator = struct {
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        const lazy = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
+        const lazy = self.sampleLazy(step_logits);
         _ = mlx.mlx_array_free(step_logits);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -2701,6 +2715,12 @@ pub const Generator = struct {
     /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
     /// This is called at the START of each iteration, giving the GPU maximum time
     /// to compute since the async_eval at the END of the previous iteration.
+    /// The ONE lazy sampler for a slot's own draws: advances the seed draw index.
+    pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) mlx.mlx_array {
+        defer self.sampling.draw +%= 1;
+        return sampleTokenLazy(logits, self.sampling, self.xfm.s);
+    }
+
     fn resolvePendingToken(self: *Generator) !void {
         if (!self.has_pending_token) return;
         try mlx.check(mlx.mlx_array_eval(self.pending_token));
@@ -2744,7 +2764,7 @@ pub const Generator = struct {
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        const lazy = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
+        const lazy = self.sampleLazy(step_logits);
         _ = mlx.mlx_array_free(step_logits);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -3082,7 +3102,7 @@ pub const Generator = struct {
             const cold_logits = try xfm.forwardWith(&self.ctx, t1_input); // cache.step += 1
             defer _ = mlx.mlx_array_free(cold_logits);
 
-            const lazy = sampleTokenLazy(cold_logits, self.sampling, s);
+            const lazy = self.sampleLazy(cold_logits);
             try mlx.check(mlx.mlx_array_eval(lazy));
             var lv: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&lv, lazy));
@@ -3262,7 +3282,7 @@ pub const Generator = struct {
                     break :blk try sampleFromProbs(probs, s);
                 }
             } else {
-                const lazy = sampleTokenLazy(correction_logits, self.sampling, s);
+                const lazy = self.sampleLazy(correction_logits);
                 try mlx.check(mlx.mlx_array_eval(lazy));
                 var v: i32 = 0;
                 try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
@@ -3509,7 +3529,7 @@ pub const Generator = struct {
                 const step_out = try drafter_mod.stepArr(drafter, xfm, self.ctx.cache, prev_tok_arr, h_prev_arg, rope_offset);
                 // Sample lazily — `sampleTokenLazy` for greedy returns the
                 // argmax as a [1]-shaped lazy array. NO eval here.
-                draft_arrs[i] = sampleTokenLazy(step_out.logits, self.sampling, s);
+                draft_arrs[i] = self.sampleLazy(step_out.logits);
                 _ = mlx.mlx_array_free(step_out.logits);
 
                 // Roll h_prev forward.
@@ -7315,7 +7335,7 @@ pub const Generator = struct {
             const step_logits = self.pending_logits;
             self.has_pending_logits = false;
 
-            const lazy_token = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
+            const lazy_token = self.sampleLazy(step_logits);
             _ = mlx.mlx_array_free(step_logits);
 
             if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
@@ -7378,6 +7398,7 @@ pub const Generator = struct {
         if (self.logprobs_n > 0) {
             defer _ = mlx.mlx_array_free(step_logits);
             const result = try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.xfm.s);
+            self.sampling.draw +%= 1;
             self.next_token_id = result.token_id;
             // `result` belongs to the token we just SAMPLED, which the next
             // call returns; `token` is carrying the previous round's result.
@@ -7389,7 +7410,7 @@ pub const Generator = struct {
         }
 
         // Last token or pipeline bootstrap
-        const lazy_token = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
+        const lazy_token = self.sampleLazy(step_logits);
         _ = mlx.mlx_array_free(step_logits);
 
         if (self.step < self.max_tokens) {
@@ -7477,7 +7498,7 @@ pub const Generator = struct {
         try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
 
         // Synchronous sample: we need the realized token id to advance the grammar.
-        const lazy = sampleTokenLazy(masked_logits, self.sampling, s);
+        const lazy = self.sampleLazy(masked_logits);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
@@ -8019,12 +8040,22 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
 
     // Sample from categorical distribution (lazy — no eval!)
     var sampled = mlx.mlx_array_new();
-    const null_key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(null_key);
-    _ = mlx.mlx_random_categorical(&sampled, current, -1, null_key, s);
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
+    _ = mlx.mlx_random_categorical(&sampled, current, -1, key, s);
     _ = mlx.mlx_array_free(current);
 
     return sampled; // Shape [1], lazy
+}
+
+/// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
+/// request replays byte-for-byte and consecutive draws never share a key.
+/// Null-ctx (MLX global RNG) when the request set no seed.
+fn seedKey(sampling: SamplingParams) mlx.mlx_array {
+    const seed = sampling.seed orelse return mlx.mlx_array_new();
+    var key = mlx.mlx_array_new();
+    _ = mlx.mlx_random_key(&key, seed +% sampling.draw *% 0x9E3779B97F4A7C15);
+    return key;
 }
 
 /// Convenience: generate all tokens at once (non-streaming).
@@ -9157,16 +9188,9 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
     // Sample from categorical distribution
     var sampled = mlx.mlx_array_new();
 
-    if (sampling.seed) |seed| {
-        var key = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(key);
-        try mlx.check(mlx.mlx_random_key(&key, seed));
-        try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, key, s));
-    } else {
-        const null_key = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(null_key);
-        try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, null_key, s));
-    }
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, key, s));
 
     // Eval and extract
     try mlx.check(mlx.mlx_array_eval(sampled));
@@ -9837,6 +9861,31 @@ test "sampleToken with temperature produces valid token" {
     const result = try sampleToken(allocator, logits, params, null, 0, s);
     // Token should be in valid range
     try testing.expect(result.token_id < 3);
+}
+
+test "seeded lazy sampling replays the same draws and advances per draw" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 0.0, 0.0 };
+    const shape = [_]c_int{ 1, 1, 2 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    var runs: [2][24]i32 = undefined;
+    for (&runs) |*run| {
+        var params = SamplingParams{ .temperature = 1.0, .seed = 42 };
+        for (run) |*out| {
+            const lazy = sampleTokenLazy(logits, params, s);
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            try mlx.check(mlx.mlx_array_item_int32(out, lazy));
+            params.draw +%= 1;
+        }
+    }
+    try testing.expectEqualSlices(i32, &runs[0], &runs[1]);
+    // The same key every draw replays ONE coin flip 24 times (p = 2^-23).
+    var all_same = true;
+    for (runs[0][1..]) |v| all_same = all_same and v == runs[0][0];
+    try testing.expect(!all_same);
 }
 
 test "sampleToken from prefill logits (seq_len > 1)" {
