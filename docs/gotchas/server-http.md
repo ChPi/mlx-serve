@@ -1509,3 +1509,27 @@ MiniMax-H3, Turbo, 1056x864, 141 frames x 5 chained windows: every window sample
 Fix: `gen.videoRgbTransportReason(delivered, w, h)` with `MAX_VIDEO_RGB_BYTES` (the app's number) refuses at admission on both video paths, naming frames, canvas, MB and the cap; the H3 site bills `chainDeliveredFrames(windows, frames)`. The app's `frameOptions` takes `chainWindows` and the stepper stops at 6 (the server refused 7-8 anyway). Lifting the cap is a transport change (stream frames or mux server-side), not a number to raise.
 
 Also filed the same day, #285: a Mage-Flow-Edit pack failing `MissingMageFlowWeight model.visual.patch_embed.proj.weight`. The reporter's `text_encoder/model.safetensors` loaded 902 tensors; the published Edit pack's has 1425 (523 `model.visual.*`), 902 is the TURBO text encoder. A pack-content problem on the user's disk, not a loader bug; the log line was relabeled from `MISSING VAE WEIGHT` to name the file and both counts.
+
+### A tool-response turn can render under the USER marker (2026-08-30)
+
+PR #318's `activeTurnMediaMessage` counts the user-role messages after the media
+message so `userTurnInsertPos` can pick the marker that opens the media turn
+instead of the last one. That count assumed one rendered user marker per
+user-ROLE message — but ChatML-family templates (Qwen 3/3.5/3.8) wrap each
+tool-response RUN in its own `<|im_start|>user`, merging consecutive tool
+messages into one wrapper, and the match is token-exact: `<tool_response>` is a
+special token, so the marker's trailing `\n` stays its own token (`[im_start,
+"user", "\n"]` appears verbatim). With `[user(image), assistant(tool_call),
+tool(result), user(context)]` the role count says one marker after the media
+message while the render has two, and the image pads land after the tool
+response. Llama renders tool results under an `ipython` header and adds no
+user marker, so a fixed per-family rule in the counter would just move the bug.
+
+`server.resolvedUserMarkersAfter` lets the rendered prompt arbitrate: it counts
+the marker's occurrences in `prompt_ids` and compares against the conversation's
+role totals — `users + tool_runs` (ChatML, runs merged), `users + tool_msgs`
+(per-message wrapping), or `users` (no tool marker). The matching convention's
+tool count is added to `user_markers_after`; an unrecognized total (template
+merged or dropped something) falls back to the role-only count, which is the
+pre-fix behavior. Guard: `insertMultimodalTokens counts a ChatML tool-response
+user marker` (server.zig) pins all three conventions by insert position.

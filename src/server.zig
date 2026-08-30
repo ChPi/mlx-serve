@@ -3168,7 +3168,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -9516,6 +9516,17 @@ const ActiveTurnMedia = struct {
     /// Number of user messages rendered after `message`. This selects the
     /// matching user-turn marker when media is followed by injected context.
     user_markers_after: usize,
+    /// Tool-role messages after `message`, and the maximal consecutive runs
+    /// they form. ChatML templates wrap each tool-response RUN in its own
+    /// `<|im_start|>user`, so tool turns can add user markers the role count
+    /// above cannot see; `resolvedUserMarkersAfter` decides from the rendered
+    /// prompt which convention is in play.
+    tool_msgs_after: usize = 0,
+    tool_runs_after: usize = 0,
+    /// Whole-conversation totals the same resolver compares against.
+    total_users: usize = 0,
+    total_tool_msgs: usize = 0,
+    total_tool_runs: usize = 0,
 };
 
 fn activeTurnMediaMessage(msgs: []const chat_mod.Message, continue_final: bool) ?ActiveTurnMedia {
@@ -9548,11 +9559,53 @@ fn activeTurnMediaMessage(msgs: []const chat_mod.Message, continue_final: bool) 
             (msg.videos != null and msg.videos.?.len > 0) or
             (msg.audio != null and msg.audio.?.len > 0))
         {
-            return .{ .message = msg, .user_markers_after = user_markers_after };
+            var media = ActiveTurnMedia{ .message = msg, .user_markers_after = user_markers_after };
+            var prev_tool = false;
+            for (msgs, 0..) |*m, j| {
+                const is_tool = std.mem.eql(u8, m.role, "tool");
+                if (std.mem.eql(u8, m.role, "user")) media.total_users += 1;
+                if (is_tool) {
+                    media.total_tool_msgs += 1;
+                    if (!prev_tool) media.total_tool_runs += 1;
+                    if (j > i) {
+                        media.tool_msgs_after += 1;
+                        if (!prev_tool) media.tool_runs_after += 1;
+                    }
+                }
+                prev_tool = is_tool;
+            }
+            return media;
         }
         user_markers_after += 1;
     }
     return null;
+}
+
+/// How many user-turn markers sit after the media message in the RENDERED
+/// prompt. The role count alone cannot answer that: ChatML templates wrap a
+/// tool-response run in its own `<|im_start|>user` (token-exact — the
+/// `<tool_response>` special token keeps the marker's trailing newline its
+/// own token), while Llama renders tool results under an ipython header. The
+/// prompt is the authority: its total marker count matches exactly one
+/// convention's prediction; an unrecognized total keeps the conservative
+/// role-only count.
+fn resolvedUserMarkersAfter(prompt_ids: []const u32, config: *const model_mod.ModelConfig, media: ActiveTurnMedia) usize {
+    if (media.tool_msgs_after == 0) return media.user_markers_after;
+    const marker = config.userTurnMarkerSlice();
+    if (marker.len == 0 or prompt_ids.len < marker.len) return media.user_markers_after;
+    var found: usize = 0;
+    var i: usize = 0;
+    while (i + marker.len <= prompt_ids.len) {
+        if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) {
+            found += 1;
+            i += marker.len;
+        } else i += 1;
+    }
+    if (found == media.total_users + media.total_tool_runs)
+        return media.user_markers_after + media.tool_runs_after;
+    if (found == media.total_users + media.total_tool_msgs)
+        return media.user_markers_after + media.tool_msgs_after;
+    return media.user_markers_after;
 }
 
 test "activeTurnMediaMessage sees media before trailing user context" {
@@ -10044,7 +10097,7 @@ fn insertMultimodalTokens(
     const want_audio = audio_token_id != 0 and n_audio > 0;
     if (!want_image and !want_video and !want_audio) return try allocator.dupe(u32, prompt_ids);
 
-    const insert_pos = userTurnInsertPos(prompt_ids, config, if (active_media) |media| media.user_markers_after else 0);
+    const insert_pos = userTurnInsertPos(prompt_ids, config, if (active_media) |media| resolvedUserMarkersAfter(prompt_ids, config, media) else 0);
 
     // Qwen3-VL wraps the image-pad run (and, identically, the video-pad run)
     // with <|vision_start|>/<|vision_end|> (get_rope_index keys on vision_start
@@ -15976,6 +16029,62 @@ test "insertMultimodalTokens targets the media user before injected context" {
     defer testing.allocator.free(out);
 
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+}
+
+test "insertMultimodalTokens counts a ChatML tool-response user marker" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+
+    // ChatML templates wrap a tool-response run in its OWN `<|im_start|>user`
+    // (token-exact: `<tool_response>` is a special token, so the marker bytes
+    // survive BPE). Counting user-ROLE messages alone lands the pads after the
+    // tool response instead of the human's image turn.
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const calls = [_]chat_mod.ToolCall{.{ .id = "call-1", .name = "inspect", .arguments = "{}" }};
+    const msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call-1" },
+        .{ .role = "user", .content = "injected context" },
+    };
+    const media = activeTurnMediaMessage(&msgs, false) orelse return error.TestExpectedMedia;
+    // Markers: image turn, tool-response wrapper, injected context — 3 total
+    // for 2 user messages + 1 tool run, which is the ChatML signature.
+    const prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 33 };
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, out);
+
+    // Consecutive tool messages share ONE wrapper (a run), still 3 markers.
+    const run_msgs = [_]chat_mod.Message{
+        .{ .role = "user", .content = "image prompt", .images = &images },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result a", .tool_call_id = "call-1" },
+        .{ .role = "tool", .content = "result b", .tool_call_id = "call-2" },
+        .{ .role = "user", .content = "injected context" },
+    };
+    const run_media = activeTurnMediaMessage(&run_msgs, false) orelse return error.TestExpectedMedia;
+    const run_out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 1, 777, 0, 888, 0, &config, run_media);
+    defer testing.allocator.free(run_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 33 }, run_out);
+
+    // A per-message template (no run merging) renders one marker per tool
+    // message: 4 markers for 2 users + 2 tool messages.
+    const permsg_prompt = [_]u32{ 1, 105, 11, 105, 22, 105, 23, 105, 33 };
+    const permsg_out = try insertMultimodalTokens(testing.allocator, &permsg_prompt, 999, 1, 777, 0, 888, 0, &config, run_media);
+    defer testing.allocator.free(permsg_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 105, 22, 105, 23, 105, 33 }, permsg_out);
+
+    // A family that renders tool results under its OWN header (Llama ipython)
+    // emits NO user marker for the tool turn: 2 markers for 2 user messages —
+    // the role-only count is already right and must stay untouched.
+    const llama_prompt = [_]u32{ 1, 105, 11, 44, 44, 105, 33 };
+    const llama_out = try insertMultimodalTokens(testing.allocator, &llama_prompt, 999, 1, 777, 0, 888, 0, &config, media);
+    defer testing.allocator.free(llama_out);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 201, 11, 44, 44, 105, 33 }, llama_out);
 }
 
 test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
