@@ -2781,6 +2781,10 @@ const QSA_MASK_BYTES_PER_KEY: u64 = 4;
 /// prompt length.
 pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64 {
     if (config.indexer_budget == 0) return 0;
+    // Prefill widths gather by block index (row-chunked score sheet, no
+    // [S, kv] mask); decode/verify widths still build the dense mask.
+    if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
+        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio);
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
@@ -17049,8 +17053,19 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     twin.max_position_embeddings = 262144;
     var q4 = twin;
     q4.indexer_budget = 2048;
+    q4.indexer_n_heads = 4;
+    q4.indexer_head_dim = 128;
+    q4.indexer_compress_ratio = 4;
     try t.expectEqual(@as(u64, 0), qsaMaskBytes(&twin, 4096, 25000));
-    try t.expectEqual(@as(u64, 4 * 4096 * 25000 * 5 / 4), qsaMaskBytes(&q4, 4096, 25000));
+    // Decode/verify widths build the dense mask; prefill widths gather by
+    // block and bill the bounded score sheet instead of 4 B x rows x keys.
+    try t.expectEqual(@as(u64, 4 * 8 * 25000 * 5 / 4), qsaMaskBytes(&q4, 8, 25000));
+    transformer_mod.qsa_gather_override = true;
+    defer transformer_mod.qsa_gather_override = null;
+    const gathered = qsaMaskBytes(&q4, 4096, 250_000);
+    try t.expect(gathered > 0);
+    try t.expect(gathered < 4 * 4096 * 250_000);
+    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4), gathered);
     const twin_bill = prefillTransientReserve(&twin, 16, 8192);
     const q4_bill = prefillTransientReserve(&q4, 16, 8192);
     try t.expectEqual(twin_bill + qsaMaskBytes(&q4, 8192, 8192), q4_bill);
