@@ -3,11 +3,11 @@
 # commit AND lookup, so every image turn re-prefilled the whole conversation.
 # Two things a byte check cannot see come from the log + usage: the second
 # identical request must report cached_tokens > 0 with a `[hot-cache] reused`
-# line, and a DIFFERENT image under the SAME placeholder tokens must NOT hit
-# (the KV is keyed on the pixels, `vision_key`). Every answer must still name
-# what only the pixels supply (the reused prefix is only correct if the
-# restored rows are the image's). A Harness-style turn may append user-role
-# context after the
+# line. A DIFFERENT image must never reuse state at or after its placeholder
+# rows (the KV there is keyed on the pixels), but a long text prefix before
+# those rows should still restore. Every answer must still name what only the
+# pixels supply (the reused prefix is only correct if the restored rows are
+# the image's). A Harness-style turn may append user-role context after the
 # human's image message; that media still belongs to the active turn, while an
 # image before the latest assistant boundary must remain historical.
 set -u
@@ -156,6 +156,34 @@ for turn in 1 2 3 4; do
     check "growing image turn $turn: cached_tokens > 0" "$(python3 -c "print(1 if int('${r%% |*}')>0 else 0)")" "1"
   fi
 done
+
+long_prefix_body() { # $1 image
+  python3 - "$1" <<'PY'
+import base64, json, sys
+
+with open(sys.argv[1], "rb") as f:
+    image_url = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+print(json.dumps({
+    "model": "mlx-serve", "max_tokens": 4, "temperature": 0,
+    "enable_thinking": False,
+    "messages": [
+        {"role": "system", "content": "beta " * 2600},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text", "text": "Reply with OK only."},
+        ]},
+    ],
+}))
+PY
+}
+
+# F1 commits a >2K text prefix followed by its image rows. Switching to F2
+# must recover the 2048 checkpoint before those rows, while the short F2 entry
+# from [3] has no useful checkpoint. Exact vision-key filtering made this cold.
+echo "[9] changed image reuses only the long text prefix before media"
+r9a=$(long_prefix_body "$F1" | ask); echo "  first image: $r9a"
+r9b=$(long_prefix_body "$F2" | ask); echo "  changed image: $r9b"
+check "changed image: cached_tokens > 0 before media" "$(python3 -c "print(1 if int('${r9b%% |*}')>0 else 0)")" "1"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" = "0" ] && echo "PASS: vision prefix cache" || { echo "FAIL: vision prefix cache"; grep -E "hot-cache|cache\]" "$LOG" | tail -20; }
