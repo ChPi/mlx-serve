@@ -1533,3 +1533,11 @@ tool count is added to `user_markers_after`; an unrecognized total (template
 merged or dropped something) falls back to the role-only count, which is the
 pre-fix behavior. Guard: `insertMultimodalTokens counts a ChatML tool-response
 user marker` (server.zig) pins all three conventions by insert position.
+
+## The sleep-inhibition gate sat in the tick that never runs (issue #251, 2026-08-30)
+
+A long render needs sleep protection only while work is active. Use `PreventUserIdleSystemSleep`; display sleep remains allowed.
+
+Release immediately before `queue_cond.wait` and acquire after wake. The startup load runs before that loop, so it acquires separately. The deferred release covers shutdown and load failure.
+
+`tests/test_sleep_inhibit.sh` checks idle, active generation, return to idle, startup load, and `--no-prevent-sleep`. It matches the assertion name because powerd uses the same assertion type.
