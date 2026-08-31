@@ -152,6 +152,10 @@ pub const LoadParams = struct {
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
+    /// Clamp the hot-cache byte budget against live post-load headroom
+    /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
+    /// deliberately has no server.zig import. Null = no clamp (tests).
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -1018,6 +1022,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1141,6 +1146,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -1325,6 +1331,7 @@ pub const Scheduler = struct {
             .gguf_ctx_size = params.ctx_size,
             .prefix_cache_capacity = params.prefix_cache_capacity,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
@@ -1806,6 +1813,7 @@ pub const Scheduler = struct {
             // which silently degraded warm reuse after every model switch.
             .prefix_cache_capacity = self.prefix_cache_capacity,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
@@ -2877,7 +2885,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
         "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
-        "ane_chunk_resolver",      "ane_headroom_resolver",
+        "ane_chunk_resolver",      "ane_headroom_resolver",     "prefix_cache_mem_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -2889,6 +2897,26 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // The stale TODO that stood in for the wiring must be gone.
     const old = "Phase E will wire the load-model API" ++ " to set this.";
     try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never the raw launch flag" {
+    // 2026-08-30 Metal OOM: a 40 GB `--prefix-cache-mem` beside a ~70 GB pack
+    // was never validated against what the weights left under the GPU ceiling;
+    // the cache filled to its cap and a 143k prefill died uncatchably. The
+    // budget must pass through the resolver (server.prefixCacheMemForLoad)
+    // before it reaches initWithMem — and a SECOND construction site must not
+    // be able to skip the clamp (the cold-load launch flags class).
+    const src = @embedFile("scheduler.zig");
+    const needle = "HotPrefixCache.initWith" ++ "Mem(";
+    var found: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, needle)) |at| : (pos = at + needle.len) {
+        found += 1;
+        const window = src[at..@min(at + 240, src.len)];
+        try testing.expect(std.mem.indexOf(u8, window, "clamped_prefix_mem") != null);
+        try testing.expect(std.mem.indexOf(u8, window, "params.prefix_cache_mem_bytes") == null);
+    }
+    try testing.expect(found >= 1);
 }
 
 test "coldLoadVision honors the process-wide vision opt-out" {
@@ -3712,10 +3740,17 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.prefix_cache_capacity > 0 and
         prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
     {
+        // The weights are resident here, so the resolver's active-memory read
+        // is honest; the raw launch budget never reaches initWithMem (a 40 GB
+        // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+        const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
+            resolve(params.config, params.prefix_cache_mem_bytes)
+        else
+            params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
             params.prefix_cache_capacity,
-            params.prefix_cache_mem_bytes,
+            clamped_prefix_mem,
         );
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted

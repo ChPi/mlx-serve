@@ -1306,6 +1306,7 @@ pub fn main(init: std.process.Init) !void {
             .kv_quant_config = kv_quant_config,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
@@ -1838,6 +1839,7 @@ fn runHeadlessServe(
         // `serve` path). Mirrors the LoadParams built in `main()`.
         .prefix_cache_capacity = server_mod.prefix_cache_capacity,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+        .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,

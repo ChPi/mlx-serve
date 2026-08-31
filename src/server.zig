@@ -2886,6 +2886,67 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     return config.pinned_prefill_chunk;
 }
 
+/// PURE: clamp the hot prefix cache's byte budget to what the loaded weights
+/// leave under the GPU ceiling after the serving context's KV and the prefill
+/// transient reserve. A 40 GB `--prefix-cache-mem` beside a ~70 GB pack was
+/// never validated against this headroom: the cache filled toward its cap and
+/// a 143k prefill died in an uncatchable Metal OOM (2026-08-30, Flash-Next on
+/// 128 GB). `requested == 0` (byte cap disabled) is bounded too — an uncapped
+/// cache beside a large model is exactly that crash. Never returns 0:
+/// `initWithMem` reads 0 as "no byte cap", the opposite of no headroom.
+pub fn clampedPrefixCacheMem(
+    requested: u64,
+    gpu_ceiling: u64,
+    active_weights: u64,
+    ctx_kv_bytes: u64,
+    transient_reserve: u64,
+) u64 {
+    const headroom = @max(gpu_ceiling -| (active_weights +| ctx_kv_bytes +| transient_reserve), 1);
+    if (requested == 0) return headroom;
+    return @min(requested, headroom);
+}
+
+/// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
+/// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
+/// deliberately has no server.zig import): the weights are resident there, so
+/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites.
+pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const kv_bits: u64 = defaultKvBits();
+    const chunk: u64 = pinPrefillChunk(config);
+    const ctx_kv: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *|
+        getEffectiveContextLength(config);
+    const clamped = clampedPrefixCacheMem(
+        requested,
+        currentGpuMemoryCeiling(active_mem),
+        active_mem,
+        ctx_kv,
+        prefillTransientReserve(config, kv_bits, chunk),
+    );
+    if (requested > 0 and clamped < requested) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+    } else if (requested == 0) {
+        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+    }
+    return clamped;
+}
+
+test "clampedPrefixCacheMem: the budget never exceeds what the weights leave under the ceiling" {
+    const t = std.testing;
+    const GB: u64 = 1 << 30;
+    // The crash's numbers: 96 GB ceiling, ~70 GB weights, ~6.4 GB of 262k-ctx
+    // KV, ~4 GB prefill reserve, --prefix-cache-mem 40 GB → ~15.6 GB budget.
+    const crash = clampedPrefixCacheMem(40 * GB, 96 * GB, 70 * GB, 6 * GB + (400 << 20), 4 * GB);
+    try t.expect(crash >= 10 * GB and crash < 16 * GB);
+    // Small model with plenty of headroom: the request is untouched.
+    try t.expectEqual(8 * GB, clampedPrefixCacheMem(8 * GB, 96 * GB, 20 * GB, 2 * GB, 2 * GB));
+    // requested == 0 (byte cap disabled today): headroom still bounds it.
+    try t.expectEqual(96 * GB - 80 * GB, clampedPrefixCacheMem(0, 96 * GB, 70 * GB, 6 * GB, 4 * GB));
+    // No headroom at all: never 0 — initWithMem reads 0 as "no byte cap".
+    try t.expectEqual(@as(u64, 1), clampedPrefixCacheMem(40 * GB, 64 * GB, 70 * GB, 6 * GB, 4 * GB));
+}
+
 /// The largest context this model's per-token footprint fits into RAM right
 /// now, IGNORING the checkpoint's own maximum. Reads live memory.
 fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
@@ -3164,11 +3225,16 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     // on the gather). Detection mirrors prefillAttnKeys: declared ratios or
     // stay generic.
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
-    const needed: u64 = if (is_dsv4)
+    // A hot-cache restore materializes a COPY of the matched entry's KV into
+    // the slot while the entry stays resident (~7-8 GB at a 138k match) —
+    // bill the largest resident entry. Conservative (billed even on a miss),
+    // but the honest direction.
+    const hot_restore: u64 = if (lm.prefix_cache) |*pc| pc.largestEntryBytes() else 0;
+    const needed: u64 = hot_restore +| (if (is_dsv4)
         dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
     else
         prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq));
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static

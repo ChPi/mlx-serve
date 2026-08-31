@@ -20,7 +20,10 @@ command -v pmset >/dev/null 2>&1 || { echo "SKIP: pmset not available (macOS onl
 
 ROOT=$(dirname "$(dirname "$MODEL")")
 ID="$(basename "$(dirname "$MODEL")")/$(basename "$MODEL")"
-# The type also matches powerd, so check the unique name.
+# The type also matches powerd, and the name matches any OTHER mlx-serve
+# instance on the box (a live server generating concurrently would false-fail
+# the idle/opt-out arms), so match the assertion to OUR pid: pmset prints
+# every assertion under a "pid NNN(process):" owner line.
 NAME="mlx-serve is generating"
 
 run_test() {
@@ -29,7 +32,11 @@ run_test() {
     else FAIL=$((FAIL + 1)); echo "  FAIL: $1 — $3"; fi
 }
 
-held() { pmset -g assertions 2>/dev/null | grep -q "$NAME" && echo 1 || echo 0; }
+held() {
+    pmset -g assertions 2>/dev/null \
+        | awk -v pid="pid $SERVER_PID(" -v name="$NAME" \
+              'index($0, pid) && index($0, name) { found = 1 } END { print found ? 1 : 0 }'
+}
 
 start_server() {
     ./zig-out/bin/mlx-serve serve --port "$PORT" --host 127.0.0.1 --log-level info \

@@ -1540,4 +1540,44 @@ A long render needs sleep protection only while work is active. Use `PreventUser
 
 Release immediately before `queue_cond.wait` and acquire after wake. The startup load runs before that loop, so it acquires separately. The deferred release covers shutdown and load failure.
 
-`tests/test_sleep_inhibit.sh` checks idle, active generation, return to idle, startup load, and `--no-prevent-sleep`. It matches the assertion name because powerd uses the same assertion type.
+`tests/test_sleep_inhibit.sh` checks idle, active generation, return to idle, startup load, and `--no-prevent-sleep`. It matches the assertion by owner pid AND name: powerd holds the same assertion type, and the bare name matches any other mlx-serve instance on the box (a live server generating concurrently false-fails the idle/opt-out arms).
+
+## The hot-cache budget was never validated against what the weights left (2026-08-30)
+
+A long agentic run on the ~70 GB Flash-Next pack (143k-token prompt) killed the
+server with an uncatchable Metal OOM (`kIOGPUCommandBufferCallbackErrorOutOfMemory`).
+The memory never fit: weights + a 40 GB `--prefix-cache-mem` budget (32.5 GB
+resident at death) + the live 143k KV and prefill transients against the ~96 GB
+Metal working-set limit on a 128 GB Mac. The registry had refused the load at
+the 64 GB cap; the app's `--skip-mem-preflight` let it through, and nothing
+anywhere compared the cache budget to the headroom the weights left.
+
+Fix: `server.clampedPrefixCacheMem` (pure) caps the budget at
+`gpu_ceiling − (weights + ctx KV + prefill transient reserve)`. The impure
+wrapper `prefixCacheMemForLoad` runs at the load site in
+`scheduler.doLoadOnInferenceThread` — weights are resident there, so
+`mlx_get_active_memory` is honest — reached through a
+`prefix_cache_mem_resolver` fn pointer because the scheduler deliberately has
+no server.zig import (the `ane_chunk_resolver` pattern). `requested == 0`
+(byte cap disabled) is bounded too — an uncapped cache beside a large model is
+exactly this crash — and the clamp never returns 0, because `initWithMem`
+reads 0 as "no byte cap". When it bites: `[hot-cache] budget clamped … MB`.
+Crash-case numbers: 96 − 70 − ~6.4 (262k ctx KV) − ~4 ≈ 15 GB instead of 40.
+
+Second hole, same crash: a hot-cache restore materializes a COPY of the
+matched entry's KV into the slot while the entry stays resident (~7–8 GB at a
+138k match), and the prefill admission guard never billed it. The guard now
+adds the cache's largest resident entry (`HotPrefixCache.largestEntryBytes`,
+an atomic mirror refreshed on every mutation — the guard reads it from conn
+threads). Conservative: billed even on a miss.
+
+Guards: `clampedPrefixCacheMem` unit test (the crash's numbers),
+the `initWithMem`-site source scan in scheduler.zig (a second construction
+site can't skip the clamp — the cold-load flags class), and the
+`largestEntryBytes` tracking test in prefix_cache.zig.
+
+App-side twin: the crash banner showed `> "9:23:51 PM [vite] Pre-transform
+error: …"` — the agent conversation's own request-preview log line — because
+`summarizeCrash`'s `error:` needle matched it (the Metal marker only reaches
+os_log, not stderr). Preview lines (`> "` prefix) are now skipped by both the
+needle scan and the last-line fallback (`isRequestPreviewLine`).

@@ -169,6 +169,12 @@ pub const HotPrefixCache = struct {
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
+    /// Cross-thread mirror of the largest live entry's `kv_bytes`. The
+    /// prefill admission guard (conn thread) reads it to bill the restore
+    /// transient — a restore materializes a COPY of the matched entry's KV
+    /// into the slot while the entry stays resident. Refreshed on the
+    /// inference thread after every mutation.
+    largest_entry_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     allocator: std.mem.Allocator,
     counter: u64 = 0,
     /// Set to true once we've called `xfm.resetCache()` at least once after
@@ -919,6 +925,7 @@ pub const HotPrefixCache = struct {
                 }
             }
             if (self.disk != null) self.disk_dirty = true;
+            self.refreshLargestEntry();
             self.logResident();
             return;
         }
@@ -961,6 +968,7 @@ pub const HotPrefixCache = struct {
         };
         self.current_kv_bytes += new_bytes;
         if (self.disk != null) self.disk_dirty = true;
+        self.refreshLargestEntry();
         self.logResident();
     }
 
@@ -1069,6 +1077,7 @@ pub const HotPrefixCache = struct {
         }
         self.entries.clearRetainingCapacity();
         self.current_kv_bytes = 0;
+        self.refreshLargestEntry();
     }
 
     /// Drop the most recently committed entry — used after a pad-only
@@ -1090,11 +1099,24 @@ pub const HotPrefixCache = struct {
         var evicted = self.entries.swapRemove(newest_idx);
         self.current_kv_bytes -|= evicted.kv_bytes;
         freeEntryOwnedState(self.allocator, &evicted);
+        self.refreshLargestEntry();
         log.info("  [hot-cache] invalidated latest entry: {s}\n", .{reason});
     }
 
     pub fn entryCount(self: *const HotPrefixCache) usize {
         return self.entries.items.len;
+    }
+
+    /// Largest live entry's bytes (KV + ssm + spec snapshots) — safe to read
+    /// from any thread. What a restore's copy transient is bounded by.
+    pub fn largestEntryBytes(self: *const HotPrefixCache) u64 {
+        return self.largest_entry_bytes.load(.monotonic);
+    }
+
+    fn refreshLargestEntry(self: *HotPrefixCache) void {
+        var largest: u64 = 0;
+        for (self.entries.items) |*e| largest = @max(largest, e.kv_bytes);
+        self.largest_entry_bytes.store(largest, .monotonic);
     }
 };
 
@@ -2027,4 +2049,42 @@ test "HotPrefixCache: replace path bounds SSM checkpoints and keeps them spread"
     try testing.expectEqual(@as(usize, 300), kept[1].pos);
     try testing.expectEqual(@as(usize, 500), kept[2].pos);
     try testing.expectEqual(@as(usize, 800), kept[3].pos);
+}
+
+test "HotPrefixCache: largestEntryBytes tracks commits and removals (restore-copy bill)" {
+    // The prefill admission guard bills a restore's copy transient by this
+    // value from a conn thread — it must follow every mutation.
+    const s = mlx.gpuStream();
+
+    var a = try KVCache.init(testing.allocator, 2);
+    defer a.deinit();
+    try testFillCache(&a, s, 2, 8);
+    // KV buffers grow in 256-token chunks, so the sizes must straddle a chunk
+    // boundary for the two entries' snapshot bytes to differ.
+    var b = try KVCache.init(testing.allocator, 2);
+    defer b.deinit();
+    try testFillCache(&b, s, 2, 600);
+
+    var toks_a: [8]u32 = undefined;
+    for (&toks_a, 0..) |*t2, i| t2.* = @intCast(i + 1);
+    var toks_b: [600]u32 = undefined;
+    for (&toks_b, 0..) |*t2, i| t2.* = @intCast(i + 100);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testing.expectEqual(@as(u64, 0), hc.largestEntryBytes());
+
+    try hc.commit(&a, &toks_a, false);
+    const small = hc.largestEntryBytes();
+    try testing.expect(small > 0);
+
+    try hc.commit(&b, &toks_b, false);
+    const big = hc.largestEntryBytes();
+    try testing.expect(big > small);
+
+    // Dropping the newest (the big one) shrinks the bill back down.
+    hc.invalidateLatest("test");
+    try testing.expectEqual(small, hc.largestEntryBytes());
+    hc.invalidateAll("test");
+    try testing.expectEqual(@as(u64, 0), hc.largestEntryBytes());
 }
