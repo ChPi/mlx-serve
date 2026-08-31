@@ -1520,6 +1520,13 @@ struct ChatDetailView: View {
     @EnvironmentObject var mcpManager: MCPManager
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
+    // Settings ▸ Interface, observed HERE because `ChatMetrics` reads these
+    // keys straight off UserDefaults with no SwiftUI dependency: without a
+    // real observer a size change reaches only rows that happen to re-render,
+    // leaving the transcript in two fonts at once. The values feed the `.id`
+    // on the row stack, which is what forces the rebuild.
+    @AppStorage(InterfacePrefKey.textSize) private var interfaceTextSize = ChatTextSize.medium.rawValue
+    @AppStorage(InterfacePrefKey.compactMode) private var interfaceCompact = false
     @State private var inputText = ""
     /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
     /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
@@ -2170,6 +2177,12 @@ struct ChatDetailView: View {
                                 .id("mediaProgress")
                         }
                     }
+                    // New identity when the text size or density changes, so
+                    // every row rebuilds with the new metrics at once (see the
+                    // @AppStorage pair above). Only fires on a Settings edit —
+                    // the transcript isn't even visible then (Settings is a
+                    // mode of this window), so the scroll reset is unseen.
+                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)")
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
                     .frame(maxWidth: contentWidth)
@@ -3687,6 +3700,9 @@ struct MessageBubble: View {
                             // two different sizes in the same column.
                             Text(message.content)
                                 .font(.system(size: ChatMetrics.transcriptFontSize))
+                                // Same leading as the reply's renderer, or the
+                                // two roles read at two densities.
+                                .lineSpacing(ChatMetrics.userLineSpacing)
                                 .textSelection(.enabled)
                         }
                         if message.isStreaming {
@@ -4454,7 +4470,10 @@ struct MarkdownText: View {
     }
 
     static func attributedString(for source: String, theme: LaTeXTheme) -> NSAttributedString {
-        let key = "\(theme.rawValue)\u{0}\(source)" as NSString
+        // The text size rides the key: fonts are baked into the cached string,
+        // so a Settings ▸ Interface change with the old key would hand every
+        // re-rendered row back at the size it was built at.
+        let key = "\(theme.rawValue)\u{0}\(ChatMetrics.transcriptFontSize)\u{0}\(source)" as NSString
         if let hit = renderCache.object(forKey: key) { return hit }
         let built = buildAttributedString(for: source, theme: theme)
         renderCache.setObject(built, forKey: key)
@@ -4471,7 +4490,19 @@ struct MarkdownText: View {
             if idx > 0 { result.append(blockSpacer()) }
             switch block {
             case .paragraph(let text):
-                result.append(renderInline(text, theme: theme))
+                // Leading + a real gap after each paragraph (single-newline
+                // "**Label.** text" runs the models love are paragraphs too),
+                // and the reading measure as a POSITIVE tailIndent — an
+                // absolute wrap point, so prose stops at ~45em while tables,
+                // code and XML keep the full column.
+                let p = NSMutableParagraphStyle()
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                p.paragraphSpacing = 8
+                p.tailIndent = ChatMetrics.proseMeasure
+                let para = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
+                para.addAttribute(.paragraphStyle, value: p,
+                                  range: NSRange(location: 0, length: para.length))
+                result.append(para)
 
             case .heading(let level, let text):
                 // Scaled from the body size, so raising the reading size
@@ -4479,8 +4510,10 @@ struct MarkdownText: View {
                 let base = ChatMetrics.transcriptFontSize
                 let size: CGFloat = level == 1 ? base + 5 : level == 2 ? base + 3 : base + 1
                 let p = NSMutableParagraphStyle()
-                p.paragraphSpacingBefore = 4
+                p.paragraphSpacingBefore = 10
                 p.paragraphSpacing = 2
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                p.tailIndent = ChatMetrics.proseMeasure
                 let heading = NSMutableAttributedString(
                     attributedString: renderInline(text, theme: theme, fontSize: size)
                 )
@@ -4498,6 +4531,9 @@ struct MarkdownText: View {
                 p.firstLineHeadIndent = 8
                 p.headIndent = 8
                 p.tailIndent = -8
+                // Less air than prose — a listing wants rows. And never the
+                // prose measure: code keeps the full column.
+                p.lineHeightMultiple = ChatMetrics.codeLineHeightMultiple
                 let attrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular),
                     .backgroundColor: NSColor.textBackgroundColor.blended(withFraction: 0.85, of: .black) ?? NSColor.darkGray,
@@ -4514,7 +4550,12 @@ struct MarkdownText: View {
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ])
                 let p = NSMutableParagraphStyle()
-                p.headIndent = 14
+                // Hanging indent measured off the bullet itself, so wrapped
+                // lines align under the text at every text size.
+                p.headIndent = bullet.size().width.rounded(.up)
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                p.paragraphSpacing = 4
+                p.tailIndent = ChatMetrics.proseMeasure
                 let inline = renderInline(text, theme: theme)
                 let combined = NSMutableAttributedString()
                 combined.append(bullet)
@@ -4631,7 +4672,7 @@ struct MarkdownText: View {
     /// paragraph spacing so tall blocks don't collapse.
     private static func blockSpacer() -> NSAttributedString {
         let p = NSMutableParagraphStyle()
-        p.paragraphSpacing = 6
+        p.paragraphSpacing = 8
         return NSAttributedString(string: "\n", attributes: [
             .font: NSFont.systemFont(ofSize: 6),
             .paragraphStyle: p,

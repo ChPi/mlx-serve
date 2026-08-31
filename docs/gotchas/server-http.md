@@ -1585,9 +1585,9 @@ because the guard ran before lookup. Do not add resident cache bytes to
 The byte budget is also a hard cap now. Previously the eviction loop emptied
 the cache but appended an oversized candidate once no entries remained, so a
 single long conversation could exceed the load-time clamp. An entry larger
-than `max_kv_bytes` is declined while an existing smaller prefix is preserved;
-the replacement path also permits eviction of its sole final entry if inherited
-SSM checkpoints push it over the cap.
+than `max_kv_bytes` is trimmed to the longest restorable prefix that fits
+(see the #330 story below); only a candidate with nothing above the floor is
+declined, preserving any existing smaller prefix.
 
 Guards: `clampedPrefixCacheMem` unit test (the crash's numbers), the
 `initWithMem`-site source scan in scheduler.zig (a second construction site
@@ -1599,3 +1599,58 @@ error: …"` — the agent conversation's own request-preview log line — becau
 `summarizeCrash`'s `error:` needle matched it (the Metal marker only reaches
 os_log, not stderr). Preview lines (`> "` prefix) are now skipped by both the
 needle scan and the last-line fallback (`isRequestPreviewLine`).
+
+## An oversized hot-cache decline is a cliff, not a cap (#330)
+
+#326 made `--prefix-cache-mem` a hard cap by declining any commit whose
+snapshot exceeds the budget. In a long agent session that is the steady state,
+not an edge case: the conversation's KV crosses the budget once mid-session
+and from that turn on NOTHING commits — the reporter's log showed 9/9 requests
+skipped, zero `reused`/`resident=` lines, ~23 minutes of re-prefill in one
+window, a cap "enforced" by holding zero bytes. Reproduced locally on
+Qwen3.5-2B at `--prefix-cache-mem 400MB`: pre-fix the cache froze at turn 1's
+21k-token entry while prompts grew to 107k.
+
+The fix costs the prefix, not the whole entry:
+
+- `trimLenForBudget` (prefix_cache.zig) picks the longest retainable length.
+  Hybrids must cut at a CHECKPOINT's `pos` (a KV-only hybrid prefix restores
+  as a cold miss while occupying an LRU slot) and the cost includes every
+  checkpoint kept. Plain attention prices tokens directly. Floor:
+  `MIN_CANCELLED_COMMIT_TOKENS`. Media entries cap the trim at `media_start`
+  — trimming INTO placeholder rows is not a shape we reason about.
+- `KVCacheSnapshot.trimmedCopy` (transformer.zig) is a REAL slice + copy per
+  array against its own shape, batch-evaled. `KVCache.truncate` is
+  offset-only and a refcount-shared snapshot bills the parent's CAPACITY —
+  an offset trim would be an accounting fiction that retains the full 6 GB.
+- Spec payloads (dflash/mtp snaps) describe the full-length state and are
+  dropped on trim; the first reused turn rebuilds them.
+- ONE-SHOT: when the resident covered entry already retains ≥ the trim
+  target, the candidate is dropped and the entry kept. The target is
+  budget-derived and stable, so without this every turn re-copies an
+  identical multi-GB prefix. (On hybrids the steady state usually converges
+  via the decline arm instead — the candidate's own checkpoints all sit
+  above the restored prefix — which preserves the resident entry too.)
+
+Two adjacent defects from the same report:
+
+- The replace path could evict its own sole entry: inherited SSM checkpoints
+  push the merged entry over a cap the pre-check passed (it only prices
+  `new_bytes`), and the old loop evicted down to empty — commit → evict
+  everything → cold prefill, every near-budget turn. Now it evicts OTHER
+  entries first, then `shedCheckpointsToFit` drops this entry's checkpoints
+  (interior thinning, same rule as the merge cap); sole-entry eviction stays
+  as the last resort that keeps the load-time clamp real.
+- `ssm_cps` double free: the commit's dupe/append error paths freed the
+  checkpoints AND the scheduler's catch arm freed them again — with a
+  different allocator. Contract now: ownership transfers to the cache on
+  EVERY outcome (after a trim the slice may be a cache-allocated
+  replacement, so only the cache can free correctly); the scheduler frees
+  nothing, and `commitCancelledPrefillSlot` detaches the salvage BEFORE the
+  call so `Slot.deinit` can't free what the cache owns.
+
+Guards: the `#330` unit tests in prefix_cache.zig (attention + hybrid trim
+with byte-exact restored rows, one-shot handle identity, no-fit decline,
+shed-not-evict, FailingAllocator ownership) and the catch-arm/detach source
+scan in scheduler.zig. NOT built: the issue's proposed `--prefix-cache-mem
+auto` context-sized floor — the default-sizing question is still open.
