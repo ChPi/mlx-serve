@@ -4868,6 +4868,19 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
+/// A grammar mask constrains from token 0 — it cannot express "think first,
+/// then JSON", so a schema request is a content-only contract and thinking is
+/// enforced OFF in the prompt (the noThinkTailSuffix machinery). Without this
+/// the mask pushes the JSON into the template's open think block and `content`
+/// ships EMPTY (live: qwen3.5 effort high + schema on /v1/messages; issue #331
+/// re-found the same hole on /v1/chat/completions and /v1/responses). Tools
+/// present = no mask (every surface skips it so tool calls stay reachable),
+/// so thinking stays whatever the request resolved. Every surface that builds
+/// a grammar mask consults this — the source scan pins the pairing.
+fn schemaMasksThinking(has_schema: bool, has_tools: bool) bool {
+    return has_schema and !has_tools;
+}
+
 /// `continue_final_message`: extend the trailing assistant message instead of
 /// answering after it. vLLM's spelling, because a client that already knows how
 /// to ask another local server for this should not have to learn a second name.
@@ -5375,7 +5388,8 @@ fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
-    const enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
+    if (schemaMasksThinking(grammar_schema_val != null, has_tools)) enable_thinking = false;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -11820,14 +11834,7 @@ fn handleAnthropicMessages(
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
     }
-    // A grammar mask constrains from token 0 — it cannot express "think
-    // first, then JSON", so a schema request is a content-only contract and
-    // thinking is enforced OFF in the prompt (the noThinkTailSuffix
-    // machinery). Without this the mask pushes the JSON into the template's
-    // open think block and `content` ships EMPTY (live: qwen3.5, effort high
-    // + schema). Tools present = no mask (see the grammar block below), so
-    // thinking stays whatever the request resolved.
-    if (output_cfg.schema != null and !has_tools) enable_thinking = false;
+    if (schemaMasksThinking(output_cfg.schema != null, has_tools)) enable_thinking = false;
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
@@ -13453,7 +13460,7 @@ fn handleResponses(
     // pass; thinking truncation happens via finish_reason="length" if the model
     // overruns max_output_tokens.
     const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), server_config.default_reasoning_budget);
-    const enable_thinking = reasoning_cfg.enable;
+    var enable_thinking = reasoning_cfg.enable;
     _ = reasoning_cfg.budget;
 
     // ── tools ──
@@ -13487,6 +13494,7 @@ fn handleResponses(
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
+    if (schemaMasksThinking(grammar_schema_val != null, active_has_tools)) enable_thinking = false;
 
     // ── model name ──
     const model_name = if (root.get("model")) |v|
@@ -17254,6 +17262,22 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
         const effort = parseReasoningEffort(parsed.value.object, -1, false);
         try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
     }
+}
+
+test "every JSON grammar mask site pairs with the schema thinking-off gate" {
+    // The gate lived only on /v1/messages while chat-completions and responses
+    // built the same token-0 mask against a prompt still inside <think>
+    // (issue #331). A NEW surface that builds a mask without consulting the
+    // gate re-ships the hole, so the pairing is pinned by count: one gate call
+    // per mask-enforcement site.
+    const src = @embedFile("server.zig");
+    const mask_line = "[grammar] enforcing JSON " ++ "schema";
+    const call = "schemaMasks" ++ "Thinking(";
+    const def = "fn schemaMasks" ++ "Thinking(";
+    const masks = std.mem.count(u8, src, mask_line);
+    const calls = std.mem.count(u8, src, call) - std.mem.count(u8, src, def);
+    try std.testing.expect(masks >= 3);
+    try std.testing.expectEqual(masks, calls);
 }
 
 test "resolveSamplingDefault: request > CLI > generation_config > fallback" {

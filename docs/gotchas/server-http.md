@@ -1654,3 +1654,29 @@ with byte-exact restored rows, one-shot handle identity, no-fit decline,
 shed-not-evict, FailingAllocator ownership) and the catch-arm/detach source
 scan in scheduler.zig. NOT built: the issue's proposed `--prefix-cache-mem
 auto` context-sized floor — the default-sizing question is still open.
+
+## The schema thinking-off gate lived on one surface of three (#331, 2026-08-31)
+
+A JSON-schema grammar mask constrains from token 0 and cannot express "think
+first, then JSON". On templates that end the rendered prompt inside a bare
+`<think>` block (qwen3.5/3.8), `</think>` is not valid JSON, so the model
+emits the schema-valid object inside the reasoning block: `reasoning_content`
+carries the JSON, `content` ships empty, streaming routes it through
+`delta.reasoning_content`.
+
+`/v1/messages` got the rule in the output_config fix (live: qwen3.5, effort
+high + schema): schema + no tools ⇒ thinking forced OFF in the prompt (the
+noThinkTailSuffix machinery). `/v1/chat/completions` and `/v1/responses`
+built the same mask with no gate — issue #331 re-found the identical symptom
+via `reasoning_effort` + `response_format`.
+
+Fix: one predicate (`server.schemaMasksThinking`) consulted at all three
+mask-building sites. Tools present = no mask on every surface (tool calls
+must stay reachable), so thinking stays whatever the request resolved.
+"Real reasoning then schema-valid JSON" would need a mask that arms only
+after the think block closes — not built; schema stays a content-only
+contract.
+
+Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
++ mask-engagement count) and the server.zig source scan pairing every
+`[grammar] enforcing` site with a gate call.
