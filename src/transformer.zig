@@ -7247,7 +7247,7 @@ pub const Transformer = struct {
             const rotary_dim: u32 = config.yarnRotaryDim();
             const half: usize = rotary_dim / 2;
             const freqs_f64 = try allocator.alloc(f64, half);
-            errdefer allocator.free(freqs_f64);
+            defer allocator.free(freqs_f64);
             computeYarnFreqs(
                 freqs_f64,
                 config.head_dim,
@@ -38828,6 +38828,13 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     var xfm = try Transformer.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
+    // A `build --yarn` pack carries `rope_type: "yarn"` in its config: the same
+    // fixture then measures the context extension end to end (attention, QSA
+    // indexer, M-RoPE table, MTP head) at positions past the trained window.
+    // Red probe: the YaRN fixture against the no-YaRN pack (same weights)
+    // fails at the first check (MTP head cos 0.971 vs the 0.995 bar).
+    try testing.expectEqual(config.rope_yarn, xfm.yarnActive());
+    if (config.rope_yarn) std.debug.print("[qwen4 fixture] YaRN factor {d:.1} window {d} -> {d}\n", .{ config.yarn_factor, config.yarn_orig_max_pos, config.max_position_embeddings });
     // The fixture renders the reference in f32; run our streams in f32 too so
     // the bar measures the math. The shipped bf16 path is pinned by the
     // `qwen4 fixture bf16` test below (streams vs a bf16 reference) — a tiny
