@@ -24,7 +24,7 @@ struct TerminalPane: View {
                         .font(.caption2).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    sshConnectRow
+                    if session.kind == .sandbox { sshConnectRow }
                 }
                 .padding(.horizontal, 14).padding(.vertical, 8)
             }
@@ -105,6 +105,8 @@ struct TerminalPane: View {
 
     /// "Connect from your terminal" — the copyable ssh one-liner (same
     /// option set as the embedded sessions; pinned by SandboxSSHTests).
+    /// Sandbox rows only: a host CLI runs on this Mac, the guest's ssh
+    /// port has nothing to do with it.
     @ViewBuilder
     private var sshConnectRow: some View {
         if let cmd = sandbox.sshDisplayCommand {
