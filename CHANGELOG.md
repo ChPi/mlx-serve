@@ -14,6 +14,7 @@
 - **Settings > Interface**: light/dark/system, accent colour, chat text size, compact mode, and a configurable global shortcut for the quick launcher (#143, thanks @deanputney).
 - **Chat images are stored on disk**, not base64 in the history file: a typical history shrinks from 1.5 MB to 80 KB, and HEIC/TIFF/raw attachments are converted so the model actually sees them (#313, thanks @lojza3d).
 - **MiniCPM5 V3 tool calls** (`<function name=...><param name=...>`) are parsed natively, including truncated ones (#315, thanks @uncle9x9).
+- **Long-context decode on Qwen 3.8 Flash Next stays fast.** Sparse attention at decode now reads only the selected ~2k KV rows instead of the whole cache, so a 256k prompt holds about 41 tok/s instead of collapsing to ~15.
 
 ### Fixes
 
