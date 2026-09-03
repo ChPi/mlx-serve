@@ -31,6 +31,8 @@ const restoreSsmCheckpoint = transformer_mod.restoreSsmCheckpoint;
 const applyQsaHistoryAt = transformer_mod.applyQsaHistoryAt;
 const checkpointHasQsaHistory = transformer_mod.checkpointHasQsaHistory;
 const sliceQsaHistoryOntoCheckpoint = transformer_mod.sliceQsaHistoryOntoCheckpoint;
+const keepOnlyLatestQsaHistory = transformer_mod.keepOnlyLatestQsaHistory;
+const entriesHaveQsaHistory = transformer_mod.entriesHaveQsaHistory;
 const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 
 /// Minimum forwarded-prefix length for committing a CANCELLED prefill
@@ -186,6 +188,10 @@ pub const HotPrefixCache = struct {
     disk: ?kv_disk_cache.DiskTier = null,
     /// A commit landed since the last `flushPendingDisk`.
     disk_dirty: bool = false,
+    /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
+    /// A restore that leaves the live entries without it cannot prefill —
+    /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
+    qsa_history_required: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -604,6 +610,12 @@ pub const HotPrefixCache = struct {
                     resetSsmEntries(ssm_entries);
                     break :disk;
                 };
+                if (self.qsa_history_required and !entriesHaveQsaHistory(ssm_entries)) {
+                    log.warn("  [disk-cache] hybrid restore carries no QSA history — falling back to RAM/cold path\n", .{});
+                    target_cache.truncate(0, s) catch {};
+                    resetSsmEntries(ssm_entries);
+                    break :disk;
+                }
                 // A checkpoint is always ≤ prompt_len−1, so a hybrid restore
                 // never takes the full-match branch (same as the RAM path).
                 target_moe_seq_offset.* = restored;
@@ -674,6 +686,12 @@ pub const HotPrefixCache = struct {
                     // (full length). Intermediate restores slice it to cp.pos.
                     if (qsaHistorySource(cps, cp)) |src| {
                         try applyQsaHistoryAt(entries, src, cp.pos, s);
+                    }
+                    if (self.qsa_history_required and !entriesHaveQsaHistory(entries)) {
+                        // No indexer history after restore: a miss, never
+                        // an entry that fails every turn.
+                        resetSsmEntries(entries);
+                        effective_matched = 0;
                     }
                 } else {
                     // No checkpoint at or before this prefix length — reset
@@ -1063,7 +1081,11 @@ pub const HotPrefixCache = struct {
                     var dropped = merged.orderedRemove(drop);
                     dropped.deinit(self.allocator);
                 }
-                break :blk try merged.toOwnedSlice(self.allocator);
+                const owned = try merged.toOwnedSlice(self.allocator);
+                // The inherited latest and this turn's latest both carry the
+                // indexer history: keep one.
+                keepOnlyLatestQsaHistory(owned);
+                break :blk owned;
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
@@ -2525,6 +2547,105 @@ test "HotPrefixCache: oversized hybrid entry with no checkpoint under budget dec
     try hc.commitWithSsm(&c1, &toks, false, cps, null, null);
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.current_kv_bytes);
+}
+
+/// qwen4-shaped hybrid: layer 0 is a QSA full-attention layer (no conv/ssm,
+/// `aux_state` = `[1, rows, 8]` indexer key history), layer 1 GDN, layer 2 idle.
+fn pcBuildQsaHybrid(s: mlx.mlx_stream, rows: c_int, conv_base: f64) [3]SSMCacheEntry {
+    const aux_shape = [_]c_int{ 1, rows, 8 };
+    return .{
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = pcArange(s, &aux_shape, 0.0), .qsa_ratio = 4 },
+        .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base), .ssm_state = mlx.mlx_array_new(), .initialized = true },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+}
+
+fn pcFreeQsaHybrid(e: *[3]SSMCacheEntry) void {
+    for (e) |*x| {
+        if (x.conv_state.ctx != null) _ = mlx.mlx_array_free(x.conv_state);
+        if (x.ssm_state.ctx != null) _ = mlx.mlx_array_free(x.ssm_state);
+        if (x.aux_state.ctx != null) _ = mlx.mlx_array_free(x.aux_state);
+        if (x.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(x.qsa_pooled);
+    }
+}
+
+test "HotPrefixCache: a QSA arch restore with no indexer history is a miss, never a poisoned entry" {
+    // A snap without QSA history (a cancel handoff whose attach failed, an
+    // old on-disk entry) used to restore aux-less; the next prefill then died
+    // in qsaMaskFromQk with QsaHistoryGap on EVERY turn on that prefix. A
+    // QSA arch treats "no history after restore" like "no checkpoint".
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 70, 71 };
+    for ([_]bool{ false, true }) |with_history| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        hc.qsa_history_required = true;
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, tokens.len);
+        var live = pcBuildQsaHybrid(s, 10, 100.0);
+        defer pcFreeQsaHybrid(&live);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
+        if (with_history) try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+        try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+
+        var target_cache = try KVCache.init(testing.allocator, 3);
+        defer target_cache.deinit();
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var moe_off: usize = 0;
+        const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
+        if (with_history) {
+            try testing.expectEqual(@as(usize, 4), r.matched);
+            // Sliced to the snap's position, not the live length.
+            try testing.expectEqual(@as(c_int, 4), mlx.getShape(target[0].aux_state)[1]);
+        } else {
+            try testing.expectEqual(@as(usize, 0), r.matched);
+            try testing.expectEqual(@as(usize, 0), moe_off);
+            try testing.expect(target[0].aux_state.ctx == null);
+        }
+    }
+}
+
+test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
+    // The replace path inherits the old entry's checkpoints. Its latest snap
+    // carried the full history and the new latest gets another one: one copy
+    // per committed turn, the leak the stride fix closed by another door.
+    const s = mlx.gpuStream();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var c1 = try KVCache.init(testing.allocator, 3);
+    defer c1.deinit();
+    try testFillCache(&c1, s, 3, t1.len);
+    var l1 = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&l1);
+    const cps1 = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps1[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l1, 4, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps1, &l1, s);
+    try hc.commitWithState(&c1, &t1, false, 0, cps1, null, null);
+
+    var c2 = try KVCache.init(testing.allocator, 3);
+    defer c2.deinit();
+    try testFillCache(&c2, s, 3, t2.len);
+    var l2 = pcBuildQsaHybrid(s, 14, 200.0);
+    defer pcFreeQsaHybrid(&l2);
+    const cps2 = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps2[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l2, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps2, &l2, s);
+    try hc.commitWithState(&c2, &t2, false, 0, cps2, null, null);
+
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    const merged = hc.entries.items[0].ssm_checkpoints.?;
+    try testing.expectEqual(@as(usize, 2), merged.len);
+    try testing.expect(!transformer_mod.checkpointHasQsaHistory(&merged[0]));
+    try testing.expect(transformer_mod.checkpointHasQsaHistory(&merged[1]));
+    try testing.expectEqual(@as(c_int, 8), mlx.getShape(merged[1].layers[0].aux_state)[1]);
 }
 
 test "HotPrefixCache: replace path sheds inherited checkpoints instead of evicting its own entry (#330)" {

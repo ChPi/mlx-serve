@@ -14,7 +14,7 @@
 - **Settings > Interface**: light/dark/system, accent colour, chat text size, compact mode, and a configurable global shortcut for the quick launcher (#143, thanks @deanputney).
 - **Chat images are stored on disk**, not base64 in the history file: a typical history shrinks from 1.5 MB to 80 KB, and HEIC/TIFF/raw attachments are converted so the model actually sees them (#313, thanks @lojza3d).
 - **MiniCPM5 V3 tool calls** (`<function name=...><param name=...>`) are parsed natively, including truncated ones (#315, thanks @uncle9x9).
-- **Long-context decode on Qwen 3.8 Flash Next stays fast.** Sparse attention at decode now reads only the selected ~2k KV rows instead of the whole cache, so a 256k prompt holds about 41 tok/s instead of collapsing to ~15.
+- **Long-context decode on Qwen 3.8 Flash Next stays fast.** Sparse attention at decode reads only the selected ~2k KV rows instead of the whole cache: a 128k prompt decodes 47 tok/s instead of 40 on an M4 Max, and the gap widens with context (thanks @beamivalice).
 
 ### Fixes
 
@@ -29,7 +29,7 @@
 - Failed sandbox/terminal rows offer Start Server / Retry instead of an alert; every file picker shows hidden files.
 - Chat: attachments the server cannot decode (HEIC, TIFF, camera raw) no longer drop out of the prompt silently.
 - Model Browser: sizes and RAM fit for quantized MLX repos were 4x too high after Hugging Face changed how it counts packed weights. Sizes are now priced by the repo's bit width and match the real download.
-- Qwen 3.8 Flash Next long prefills no longer die around 400k tokens: prefix-cache snapshots were cloning the growing QSA key history at every stride (tens of GB). History is stored once; a 1M prompt prefills and decodes.
+- Qwen 3.8 Flash Next long prefills no longer die around 400k tokens: prefix-cache snapshots were cloning the growing sparse-attention key history at every stride (tens of GB). History is stored once per cached prompt, a cancelled prefill's snapshot lines up with its cache, and a snapshot without history is a cache miss instead of a request that fails every turn (thanks @beamivalice).
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 

@@ -3752,6 +3752,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.prefix_cache_capacity,
             clamped_prefix_mem,
         );
+        entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
         // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints

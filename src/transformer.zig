@@ -5040,26 +5040,63 @@ pub fn checkpointHasQsaHistory(cp: *const SSMCheckpoint) bool {
     return false;
 }
 
-/// Copy QSA aux/pooled from the live entries onto the LATEST checkpoint
-/// (one materialized copy of the full history). Stride snapshots stay
-/// GDN/PLE-only. No-op when `cps` is empty or no layer holds QSA history.
+/// One QSA layer's history onto `dst_aux`/`dst_pooled`, sliced to `take` rows
+/// (pooled to `take/ratio` blocks). A full-length copy shares the source
+/// buffer unless `materialize` (the LIVE history is a concat chain that must
+/// be cut). `take <= 0` leaves the destination empty.
+fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src_aux: mlx.mlx_array, src_pooled: mlx.mlx_array, ratio: c_int, take: c_int, materialize: bool, s: mlx.mlx_stream) !void {
+    if (dst_aux.ctx != null) _ = mlx.mlx_array_free(dst_aux.*);
+    dst_aux.* = .{ .ctx = null };
+    if (dst_pooled.ctx != null) _ = mlx.mlx_array_free(dst_pooled.*);
+    dst_pooled.* = .{ .ctx = null };
+    if (take <= 0 or src_aux.ctx == null) return;
+    const ks = mlx.getShape(src_aux);
+    if (ks.len < 2) return;
+    const rows: c_int = ks[1];
+    const full = take >= rows;
+    if (full and !materialize) {
+        dst_aux.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(dst_aux, src_aux));
+    } else if (full) {
+        dst_aux.* = try materializedOwnedCopy(s, src_aux);
+    } else {
+        const start = [_]c_int{ 0, 0, 0 };
+        const stop = [_]c_int{ ks[0], take, ks[2] };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, src_aux, &start, 3, &stop, 3, &strides, 3, s));
+        dst_aux.* = try materializedOwnedCopy(s, view);
+    }
+    if (src_pooled.ctx == null) return;
+    if (materialize) {
+        dst_pooled.* = try materializedOwnedCopy(s, src_pooled);
+    } else {
+        dst_pooled.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(dst_pooled, src_pooled));
+    }
+    if (!full) try truncatePooled(dst_pooled, take, ratio, s);
+}
+
+/// Copy QSA aux/pooled from the live entries onto the LATEST checkpoint —
+/// ONE materialized copy, sliced to that checkpoint's position (a cancel
+/// handoff attaches while the live history is ahead of the last stride
+/// snap). Older snaps in `cps` drop any history they carried. No-op when
+/// `cps` is empty or no layer holds QSA history.
 pub fn attachQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
     if (cps.len == 0) return;
     const cp = &cps[cps.len - 1];
     if (cp.layers.len != live.len) return error.SsmCheckpointLayerMismatch;
+    const keep: c_int = @intCast(cp.pos);
     var copied: usize = 0;
     for (cp.layers, live) |*dst, src| {
         if (!ssmAuxIsQsaHistory(&src)) continue;
-        if (dst.aux_state.ctx != null) _ = mlx.mlx_array_free(dst.aux_state);
-        dst.aux_state = try materializedOwnedCopy(s, src.aux_state);
-        copied += 1;
-        if (src.qsa_pooled.ctx != null) {
-            if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
-            dst.qsa_pooled = try materializedOwnedCopy(s, src.qsa_pooled);
-        }
+        try copyQsaHistorySliced(&dst.aux_state, &dst.qsa_pooled, src.aux_state, src.qsa_pooled, src.qsa_ratio, keep, true, s);
         dst.qsa_ratio = src.qsa_ratio;
+        copied += 1;
     }
     if (copied == 0) return;
+    keepOnlyLatestQsaHistory(cps);
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
     var n: usize = 0;
@@ -5075,6 +5112,39 @@ pub fn attachQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntr
     if (n > 0) _ = mlx.mlx_eval(vec);
 }
 
+/// Keep the QSA history on the NEWEST snap that carries it and drop it from
+/// every older one. A prefix-extend merge inherits the previous turn's latest
+/// snap, so without this an agent session holds one full copy per turn.
+pub fn keepOnlyLatestQsaHistory(cps: []SSMCheckpoint) void {
+    var i = cps.len;
+    var kept = false;
+    while (i > 0) {
+        i -= 1;
+        if (!checkpointHasQsaHistory(&cps[i])) continue;
+        if (!kept) {
+            kept = true;
+            continue;
+        }
+        for (cps[i].layers) |*l| {
+            if (!snapshotHasQsaHistory(l)) continue;
+            if (l.aux_state.ctx != null) _ = mlx.mlx_array_free(l.aux_state);
+            l.aux_state = .{ .ctx = null };
+            if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+            l.qsa_pooled = .{ .ctx = null };
+        }
+    }
+}
+
+/// Any live QSA layer holds indexer history. On a QSA arch a restore that
+/// leaves this false cannot prefill (QsaHistoryGap) — the cache treats it
+/// as a miss.
+pub fn entriesHaveQsaHistory(entries: []const SSMCacheEntry) bool {
+    for (entries) |*e| {
+        if (ssmAuxIsQsaHistory(e)) return true;
+    }
+    return false;
+}
+
 /// Overlay QSA history from `src_cp` (the entry's latest snap, full length)
 /// onto `entries` already restored to `pos`. Slices aux to `pos` rows and
 /// pooled to `pos/ratio` blocks. No-op on PLE/GDN layers (they already
@@ -5086,42 +5156,7 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
         if (!snapshotHasQsaHistory(&src)) continue;
         // After restoreSsmCheckpoint a QSA layer has no conv window.
         if (dst.conv_state.ctx != null and mlx.mlx_array_size(dst.conv_state) > 0) continue;
-        if (src.aux_state.ctx == null) continue;
-        const ks = mlx.getShape(src.aux_state);
-        if (ks.len < 2) continue;
-        const rows: c_int = ks[1];
-        const take: c_int = @min(keep, rows);
-        if (dst.aux_state.ctx != null) _ = mlx.mlx_array_free(dst.aux_state);
-        dst.aux_state = .{ .ctx = null };
-        if (take <= 0) {
-            if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
-            dst.qsa_pooled = .{ .ctx = null };
-            continue;
-        }
-        if (take == rows) {
-            dst.aux_state = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&dst.aux_state, src.aux_state));
-            if (src.qsa_pooled.ctx != null) {
-                if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
-                dst.qsa_pooled = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
-            }
-        } else {
-            const start = [_]c_int{ 0, 0, 0 };
-            const stop = [_]c_int{ ks[0], take, ks[2] };
-            const strides = [_]c_int{ 1, 1, 1 };
-            var view = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(view);
-            try mlx.check(mlx.mlx_slice(&view, src.aux_state, &start, 3, &stop, 3, &strides, 3, s));
-            dst.aux_state = try materializedOwnedCopy(s, view);
-            if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
-            dst.qsa_pooled = .{ .ctx = null };
-            if (src.qsa_pooled.ctx != null) {
-                dst.qsa_pooled = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
-                try truncatePooled(&dst.qsa_pooled, take, src.qsa_ratio, s);
-            }
-        }
+        try copyQsaHistorySliced(&dst.aux_state, &dst.qsa_pooled, src.aux_state, src.qsa_pooled, src.qsa_ratio, keep, false, s);
         dst.qsa_ratio = src.qsa_ratio;
     }
 }
@@ -5137,42 +5172,7 @@ pub fn sliceQsaHistoryOntoCheckpoint(dst: *SSMCheckpoint, src: *const SSMCheckpo
     for (dst.layers, src.layers) |*d, s_l| {
         if (!snapshotHasQsaHistory(&s_l)) continue;
         if (d.conv_state.ctx != null and mlx.mlx_array_size(d.conv_state) > 0) continue;
-        if (s_l.aux_state.ctx == null) continue;
-        const ks = mlx.getShape(s_l.aux_state);
-        if (ks.len < 2) continue;
-        const rows: c_int = ks[1];
-        const take: c_int = @min(keep, rows);
-        if (d.aux_state.ctx != null) _ = mlx.mlx_array_free(d.aux_state);
-        d.aux_state = .{ .ctx = null };
-        if (take <= 0) {
-            if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
-            d.qsa_pooled = .{ .ctx = null };
-            continue;
-        }
-        if (take == rows) {
-            d.aux_state = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&d.aux_state, s_l.aux_state));
-            if (s_l.qsa_pooled.ctx != null) {
-                if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
-                d.qsa_pooled = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_array_set(&d.qsa_pooled, s_l.qsa_pooled));
-            }
-        } else {
-            const start = [_]c_int{ 0, 0, 0 };
-            const stop = [_]c_int{ ks[0], take, ks[2] };
-            const strides = [_]c_int{ 1, 1, 1 };
-            var view = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(view);
-            try mlx.check(mlx.mlx_slice(&view, s_l.aux_state, &start, 3, &stop, 3, &strides, 3, s));
-            d.aux_state = try materializedOwnedCopy(s, view);
-            if (d.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(d.qsa_pooled);
-            d.qsa_pooled = .{ .ctx = null };
-            if (s_l.qsa_pooled.ctx != null) {
-                d.qsa_pooled = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_array_set(&d.qsa_pooled, s_l.qsa_pooled));
-                try truncatePooled(&d.qsa_pooled, take, s_l.qsa_ratio, s);
-            }
-        }
+        try copyQsaHistorySliced(&d.aux_state, &d.qsa_pooled, s_l.aux_state, s_l.qsa_pooled, s_l.qsa_ratio, keep, false, s);
         d.qsa_ratio = s_l.qsa_ratio;
     }
 }
@@ -12657,8 +12657,10 @@ pub const Transformer = struct {
         const nb: c_int = @divTrunc(kv, ratio);
         entry.qsa_ratio = ratio;
         {
+            // Fewer rows = a snap without history; MORE = a history restored
+            // ahead of the cache position. Both misplace every new key.
             const key_rows = mlx.getShape(keys)[1];
-            if (key_rows < kv) return error.QsaHistoryGap;
+            if (key_rows != kv) return error.QsaHistoryGap;
         }
         if (std.c.getenv("QWEN4_NO_POOLED") != null and entry.qsa_pooled.ctx != null) {
             _ = mlx.mlx_array_free(entry.qsa_pooled);
@@ -27987,6 +27989,21 @@ test "attachQsaHistoryToLatest is one copy; applyQsaHistoryAt slices to pos" {
     try sliceQsaHistoryOntoCheckpoint(&cps[0], &cps[1], 32, s);
     try testing.expect(checkpointHasQsaHistory(&cps[0]));
     try testing.expectEqual(@as(c_int, 32), mlx.getShape(cps[0].layers[0].aux_state)[1]);
+
+    // Two snaps carrying history (a prefix-extend merge inherits the previous
+    // turn's latest) collapse to ONE: the newest keeps it.
+    keepOnlyLatestQsaHistory(&cps);
+    try testing.expect(!checkpointHasQsaHistory(&cps[0]));
+    try testing.expect(checkpointHasQsaHistory(&cps[1]));
+    try testing.expectEqual(@as(c_int, 64), mlx.getShape(cps[1].layers[0].aux_state)[1]);
+
+    // The cancel handoff attaches while the live history is AHEAD of the latest
+    // snap (cancel between strides): the copy is sliced to the snap's pos, or
+    // the restore installs rows the cache does not hold.
+    var short = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live_arr, 16, s)};
+    defer short[0].deinit(testing.allocator);
+    try attachQsaHistoryToLatest(&short, &live_arr, s);
+    try testing.expectEqual(@as(c_int, 16), mlx.getShape(short[0].layers[0].aux_state)[1]);
 }
 
 test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar quants" {
