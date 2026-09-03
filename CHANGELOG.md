@@ -29,6 +29,7 @@
 - Failed sandbox/terminal rows offer Start Server / Retry instead of an alert; every file picker shows hidden files.
 - Chat: attachments the server cannot decode (HEIC, TIFF, camera raw) no longer drop out of the prompt silently.
 - Model Browser: sizes and RAM fit for quantized MLX repos were 4x too high after Hugging Face changed how it counts packed weights. Sizes are now priced by the repo's bit width and match the real download.
+- Qwen 3.8 Flash Next long prefills no longer die around 400k tokens: prefix-cache snapshots were cloning the growing QSA key history at every stride (tens of GB). History is stored once; a 1M prompt prefills and decodes.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 
