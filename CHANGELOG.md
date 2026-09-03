@@ -30,6 +30,7 @@
 - Chat: attachments the server cannot decode (HEIC, TIFF, camera raw) no longer drop out of the prompt silently.
 - Model Browser: sizes and RAM fit for quantized MLX repos were 4x too high after Hugging Face changed how it counts packed weights. Sizes are now priced by the repo's bit width and match the real download.
 - Qwen 3.8 Flash Next long prefills no longer die around 400k tokens: prefix-cache snapshots were cloning the growing sparse-attention key history at every stride (tens of GB). History is stored once per cached prompt, a cancelled prefill's snapshot lines up with its cache, and a snapshot without history is a cache miss instead of a request that fails every turn (thanks @beamivalice).
+- LTX video generation crashed the server at "Decoding video" on 26.8.11 (#321, thanks @hermitdave, @jedisct1). MLX 0.32.2 changed how 3D convolutions run, and the VAE decoder's per-convolution working set grew to tens of GB at full resolution (67 GB peak at 97 frames 1024x576, now 36 GB, same speed). The decoder now runs its convolutions in bounded frame windows.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 
