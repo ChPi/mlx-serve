@@ -5770,6 +5770,23 @@ pub const ForwardCtx = struct {
     /// so the attention layer never re-derives a per-slot offset.
     batch_slots: ?[]const *ForwardCtx = null,
     batch_rope_offsets: ?mlx.mlx_array = null,
+    /// qwen4_exp pipelined decode: the n-gram PLE rows are a HOST gather keyed
+    /// on the token ids, and the pipelined step builds its graph on a token
+    /// that is still a lazy sample. With `ple_defer` set, `pleEmbedding` hands
+    /// the graph an unfilled leaf and records it here; the caller fills it via
+    /// `Transformer.flushDeferredPle` (syncing on the token THEN) right before
+    /// the graph is evaluated. Set only by `generate.lazyForward`; a forward
+    /// evaluated with `ple_pending` still set reads zero rows.
+    ple_defer: bool = false,
+    ple_pending: ?PlePending = null,
+};
+
+pub const PlePending = struct {
+    emb: mlx.mlx_array,
+    token_ids: mlx.mlx_array,
+    entry: *SSMCacheEntry,
+    layer: usize,
+    seq_len: c_int,
 };
 
 // ── Decode quantized-KV attention kernel (docs/kv-quant-perf.md) ──
@@ -11538,6 +11555,20 @@ pub const Transformer = struct {
     /// `hcRead` that first applies a deferred write (`*pending`, consumed):
     /// fused when the N kernel takes it, else the chain's hcWrite. `h` is
     /// replaced by the written stream either way.
+    /// Diagnostic (`QWEN4_STANDIN=hc`): stream 0 as the block input, unit
+    /// gates — the read kernels drop out, the writes stay live.
+    fn hcReadStandin(self: *Transformer, h: mlx.mlx_array, batch: c_int, seq_len: c_int) !HcRead {
+        const hc: c_int = @intCast(self.config.hc_count);
+        const hidden: c_int = @intCast(self.config.hidden_size);
+        const start = [_]c_int{ 0, 0, 0 };
+        const stop = [_]c_int{ batch, seq_len, hidden };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var mixed = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&mixed, h, &start, 3, &stop, 3, &strides, 3, self.s));
+        const inj_shape = [_]c_int{ batch, seq_len, hc, 1 };
+        return .{ .mixed = mixed, .inj = try standinOnes(&inj_shape, self.s) };
+    }
+
     fn hcReadPending(self: *Transformer, h: *mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pending: *?HcPending) !HcRead {
         if (pending.*) |*pd| {
             defer pending.* = null;
@@ -11719,6 +11750,59 @@ pub const Transformer = struct {
     /// for all N·heads rows.
     fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
         const st = self.qwen4.?;
+        const emb_dim: usize = st.table.dim * st.hash.n_heads;
+        const n: usize = mlx.mlx_array_size(token_ids);
+        const batch: c_int = @intCast(n / @as(usize, @intCast(seq_len)));
+        const shape = [_]c_int{ batch, seq_len, @intCast(emb_dim) };
+        // Packed bf16 on the host (RNE) so the upload is one copy — no
+        // mid-graph eval, no GPU sync inside the layer loop.
+        const pk = try self.allocator.alloc(u16, n * emb_dim);
+        defer self.allocator.free(pk);
+        if (ctx.ple_defer and ctx.batch_slots == null) {
+            std.debug.assert(ctx.ple_pending == null);
+            @memset(pk, 0);
+            const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+            var emb_ref = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&emb_ref, emb));
+            var ids_ref = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&ids_ref, token_ids));
+            ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len };
+            return emb;
+        }
+        try self.pleGatherBf16(ctx, token_ids, entry, layer, seq_len, pk);
+        return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+    }
+
+    /// Fill the leaf a `ple_defer` forward was built on: the token ids are
+    /// read NOW (this is the one host sync of a pipelined qwen4 step), the
+    /// rows gathered straight into the leaf's buffer, and the per-entry
+    /// n-gram history advanced. No-op without a pending leaf.
+    pub fn flushDeferredPle(self: *Transformer, ctx: *ForwardCtx) !void {
+        const p = ctx.ple_pending orelse return;
+        ctx.ple_pending = null;
+        defer {
+            _ = mlx.mlx_array_free(p.emb);
+            _ = mlx.mlx_array_free(p.token_ids);
+        }
+        const dst = mlx.mlx_array_data_bfloat16(p.emb) orelse return error.PleLeafUnreadable;
+        const out: [*]u16 = @constCast(dst);
+        try self.pleGatherBf16(ctx, p.token_ids, p.entry, p.layer, p.seq_len, out[0..mlx.mlx_array_size(p.emb)]);
+    }
+
+    /// Drop a pending leaf without filling it (the forward that built on it
+    /// is being abandoned).
+    pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
+        const p = ctx.ple_pending orelse return;
+        ctx.ple_pending = null;
+        _ = mlx.mlx_array_free(p.emb);
+        _ = mlx.mlx_array_free(p.token_ids);
+    }
+
+    /// The host side of the n-gram PLE embedding: token ids → hashed rows →
+    /// gathered + bf16-packed into `pk` (`[n][emb_dim]`), advancing the
+    /// entry's n-gram history.
+    fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16) !void {
+        const st = self.qwen4.?;
         const ctx_len: usize = st.hash.ngram_size - 1;
         // Draft ids arrive as lazy graphs of whatever dtype the sampler
         // produced: cast + materialize contiguous before the host read.
@@ -11730,7 +11814,6 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_contiguous(&ids_c, ids_i32, false, self.s));
         try mlx.check(mlx.mlx_array_eval(ids_c));
         const n: usize = mlx.mlx_array_size(ids_c);
-        const batch: c_int = @intCast(n / @as(usize, @intCast(seq_len)));
         const ids = try self.allocator.alloc(u32, n);
         defer self.allocator.free(ids);
         const src = mlx.mlx_array_data_int32(ids_c) orelse return error.TokenIdsUnreadable;
@@ -11764,27 +11847,12 @@ pub const Transformer = struct {
         var gclk: ProfClock = if (diagEnvOn("QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
         st.table.gather(rows, host);
         if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
-
-        // Pack bf16 on the host (RNE) so the upload is one copy — no
-        // mid-graph eval, no GPU sync inside the layer loop.
-        if (std.c.getenv("QWEN4_PLE_GPU_CAST") != null) {
-            const shape0 = [_]c_int{ batch, seq_len, @intCast(emb_dim) };
-            const f32_arr = mlx.mlx_array_new_data(host.ptr, &shape0, 3, .float32);
-            defer _ = mlx.mlx_array_free(f32_arr);
-            var out0 = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_astype(&out0, f32_arr, .bfloat16, self.s));
-            try mlx.check(mlx.mlx_array_eval(out0));
-            return out0;
-        }
-        const pk = try self.allocator.alloc(u16, host.len);
-        defer self.allocator.free(pk);
+        std.debug.assert(pk.len == host.len);
         for (host, 0..) |v, i| {
             const u: u32 = @bitCast(v);
             const rounded = u +% 0x7FFF +% ((u >> 16) & 1);
             pk[i] = @intCast(rounded >> 16);
         }
-        const shape = [_]c_int{ batch, seq_len, @intCast(emb_dim) };
-        return mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
     }
 
     /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
@@ -12746,10 +12814,10 @@ pub const Transformer = struct {
                 try prof.lap(h, .ple);
             }
 
-            var pre = try self.hcReadPending(&h, &lw.hc_attn.?, batch, seq_len, &pending);
+            const si = qwen4Standin();
+            var pre: HcRead = if (si.hc) try self.hcReadStandin(h, batch, seq_len) else try self.hcReadPending(&h, &lw.hc_attn.?, batch, seq_len, &pending);
             defer pre.deinit();
             try prof.lap(pre.mixed, .hc_read);
-            const si = qwen4Standin();
             const attn_out = switch (lw.attn) {
                 .linear => |la| if (si.gdn) try standinRef(pre.mixed) else try self.gatedDeltaNet(pre.mixed, &la, entry, layer_idx, batch, seq_len, is_prefill),
                 .full => |fa| if (si.attn) try standinRef(pre.mixed) else try self.qwen4AttnWith(ctx, pre.mixed, &fa, entry, li, @intCast(offset), 0, batch, seq_len, is_prefill),
@@ -12762,11 +12830,11 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_attn, pre.inj);
                 Qwen4Trace.set(&tr.attn_out, attn_out);
             };
-            try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, &pending);
+            if (si.hc) h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, &pending);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
 
-            var pre2 = try self.hcReadPending(&h, &lw.hc_mlp.?, batch, seq_len, &pending);
+            var pre2: HcRead = if (si.hc) try self.hcReadStandin(h, batch, seq_len) else try self.hcReadPending(&h, &lw.hc_mlp.?, batch, seq_len, &pending);
             defer pre2.deinit();
             try prof.lap(pre2.mixed, .hc_read);
             const mlp_out = if (si.mlp) try standinRef(pre2.mixed) else switch (lw.mlp) {
@@ -12780,7 +12848,7 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
                 Qwen4Trace.set(&tr.mlp_out, mlp_out);
             };
-            try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, &pending);
+            if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, &pending);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
             prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
@@ -17775,7 +17843,13 @@ pub const Transformer = struct {
         var act_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(act_2d);
         var inter: c_int = 0;
-        if (self.config.hidden_act == .silu and
+        if (qwen4Standin().moe_gateup and self.config.moe_intermediate_size > 0) {
+            // Diagnostic: unit activations, the gate+up kernel drops out.
+            const sh = [_]c_int{ K, @intCast(self.config.moe_intermediate_size) };
+            _ = mlx.mlx_array_free(act_2d);
+            act_2d = try standinOnes(&sh, self.s);
+            inter = sh[1];
+        } else if (self.config.hidden_act == .silu and
             gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size and gate_qp.mode == up_qp.mode)
         {
             if (try gatherQmvGateUp(
@@ -17826,6 +17900,21 @@ pub const Transformer = struct {
         // [K, hidden] intermediate never materializes. Declines (dtype
         // mismatch, geometry, kill switch) fall through to the split form
         // with `reduced` untouched.
+        if (qwen4Standin().moe_down and @rem(D, inter) == 0) {
+            // Diagnostic: the down kernel drops out; the activations are still
+            // consumed (sum over K, tiled to hidden) so gate+up stays live.
+            var summed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(summed);
+            try mlx.check(mlx.mlx_sum_axis(&summed, act_2d, 0, false, self.s));
+            const reps = [_]c_int{@divExact(D, inter)};
+            var tiled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tiled);
+            try mlx.check(mlx.mlx_tile(&tiled, summed, &reps, 1, self.s));
+            const bsh_shape = [_]c_int{ B, S, D };
+            try mlx.check(mlx.mlx_reshape(out, tiled, &bsh_shape, 3, self.s));
+            reduced.* = true;
+            return true;
+        }
         {
             var scores_flat = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(scores_flat);
@@ -17943,10 +18032,34 @@ pub const Transformer = struct {
             try self.computeHy3Routing(router_logits, bias)
         else
             try self.computeMoeRouting(router_logits);
-        const inds = routed.inds;
+        var inds = routed.inds;
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
         defer _ = mlx.mlx_array_free(norm_scores);
+        if (qwen4Standin().moe_router) {
+            // Diagnostic: fixed experts 0..K-1, uniform scores (routing off the critical path).
+            const ish = mlx.getShape(inds);
+            const k: c_int = ish[ish.len - 1];
+            var ar = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ar);
+            try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(k), 1, mlx.mlx_array_dtype(inds), self.s));
+            var fixed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_broadcast_to(&fixed, ar, ish.ptr, @intCast(ish.len), self.s));
+            var fixed_c = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_contiguous(&fixed_c, fixed, false, self.s));
+            _ = mlx.mlx_array_free(fixed);
+            try mlx.check(mlx.mlx_array_eval(fixed_c));
+            _ = mlx.mlx_array_free(inds);
+            inds = fixed_c;
+            const ssh = mlx.getShape(norm_scores);
+            var uni = mlx.mlx_array_new();
+            const one_k = try scalarOf(1.0 / @as(f32, @floatFromInt(k)), mlx.mlx_array_dtype(norm_scores), self.s);
+            defer _ = mlx.mlx_array_free(one_k);
+            try mlx.check(mlx.mlx_full(&uni, ssh.ptr, @intCast(ssh.len), one_k, mlx.mlx_array_dtype(norm_scores), self.s));
+            try mlx.check(mlx.mlx_array_eval(uni));
+            _ = mlx.mlx_array_free(norm_scores);
+            norm_scores = uni;
+        }
 
         // The group-limited chain deliberately hands its weights back in f32
         // (a bf16 round trip after routed_scaling_factor costs real accuracy),
@@ -18242,7 +18355,7 @@ pub const Transformer = struct {
         }
 
         // Gemma 4: shared expert is handled separately in forwardMoe, just return expert_sum
-        if (mw.shared_expert_gate_w == null) return expert_sum;
+        if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return expert_sum;
         defer _ = mlx.mlx_array_free(expert_sum);
 
         // Qwen3.5: shared expert + gated combination
@@ -21436,10 +21549,10 @@ var decode_prof_enabled: ?bool = null;
 
 // Self-contained monotonic lap timer (this Zig nightly has no std.time.Timer;
 // the repo times via std.Io). `lap()` returns ns since the previous lap.
-/// QWEN4_STANDIN=gdn,attn,mlp,gdn_recur,gdn_proj,attn_qsa,attn_sdpa — replace a block
+/// QWEN4_STANDIN=gdn,attn,mlp,gdn_recur,gdn_proj,attn_qsa,attn_sdpa,hc,moe_shared,moe_router,moe_gateup,moe_down — replace a block
 /// with a free stand-in (a +1 ref of its input / a cached ones array) so the
 /// in-situ fwd-ubench reports what that block costs. Diagnostic only.
-pub const Standin = packed struct(u8) { gdn: bool = false, attn: bool = false, mlp: bool = false, gdn_recur: bool = false, gdn_proj: bool = false, attn_qsa: bool = false, attn_sdpa: bool = false, _pad: u1 = 0 };
+pub const Standin = packed struct(u16) { gdn: bool = false, attn: bool = false, mlp: bool = false, gdn_recur: bool = false, gdn_proj: bool = false, attn_qsa: bool = false, attn_sdpa: bool = false, hc: bool = false, moe_shared: bool = false, moe_router: bool = false, moe_gateup: bool = false, moe_down: bool = false, _pad: u4 = 0 };
 var standin_cached: ?Standin = null;
 pub fn qwen4Standin() Standin {
     if (standin_cached) |v| return v;
@@ -21454,6 +21567,11 @@ pub fn qwen4Standin() Standin {
             if (std.mem.eql(u8, tok, "gdn_proj")) v.gdn_proj = true;
             if (std.mem.eql(u8, tok, "attn_qsa")) v.attn_qsa = true;
             if (std.mem.eql(u8, tok, "attn_sdpa")) v.attn_sdpa = true;
+            if (std.mem.eql(u8, tok, "hc")) v.hc = true;
+            if (std.mem.eql(u8, tok, "moe_shared")) v.moe_shared = true;
+            if (std.mem.eql(u8, tok, "moe_router")) v.moe_router = true;
+            if (std.mem.eql(u8, tok, "moe_gateup")) v.moe_gateup = true;
+            if (std.mem.eql(u8, tok, "moe_down")) v.moe_down = true;
         }
     }
     standin_cached = v;
@@ -24054,13 +24172,26 @@ fn gatherQmvGateUpSource(comptime nvfp4: bool) [:0]const u8 {
         \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_p + (size_t)n * (size_t)K_by_p;
         \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
         \\
+        \\// Every lane's packed words are issued up front (KP = K_by_p is a
+        \\// template constant): −0.7% per forward in idle same-boot pairs vs
+        \\// the runtime-count loop. Same per-lane accumulation order.
+        \\constexpr int IT = (KP + 31) / 32;
+        \\uint32_t pg[IT];
+        \\uint32_t pu[IT];
+        \\for (int i = 0; i < IT; ++i) {{
+        \\  int pack = int(lane) + 32 * i;
+        \\  pg[i] = (pack < KP) ? wg_q[wbase + (size_t)pack] : 0u;
+        \\  pu[i] = (pack < KP) ? wu_q[wbase + (size_t)pack] : 0u;
+        \\}}
         \\// Two independent 4-way accumulator sets: the gate chain and the up
         \\// chain never wait on each other.
         \\float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
         \\float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
-        \\for (int pack = int(lane); pack < K_by_p; pack += 32) {{
-        \\  uint32_t packed_g = wg_q[wbase + (size_t)pack];
-        \\  uint32_t packed_u = wu_q[wbase + (size_t)pack];
+        \\for (int i = 0; i < IT; ++i) {{
+        \\  int pack = int(lane) + 32 * i;
+        \\  if (pack >= KP) break;
+        \\  uint32_t packed_g = pg[i];
+        \\  uint32_t packed_u = pu[i];
         \\  int k_base = pack * VPW;
         \\  int gi = k_base / GS;
         \\{s}
@@ -24602,7 +24733,7 @@ pub fn hcReadFused(
     return .{ .mixed = mixed, .inj = inj_out, .stream = stream_out };
 }
 
-const GateUpCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+const GateUpCfgKey = struct { topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
 var gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_cfg_key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey);
 var gqmv_gateup_engaged: bool = false;
@@ -24677,7 +24808,7 @@ pub fn gatherQmvGateUp(
     const sgs_per_tg: c_int = 8;
     if (@rem(N, sgs_per_tg) != 0) return null;
 
-    const key = GateUpCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = GateUpCfgKey{ .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
     if (gateup_cfg == null or !std.meta.eql(gateup_cfg_key, key)) {
         if (gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -24688,6 +24819,7 @@ pub fn gatherQmvGateUp(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", @divExact(K * @as(c_int, @intCast(bits)), 32)));
         gateup_cfg = config;
         gateup_cfg_key = key;
     }
@@ -38810,6 +38942,113 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
         pooled = true;
     };
     try testing.expect(pooled);
+}
+
+test "qwen4 deferred PLE: a pipelined decode step matches the direct forward (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.qwen4 != null);
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+
+    const State = struct {
+        cache: KVCache,
+        off: usize = 0,
+        entries: []SSMCacheEntry,
+        fn init(a: std.mem.Allocator, n_layers: u32) !@This() {
+            const entries = try a.alloc(SSMCacheEntry, n_layers);
+            for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+            const cache = try KVCache.init(a, n_layers);
+            return .{ .cache = cache, .entries = entries };
+        }
+        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            for (self.entries) |*e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+                if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
+                if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
+            }
+            a.free(self.entries);
+            self.cache.deinit();
+        }
+        fn ctx(self: *@This()) ForwardCtx {
+            return .{ .cache = &self.cache, .moe_seq_offset = &self.off, .ssm_entries = self.entries, .capture_hidden = null, .vision_embeddings = null };
+        }
+    };
+    var direct = try State.init(allocator, config.num_hidden_layers);
+    defer direct.deinit(allocator);
+    var deferred = try State.init(allocator, config.num_hidden_layers);
+    defer deferred.deinit(allocator);
+    var dctx = direct.ctx();
+    var lctx = deferred.ctx();
+
+    const prompt = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2 };
+    const pshape = [_]c_int{ 1, prompt.len };
+    for ([_]*ForwardCtx{ &dctx, &lctx }) |c| {
+        const pids = mlx.mlx_array_new_data(&prompt, &pshape, 2, .int32);
+        defer _ = mlx.mlx_array_free(pids);
+        const l = try xfm.forwardWith(c, pids);
+        try mlx.check(mlx.mlx_array_eval(l));
+        _ = mlx.mlx_array_free(l);
+    }
+
+    // Two decode steps: the deferred arm builds on an unfilled leaf, then
+    // fills it before eval. Both steps must match bit for bit (the second one
+    // proves the n-gram history advanced at flush time).
+    const steps = [_]i32{ 11, 4 };
+    for (steps) |tok| {
+        const dshape = [_]c_int{ 1, 1 };
+        const did = mlx.mlx_array_new_data(&tok, &dshape, 2, .int32);
+        defer _ = mlx.mlx_array_free(did);
+        const dl = try xfm.forwardWith(&dctx, did);
+        defer _ = mlx.mlx_array_free(dl);
+
+        lctx.ple_defer = true;
+        const ll = try xfm.forwardWith(&lctx, did);
+        defer _ = mlx.mlx_array_free(ll);
+        lctx.ple_defer = false;
+        try testing.expect(lctx.ple_pending != null);
+        try xfm.flushDeferredPle(&lctx);
+        try testing.expect(lctx.ple_pending == null);
+
+        const a = try qwen4ReadF32(allocator, dl, s);
+        defer allocator.free(a);
+        const b = try qwen4ReadF32(allocator, ll, s);
+        defer allocator.free(b);
+        try testing.expectEqualSlices(f32, a, b);
+    }
+
+    // Load-bearing arm: an unflushed leaf is NOT the direct forward.
+    {
+        const tok: i32 = 7;
+        const dshape = [_]c_int{ 1, 1 };
+        const did = mlx.mlx_array_new_data(&tok, &dshape, 2, .int32);
+        defer _ = mlx.mlx_array_free(did);
+        const dl = try xfm.forwardWith(&dctx, did);
+        defer _ = mlx.mlx_array_free(dl);
+        lctx.ple_defer = true;
+        const ll = try xfm.forwardWith(&lctx, did);
+        defer _ = mlx.mlx_array_free(ll);
+        lctx.ple_defer = false;
+        const a = try qwen4ReadF32(allocator, dl, s);
+        defer allocator.free(a);
+        const b = try qwen4ReadF32(allocator, ll, s);
+        defer allocator.free(b);
+        xfm.discardDeferredPle(&lctx);
+        try testing.expect(!std.mem.eql(f32, a, b));
+    }
 }
 
 test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget match the HF reference" {

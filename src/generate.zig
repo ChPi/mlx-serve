@@ -7621,7 +7621,20 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
     var reshaped = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(reshaped);
     try mlx.check(mlx.mlx_reshape(&reshaped, lazy_token, &tok_shape, 2, xfm.s));
-    return try xfm.forwardWith(ctx, reshaped);
+    // The graph is built while the previous step still runs on the GPU; an
+    // arch with a host-side token lookup (qwen4 n-gram PLE) fills its leaf
+    // afterwards, so the one sync on the token comes AFTER the build.
+    ctx.ple_defer = true;
+    defer ctx.ple_defer = false;
+    const logits = xfm.forwardWith(ctx, reshaped) catch |e| {
+        xfm.discardDeferredPle(ctx);
+        return e;
+    };
+    xfm.flushDeferredPle(ctx) catch |e| {
+        _ = mlx.mlx_array_free(logits);
+        return e;
+    };
+    return logits;
 }
 
 /// Sample a token lazily from logits — returns a lazy MLX array (no eval).

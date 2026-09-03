@@ -4374,3 +4374,34 @@ Hermetic bar: `gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA 
 Image decode is the mixed-arm case: `beginMropeChunk` at `seq_len <= 1` leaves `mrope_cos_cur` null (unchanged — do not "fix" that), so decode queries take the scalar path while prefill queries and pooled keys ride the already-scaled M-RoPE tables. Prefill and decode then ranked different blocks. Never `yarnScaleQK` on the indexer (`[head_dim]` is 256, not 128); never `mlx_fast_rope` scale as mscale (would also scale the pass-through tail); never `mlx_array_new_float` on bf16. Scalar mscale is `yarnScaleRotated` (queries) and `ropeAtFreqs` × `scalarOf` (pooled keys).
 
 `--config-overrides` now rides `modelFingerprint`, so a YaRN boot cannot restore an unscaled SSD prefix. Wipe `~/.mlx-serve/kv-cache` once after this change if you already served with overrides (old entries were fingerprinted without the JSON). DiskTier version and hash seed stay put.
+
+## qwen4 decode: the n-gram gather synced on the token inside the graph build (2026-09-02)
+
+Flash-Next served 63 tok/s short / 55 at 8.5k while the in-situ ubench put the forward at 13.5 ms GPU + 1.3 ms CPU build (74 tok/s if the build overlapped). The pipelined decode (`Generator.next`: build step N+1 on the lazy sample of step N, `async_eval`, then resolve token N) overlaps the build with the GPU on every other arch. On qwen4 the n-gram PLE needs the token ids on the HOST (hash → `ngram_table.bin` rows), and `pleEmbedding` did `mlx_array_eval(ids)` at layer 1 — so the build blocked there until forward N finished, and layers 1..47 (most of the 1.3 ms) plus the gather ran with the GPU idle. Serving was forward + build + gather, every token.
+
+Fix: `ForwardCtx.ple_defer` (set only by `generate.lazyForward`). `pleEmbedding` then hands the graph a zero-filled bf16 leaf and records `PlePending` (leaf + token-id ref + entry); after `forwardWith` returns, `Transformer.flushDeferredPle` evals the ids (the ONE sync — it waits for forward N, which is unavoidable), gathers the rows straight into the leaf's buffer (`mlx_array_data_bfloat16` + `@constCast`; a `new_data` leaf is an evaluated shared-mode buffer nobody reads until the graph runs) and advances the per-entry n-gram history. Batched decode (`batch_slots`), MTP verify and the concrete-token slow path keep the synchronous arm. Short 63.0 → 69.0 tok/s, 8.5k 55.1 → 60.6, greedy bytes identical on both prompts.
+
+Measured null and removed: `mlx_async_eval` of the post-layer-0 stream before the sync (so the GPU would run layer 0 + the sample while the host gathers). First pass 68.8 / 60.6 vs 69.0 / 60.6 while the user watched video on the box (same binary re-booted 67.3 / 59.2); idle interleaved pairs L0-B-B-L0: 68.9, 68.5 vs 68.4, 68.5 short, long 60.3 / 60.2 everywhere — null. Idle same-boot-order pairs read ±0.03 ms on the ubench; a busy desktop widens that to ±2.5%, so sub-2% calls are only worth making on an idle box.
+
+Bar: `qwen4 deferred PLE` (tiny pack, `QWEN4_TEST_MODEL`): two `ple_defer` + flush decode steps == the direct forward bit for bit (the second step proves the history advanced at flush time), and an UNFLUSHED leaf differs — the leaf is load-bearing.
+
+Where the rest of the qwen4 decode goes (same day, stand-in ubench, 14.8 ms GPU): MoE 5.8 ms vs a ~2.7 ms byte floor, GDN 3.3 vs 1.9 (projections 2.8 of it), attention 0.85, hyper-connection read/write + norms ~3.0, lm_head 1.4. Roughly 13 dependent kernels per layer at ~10–20 µs each; the next levers are kernel-count ones (single-kernel hc read via a last-threadgroup reduction, MoE kernel latency), not bytes. 27B for comparison: 33.7 ms/forward vs a 31 ms byte floor (roofline); verify widths S=2/3/4/5/6/8 = 34.9/36.0/39.5/44.8/49.9/89.6 ms, long KV adds ~1 ms at S=2 — its MTP round is the verify forward, so the 27B's only decode lever is the vqmm lane's compute rate at 4–7 rows.
+
+### Leftovers round, same day: five nulls and one loss, all measured in-situ
+
+Stand-ins added for the meter (`QWEN4_STANDIN=hc,moe_shared,moe_router,moe_gateup,moe_down`; a stand-in whose output nothing consumes lets MLX drop the whole block as dead code — the first `hc` arm read 2.8 ms because every block became unreachable; the shipped one keeps the writes live). Decode, GPU ms/forward, base 14.5–14.8:
+
+| arm | result | reading |
+|---|---|---|
+| `moe_gateup` stand-in | −1.7 ms | 16.4 MB/forward → the fused gate+up kernel is at ~450 GB/s: bandwidth |
+| `moe_down` stand-in | −0.6 ms | 8 MB: bandwidth |
+| `moe_shared` stand-in | −0.86 ms | 7.4 MB: bandwidth (the chain overlaps the routed path) |
+| `moe_router` stand-in | −0.88 ms | 2.6 MB in 18 µs/layer: ~13 µs/layer of two-kernel latency (qmv + topk) |
+| `hc` stand-in (view + unit gates, chain writes kept) | −1.65 ms | the three read kernels are ~17 µs per read |
+| `MLX_SERVE_MOE_GATHER_QMV_OFF=1` (stock gather_qmm) | +1.3 ms | ours stays |
+| gate+up with a template pack count + register-preloaded words (the hc-read unroll) | −0.7% (idle pairs 14.88/14.91 vs 14.99/14.99) — SHIPPED, bit-identical | at bandwidth already; the preload only trims issue latency |
+| `MLX_MAX_OPS_PER_BUFFER=64` + `MLX_MAX_MB_PER_BUFFER=1024` (fewer command buffers; ~111/token at the default) | null (idle pairs 14.99/15.06 vs 14.99/14.99) | Metal pipelines buffer commits fine |
+| hc read N folded into D and U (every threadgroup recomputes the 4 stream RMS stats with the stats kernel's exact reduction order; −96 dependent kernels/forward; bytes identical) | **+1.3 ms, serving 69 → 62.6** | 644 threadgroups × 20 KB + a barrier before any weight load: the redundant reduction costs more than the kernel it removes. Reverted |
+| prefill: dense causal instead of the QSA mask arm at the 4096-row chunk over kv 4096–8192 (`attn_qsa` stand-in) | 8.35 s vs 6.33 s per chunk | the masked `msv_attn_p256` arm already beats dense by 2 s; nothing to win there |
+
+Reading of the whole: ~6.4 ms of the 14.5 are weight bytes at 546 GB/s, every big block (experts, GDN projections, shared expert, lm_head) is at bandwidth, and the other ~8 ms is ~840 dependent kernels at roughly 10 µs of turnaround each. The only levers left are kernel-COUNT cuts that do not redistribute work (GDN prework + recurrence + norm-gate as one per-head kernel, −72; router matvec + top-k via a last-threadgroup reduce, −48), each a kernel project worth ≤ 5%. Metal System Trace via `xctrace` gives command-buffer intervals only; the shader-profiler table stays empty without the GUI template, so the stand-in ubench remains the per-kernel meter.
