@@ -12,6 +12,7 @@
 
 - A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.
 - Models whose output layer is padded past the end of their tokenizer (Qwen 3.8 Flash Next has 243 such rows) could draw one of those rows: the token decoded to nothing, so a reply lost a step and the wasted token stayed in the context. Those rows are now never sampled; reported log-probabilities are unchanged.
+- A long hybrid-model session could suddenly re-prefill its entire prompt from scratch (nine minutes at 390k tokens) with nothing in the log. A cache entry committed after restoring an earlier entry never inherited that entry's restore points, so once the original was evicted nothing usable remained; such entries now inherit them, and a miss that had a matching prompt is always logged.
 
 ---
 
