@@ -7497,7 +7497,8 @@ fn handleChatCompletions(
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
     // sidecar only loads when it binds to this trunk; MoE mirrors the
-    // drafter caution). Priority MTP > drafter > PLD at dispatch. NOT
+    // drafter caution). Priority DFlash > MTP > gemma drafter > PLD at
+    // dispatch (`requestSpecModes`). NOT
     // subject to the n-gram spec gate below — the trained head holds ~73%
     // per-draft acceptance even on fully novel content.
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
@@ -7647,8 +7648,8 @@ fn handleChatCompletions(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -7915,8 +7916,8 @@ fn handleCompletions(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -7970,12 +7971,13 @@ fn handleNonStreamingCompletion(
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
-    // Spec dispatch (priority MTP > drafter > PLD; mirrors handleNonStreamingGeneration).
+    // Spec dispatch: `requestSpecModes` (DFlash > MTP > drafter > PLD).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
-    const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
     var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream);
@@ -8061,8 +8063,7 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -8436,9 +8437,10 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
-    const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Transfer vision ownership into the slot via the scheduler.
     const slot_ve: ?mlx.mlx_array = blk: {
@@ -8960,23 +8962,78 @@ pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) 
     return has_hybrid_layers and !dflash_loaded;
 }
 
+pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
+
+/// The ONE request-level spec dispatch, shared by every surface x stream /
+/// non-stream. Priority: DFlash > MTP > gemma drafter > PLD, mirroring
+/// `scheduler.specInitWiring`. A loaded DFlash sidecar is an explicit choice
+/// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
+/// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
+/// false` hand the round back to MTP. The gemma cross-attention drafter
+/// stays below MTP. logprobs and a grammar constraint disable every mode.
+/// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
+/// already applied at every surface's parse site.
+pub fn requestSpecModes(
+    enable_pld: bool,
+    enable_drafter: bool,
+    enable_mtp: bool,
+    gemma_drafter_loaded: bool,
+    dflash_loaded: bool,
+    mtp_loaded: bool,
+    has_constraint: bool,
+    logprobs_n: u32,
+) RequestSpec {
+    const spec_ok = logprobs_n == 0 and !has_constraint;
+    const sidecar = spec_ok and enable_drafter and (gemma_drafter_loaded or dflash_loaded);
+    const use_dflash = sidecar and dflash_loaded;
+    const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
+    const use_drafter = use_dflash or (!use_mtp and sidecar);
+    return .{
+        .use_mtp = use_mtp,
+        .use_drafter = use_drafter,
+        .use_pld = !use_mtp and !use_drafter and spec_ok and enable_pld,
+    };
+}
+
 fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
-    drafter_loaded: bool,
+    gemma_drafter_loaded: bool,
+    dflash_loaded: bool,
     mtp_loaded: bool,
-    arch_blocks_sidecar: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
-    // Priority: MTP > drafter > PLD. The MTP head only loads when it binds
-    // to the trunk, so no extra arch gates here; the GDN/SSM rollback path
-    // it needs is the same one PLD uses.
-    if (enable_mtp and mtp_loaded and logprobs_n == 0 and !has_constraint) return .mtp;
-    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !arch_blocks_sidecar) return .drafter;
-    if (enable_pld and logprobs_n == 0 and !has_constraint) return .pld;
+    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, gemma_drafter_loaded, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
+    if (r.use_mtp) return .mtp;
+    if (r.use_drafter) return .drafter;
+    if (r.use_pld) return .pld;
     return .regular;
+}
+
+test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head; the gemma drafter does not" {
+    // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
+    var r = requestSpecModes(true, true, true, false, true, true, false, 0);
+    try std.testing.expect(r.use_drafter and !r.use_mtp and !r.use_pld);
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, true, true, false, 0));
+    // gemma drafter + mtp -> MTP keeps its rank.
+    r = requestSpecModes(true, true, true, true, false, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, false, true, false, 0));
+    // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
+    r = requestSpecModes(true, false, true, false, true, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    // logprobs / grammar disable every spec mode, dflash included.
+    r = requestSpecModes(true, true, true, false, true, true, false, 3);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
+    r = requestSpecModes(true, true, true, false, true, true, true, 0);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
+    // No sidecar loaded -> MTP; nothing loaded -> PLD.
+    r = requestSpecModes(true, true, true, false, false, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    r = requestSpecModes(true, true, true, false, false, false, false, 0);
+    try std.testing.expect(r.use_pld and !r.use_mtp and !r.use_drafter);
 }
 
 fn handleStreamingGeneration(
@@ -9043,7 +9100,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -14002,8 +14059,8 @@ fn handleAnthropicMessages(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -14124,12 +14181,12 @@ fn handleAnthropicNonStreaming(
 
     var timer = Stopwatch.init(stream.io);
 
-    // Speculative decoding dispatch — same priority as chat-completions
-    // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
-    const config = lm.config.?;
-    const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
-    const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
+    // Speculative decoding dispatch — same `requestSpecModes` as
+    // chat-completions (DFlash > MTP > drafter > PLD).
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
@@ -14364,7 +14421,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -15822,7 +15879,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -16125,11 +16182,12 @@ fn handleResponsesInner(
             .decode_tps = 0.0,
         };
     } else {
-        // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
-        // /v1/responses gets the same speedup as /v1/chat/completions.
-        const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
-        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
-        const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
+        // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
+        // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
+        const use_mtp = spec.use_mtp;
+        const use_drafter = spec.use_drafter;
+        const use_pld = spec.use_pld;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
             const v = local_ve;

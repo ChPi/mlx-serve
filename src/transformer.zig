@@ -38131,17 +38131,33 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xBEEF);
     const rnd = prng.random();
-    const WARM = 5;
-    const ITERS = 30;
+    const WARM = 2;
+    const ITERS = 8;
+    // One eval per BATCH of independent launches, never per launch: an eval
+    // barrier costs ~0.14 ms of sync on this box, which is more than the whole
+    // `out` projection and made every small shape a sync measurement. A real
+    // verify forward pipelines its dispatches, so the bench must too.
+    const BATCH = 12;
 
-    const shapes = [_]struct { name: []const u8, k: c_int, n: c_int }{
-        .{ .name = "qkvz", .k = 5120, .n = 16384 },
-        .{ .name = "gate/up", .k = 5120, .n = 17408 },
-        .{ .name = "down", .k = 17408, .n = 5120 },
-        .{ .name = "out", .k = 6144, .n = 5120 },
-        .{ .name = "lm_head", .k = 5120, .n = 151936 },
+    // Qwen3.8-27B 4-bit g64 inventory: hidden 5120, inter 17408, hd 256,
+    // 24/4 heads with an output gate, 64 layers = 48 GDN + 16 full attention,
+    // vocab 248320. `per_fwd` is how many times the shape runs in ONE forward,
+    // so the totals below are a whole-model qmm estimate at each width.
+    const shapes = [_]struct { name: []const u8, k: c_int, n: c_int, per_fwd: f64 }{
+        .{ .name = "gdn_in", .k = 5120, .n = 16384, .per_fwd = 48 },
+        .{ .name = "attn_q", .k = 5120, .n = 12288, .per_fwd = 16 },
+        .{ .name = "attn_kv", .k = 5120, .n = 1024, .per_fwd = 32 },
+        .{ .name = "gate/up", .k = 5120, .n = 34816, .per_fwd = 64 },
+        .{ .name = "down", .k = 17408, .n = 5120, .per_fwd = 64 },
+        .{ .name = "out", .k = 6144, .n = 5120, .per_fwd = 64 },
+        .{ .name = "lm_head", .k = 5120, .n = 248320, .per_fwd = 1 },
     };
-    std.debug.print("\n[vqmm-ubench] {s:>8} {s:>3} {s:>10} {s:>10} {s:>8}\n", .{ "shape", "M", "stock_ms", "kernel_ms", "ratio" });
+    const widths = [_]c_int{ 1, 4, 6, 8, 12, 16 };
+    var stock_tot: [widths.len]f64 = @splat(0);
+    var kern_tot: [widths.len]f64 = @splat(0);
+    var flops: [widths.len]f64 = @splat(0);
+
+    std.debug.print("\n[vqmm-ubench] {s:>8} {s:>3} {s:>10} {s:>10} {s:>8} {s:>10}\n", .{ "shape", "M", "stock_ms", "kernel_ms", "ratio", "kern_TF/s" });
     for (shapes) |sh| {
         const wn: usize = @intCast(sh.n * sh.k);
         const wbuf = try allocator.alloc(f32, wn);
@@ -38167,22 +38183,29 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
         try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
         for ([_]mlx.mlx_array{ wq, wsc, wbi }) |a| try mlx.check(mlx.mlx_array_eval(a));
 
-        // M 4/6 exercise the split-K lanes; 8/12/16 exercise the NAX m16
-        // tile on M5-class machines and honestly print "fallback" elsewhere.
-        // For the M5-day NAX-at-low-M A/B (todo-m5-nax.md §7), re-run with
-        // MLX_SERVE_VERIFY_QMM_NAX_MIN_M=4 so the 4/6 rows route to NAX.
-        for ([_]c_int{ 4, 6, 8, 12, 16 }) |m| {
-            const xn: usize = @intCast(m * sh.k);
+        for (widths, 0..) |m, wi| {
+            const xn: usize = @as(usize, @intCast(m * sh.k)) * BATCH;
             const xbuf = try allocator.alloc(f32, xn);
             defer allocator.free(xbuf);
             for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
-            const xshape = [_]c_int{ 1, m, sh.k };
+            const xshape = [_]c_int{ BATCH, m, sh.k };
             const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
             defer _ = mlx.mlx_array_free(x32);
-            var x = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x);
-            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
-            try mlx.check(mlx.mlx_array_eval(x));
+            var xall = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xall);
+            try mlx.check(mlx.mlx_astype(&xall, x32, .bfloat16, s));
+            var xs: [BATCH]mlx.mlx_array = undefined;
+            defer for (&xs) |*a| {
+                _ = mlx.mlx_array_free(a.*);
+            };
+            for (&xs, 0..) |*a, r| {
+                a.* = mlx.mlx_array_new();
+                const start = [_]c_int{ @intCast(r), 0, 0 };
+                const stop = [_]c_int{ @as(c_int, @intCast(r)) + 1, m, sh.k };
+                const strides = [_]c_int{ 1, 1, 1 };
+                try mlx.check(mlx.mlx_slice(a, xall, &start, 3, &stop, 3, &strides, 3, s));
+                try mlx.check(mlx.mlx_array_eval(a.*));
+            }
 
             var stock_ms: f64 = 0;
             {
@@ -38190,12 +38213,17 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
                 var sw = io_util.Stopwatch.init(tio);
                 while (it < WARM + ITERS) : (it += 1) {
                     if (it == WARM) sw.reset();
-                    var out = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_quantized_matmul(&out, x, wq, wsc, wbi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
-                    try mlx.check(mlx.mlx_array_eval(out));
-                    _ = mlx.mlx_array_free(out);
+                    var outs: [BATCH]mlx.mlx_array = undefined;
+                    for (&outs, &xs) |*o, xi| {
+                        o.* = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_quantized_matmul(o, xi, wq, wsc, wbi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+                    }
+                    const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+                    try mlx.check(mlx.mlx_eval(vec));
+                    _ = mlx.mlx_vector_array_free(vec);
+                    for (outs) |o| _ = mlx.mlx_array_free(o);
                 }
-                stock_ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS) / 1e6;
+                stock_ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS * BATCH) / 1e6;
             }
             var kern_ms: f64 = 0;
             var engaged = true;
@@ -38204,22 +38232,43 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
                 var sw = io_util.Stopwatch.init(tio);
                 while (it < WARM + ITERS) : (it += 1) {
                     if (it == WARM) sw.reset();
-                    const out_opt = try verifyQmm(s, x, wq, wsc, wbi, 4, 64);
-                    const out = out_opt orelse {
+                    var outs: [BATCH]mlx.mlx_array = undefined;
+                    var got: usize = 0;
+                    for (&outs, &xs) |*o, xi| {
+                        o.* = (try verifyQmm(s, xi, wq, wsc, wbi, 4, 64)) orelse break;
+                        got += 1;
+                    }
+                    if (got < BATCH) {
+                        for (outs[0..got]) |o| _ = mlx.mlx_array_free(o);
                         engaged = false;
                         break;
-                    };
-                    try mlx.check(mlx.mlx_array_eval(out));
-                    _ = mlx.mlx_array_free(out);
+                    }
+                    const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+                    try mlx.check(mlx.mlx_eval(vec));
+                    _ = mlx.mlx_vector_array_free(vec);
+                    for (outs) |o| _ = mlx.mlx_array_free(o);
                 }
-                kern_ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS) / 1e6;
+                kern_ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS * BATCH) / 1e6;
             }
+            const shape_flops = 2.0 * @as(f64, @floatFromInt(sh.k)) * @as(f64, @floatFromInt(sh.n)) * @as(f64, @floatFromInt(m));
+            stock_tot[wi] += stock_ms * sh.per_fwd;
+            flops[wi] += shape_flops * sh.per_fwd;
             if (engaged) {
-                std.debug.print("[vqmm-ubench] {s:>8} {d:>3} {d:>10.3} {d:>10.3} {d:>8.2}\n", .{ sh.name, m, stock_ms, kern_ms, kern_ms / stock_ms });
+                kern_tot[wi] += kern_ms * sh.per_fwd;
+                std.debug.print("[vqmm-ubench] {s:>8} {d:>3} {d:>10.3} {d:>10.3} {d:>8.2} {d:>10.2}\n", .{ sh.name, m, stock_ms, kern_ms, kern_ms / stock_ms, shape_flops / kern_ms / 1e9 });
             } else {
-                std.debug.print("[vqmm-ubench] {s:>8} {d:>3} {d:>10.3} {s:>10} {s:>8}\n", .{ sh.name, m, stock_ms, "fallback", "-" });
+                kern_tot[wi] += stock_ms * sh.per_fwd;
+                std.debug.print("[vqmm-ubench] {s:>8} {d:>3} {d:>10.3} {s:>10} {s:>8} {d:>10.2}\n", .{ sh.name, m, stock_ms, "fallback", "-", shape_flops / stock_ms / 1e9 });
             }
         }
+    }
+    std.debug.print("\n[vqmm-ubench] whole-forward qmm estimate (64 layers + lm_head), served lane\n", .{});
+    std.debug.print("[vqmm-ubench] {s:>3} {s:>10} {s:>10} {s:>9} {s:>10} {s:>12}\n", .{ "M", "stock_ms", "kern_ms", "vs_M1", "TFLOP/s", "marg/row_ms" });
+    for (widths, 0..) |m, wi| {
+        const marg = if (m == 1) 0.0 else (kern_tot[wi] - kern_tot[0]) / @as(f64, @floatFromInt(m - 1));
+        std.debug.print("[vqmm-ubench] {d:>3} {d:>10.2} {d:>10.2} {d:>8.2}x {d:>10.2} {d:>12.3}\n", .{
+            m, stock_tot[wi], kern_tot[wi], kern_tot[wi] / kern_tot[0], flops[wi] / kern_tot[wi] / 1e9, marg,
+        });
     }
 }
 

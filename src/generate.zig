@@ -1379,7 +1379,10 @@ pub const Generator = struct {
     // 4.4-15.0 accepted/round and the regressing prose/vision class at
     // 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
     // workloads accepting 62-86% remain above it as well.
-    pub const DFLASH_GATE_WARMUP: u64 = 3;
+    // Warmup 8, not 3 (2026-09-03): three rounds tripped on ONE dry opening
+    // (llmprobe's 16k rung: 0/3, drafter off for the whole request at 25
+    // tok/s; the same prompt restored from cache decoded at 73).
+    pub const DFLASH_GATE_WARMUP: u64 = 8;
     pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
     pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
     /// Absolute floor for a SPARSE target, applied after the width scaling.
@@ -4765,9 +4768,10 @@ pub const Generator = struct {
     }
 
     /// DFlash runtime economics gate. Sticky within the request: once a
-    /// three-round sample proves the block-parallel path yields less than its
-    /// width-normalized request-class threshold, subsequent ticks use the
-    /// regular pipelined decoder through `nextDflash`'s entry fallback.
+    /// `DFLASH_GATE_WARMUP`-round sample proves the block-parallel path yields
+    /// less than its width-normalized request-class threshold, subsequent
+    /// ticks use the regular pipelined decoder through `nextDflash`'s entry
+    /// fallback.
     fn checkDflashRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
         if (!dflashGateShouldDisable(
@@ -11079,20 +11083,21 @@ test "Generator.dflashGateShouldDisable uses accepted yield across block widths"
 
     // Muse prose/vision measured 1.0-1.5 accepted drafts per round at both
     // block 8 and block 16: that class loses to serial and must fall back.
-    try testing.expect(Generator.dflashGateShouldDisable(3, 3, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(Generator.dflashGateShouldDisable(3, 5, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    const w = Generator.DFLASH_GATE_WARMUP;
+    try testing.expect(Generator.dflashGateShouldDisable(w, w * 1, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(w, w * 2 - 1, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
 
     // Exactly two is the strict break-even boundary; code/tool traffic at
     // 4.4+ and echo traffic near a full block remain on DFlash.
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 6, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 45, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 2, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 5, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
 
     // Thinking preambles recovered from ~1.4 early to 4.4 whole-request; the
     // resolved-mode threshold keeps that path alive while still cutting off
     // a truly non-yielding reasoning request.
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 4, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(Generator.dflashGateShouldDisable(3, 2, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w + w / 3, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(w, w - w / 3, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
 }
 
 test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {

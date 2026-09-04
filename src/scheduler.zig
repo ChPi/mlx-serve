@@ -6185,11 +6185,14 @@ pub fn specInitWiring(
         .use_pld = false,
         .native_intent = has_native_draft and enable_mtp,
     };
-    const use_mtp = enable_mtp and has_mtp;
     // enable_drafter is the request-level "assistant sidecar" switch for BOTH
     // sidecar kinds; the loader guarantees at most one of drafter/dflash is
-    // loaded per model. Priority: MTP > dflash > gemma drafter > PLD.
-    const use_dflash = !use_mtp and enable_drafter and has_dflash;
+    // loaded per model. Priority: dflash > MTP > gemma drafter > PLD — a
+    // loaded DFlash sidecar is an explicit choice (`--drafter` or the pack's
+    // own `drafter/`) while the MTP head ships with the checkpoint;
+    // `--no-drafter` (or `enable_drafter:false`) hands the round back to MTP.
+    const use_dflash = enable_drafter and has_dflash;
+    const use_mtp = !use_dflash and enable_mtp and has_mtp;
     const use_drafter = !use_mtp and !use_dflash and enable_drafter and has_drafter;
     return .{
         .use_mtp = use_mtp,
@@ -6258,8 +6261,8 @@ pub fn specTickMode(
     gen_dspark_enabled: bool,
 ) SpecTickMode {
     if (gen_dspark_enabled and slot_enable_mtp) return .dspark;
-    if (slot_enable_mtp and gen_has_mtp) return .mtp;
     if (slot_enable_drafter and gen_has_dflash) return .dflash;
+    if (slot_enable_mtp and gen_has_mtp) return .mtp;
     if (slot_enable_drafter and gen_has_drafter) return .drafter;
     if (slot_enable_pld and gen_pld_enabled) return .pld;
     return .regular;
@@ -7564,14 +7567,21 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
 
-    // DFlash rides the enable_drafter switch: MTP > dflash > drafter > PLD.
+    // DFlash rides the enable_drafter switch: dflash > MTP > drafter > PLD.
     {
         const w = specInitWiring(false, false, false, false, false, true, false, true, true);
         try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and !w.use_pld);
     }
-    // A loaded MTP head still outranks it.
+    // A loaded drafter outranks the checkpoint's own MTP head: the sidecar
+    // is an explicit choice (`--drafter` or the in-dir `drafter/`), the head
+    // ships with every pack; `--no-drafter` restores MTP by not loading it.
     {
         const w = specInitWiring(false, false, false, true, true, true, false, true, true);
+        try testing.expect(w.use_dflash and !w.use_mtp and !w.use_pld);
+    }
+    // enable_drafter:false on the request hands the round back to MTP.
+    {
+        const w = specInitWiring(false, false, false, true, true, false, false, true, true);
         try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // enable_drafter:false opts BOTH sidecar kinds out.
@@ -7690,12 +7700,15 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false, false));
 
     // DFlash: slot's enable_drafter + generator's dflash handle; outranks the
-    // gemma drafter, loses to MTP/DSpark. Generator handle alone never
-    // resurrects it, and a dflash generator with the slot flag off stays
-    // regular (the specTickMode both-sides contract).
+    // gemma drafter AND the MTP head (a loaded sidecar is the explicit
+    // choice), loses to DSpark. Generator handle alone never resurrects it,
+    // and a dflash generator with the slot flag off stays regular (the
+    // specTickMode both-sides contract) — or MTP when that is armed.
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, false, true, false, false, false));
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, true, false, false, false));
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, false, true, false, false, true));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
 }
 
