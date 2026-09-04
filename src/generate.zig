@@ -1360,6 +1360,25 @@ pub const Generator = struct {
     /// - `per_draft_pct` (drafter only) = accepts / (attempts × (block_size-1)),
     ///   the per-draft acceptance probability comparable to vLLM's reported
     ///   "62% acceptance rate" metric.
+    /// Which QSA arm served this request's attention (qwen4_exp only; no-op
+    /// elsewhere). The engaged/declined meters are one-shots for the whole
+    /// PROCESS, so they cannot say what ran on THIS request at THIS context
+    /// length — a gather that quietly hands every call back to the dense mask
+    /// (a full kv8 dequant per layer per forward) otherwise reads like a
+    /// healthy run. Emitted next to `[spec-stats]`; resets the tally.
+    pub fn logQsaArms(self: *Generator) void {
+        // The tally rides THIS request's ForwardCtx — the one every forward
+        // of this slot was handed. A Transformer-level counter printed the
+        // union of every slot that decoded or prefilled since the last
+        // finisher reset it.
+        const c = self.ctx.qsa_arms.take() orelse return;
+        const arm = c.majority() orelse return;
+        log.info(
+            "  [qsa-arms] qsa={s} calls={d} mask={d} decode={d} verify={d} prefill={d}\n",
+            .{ @tagName(arm), c.total(), c.mask, c.decode, c.verify, c.prefill },
+        );
+    }
+
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
@@ -8438,6 +8457,7 @@ fn finishDrafterResult(
         });
     }
     gen.logSpecStats();
+    gen.logQsaArms();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
@@ -8543,6 +8563,7 @@ pub fn generateMtp(
         });
     }
     gen.logSpecStats();
+    gen.logQsaArms();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
@@ -8593,6 +8614,7 @@ fn finishPldResult(
         });
     }
     gen.logSpecStats();
+    gen.logQsaArms();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
@@ -12967,4 +12989,33 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     // keeps the head it already has.
     try testing.expect(fx.xfm.qwen4BuildDraftRerank());
     try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+}
+
+test "every request-finalize seam that logs [spec-stats] also logs [qsa-arms]" {
+    // Class guard for a wiring bug this test was written after: `logQsaArms`
+    // was added beside the three `gen.logSpecStats()` calls in THIS file, which
+    // are the legacy/CLI path only. The SERVER finalizes requests in
+    // `scheduler.finishSlot` ("scheduler-driven slots finalize here instead"),
+    // so `[qsa-arms]` was dead on every served request while looking wired.
+    // A per-request meter is worth nothing if it misses the path that actually
+    // serves requests, so the SEAM — not the symbol — is what gets pinned:
+    // every call site of the request summary must carry both. Needles are
+    // assembled at comptime so this test's own source cannot satisfy the scan.
+    const spec_call = "logSpec" ++ "Stats();";
+    const qsa_call = "logQsa" ++ "Arms();";
+    inline for (.{ @embedFile("generate.zig"), @embedFile("scheduler.zig") }) |src| {
+        var i: usize = 0;
+        var seams: usize = 0;
+        while (std.mem.indexOfPos(u8, src, i, spec_call)) |at| {
+            seams += 1;
+            // The paired call must sit in the same short block, not merely
+            // somewhere else in the file.
+            const win_end = @min(src.len, at + 400);
+            if (std.mem.indexOfPos(u8, src, at, qsa_call)) |q| {
+                if (q >= win_end) return error.SpecStatsSeamMissesQsaArms;
+            } else return error.SpecStatsSeamMissesQsaArms;
+            i = at + spec_call.len;
+        }
+        try std.testing.expect(seams > 0);
+    }
 }
