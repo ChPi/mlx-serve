@@ -406,6 +406,12 @@ Assistant shape (no embed table, no lm_head — borrows the trunk's): `encoder.f
 
 **Sampled requests** draft greedily and accept through the one-hot rule, and that is the MEASURED choice, not a v1 shortcut: on Muse 4-bit there is no temperature penalty (temp 0 → 1.98x / 55.1% per-draft; temp 0.7 → 1.98x / 57.7%, 3 reps x 4 prompts, same-boot serial reference). `MLX_SERVE_DFLASH_SAMPLED_DRAFTS=1` draws each draft from the request's own filtered distribution (`filteredProbsBlock`, one filter pass + one categorical over all m rows) and accepts through the full Leviathan ratio with the residual taken against the true q — exact, and a LOSS (1.87x / 54.5%): expected acceptance is `p(argmax q)` greedy vs `1 − TV(p,q)` sampled, and this assistant's argmax tracks the trunk while its distribution shape does not. Per-request spec cells swing ~10% run to run at temperature; 3+ reps before believing a temperature claim.
 
+### Workload-fair hot-cache eviction (#378)
+
+One model, two workloads: an agent conversation and a batch sweep of documents share `LoadedModel.prefix_cache`, and plain LRU let the sweep evict the conversation every time (more entries made it worse). Every entry now carries a `cache_key`, derived per request by `server.requestCacheKey` from the first of: `prompt_cache_key` (OpenAI's routing field; Codex sends it, a scripted pipeline can), `metadata.user_id` (Anthropic; Claude Code embeds its session id), the system prompt (OpenAI `messages[0]` system content incl. text parts, Anthropic `system`, Responses `instructions`), else 0 = anonymous. `/v1/completions` keys on `prompt_cache_key` only.
+
+When an entry must go (count cap, byte budget, `evictLruToAdmit`), `lruIndexExcluding` counts eligible entries per key (the incoming request's key counts as one more on the append path), keeps only the key(s) with the most, and takes the LRU among them; a tie between groups is plain LRU. A sweep therefore evicts its own documents, an unkeyed sweep is one anonymous group that evicts itself, and one workload alone is byte-identical to before. Matching is still by token prefix, the SSD tier's schema and the SSD-first idle spill (`oldestIdleIndex`) are untouched; a disk restore re-enters RAM under the restoring request's key. `[hot-cache] evicted LRU entry (...; key=<hex>; ...)` names the victim's key.
+
 ### SSD-first prefix cache (qwen4_exp)
 
 At 1M context on a 128 GB M5 Max the budget is weights ~70 GB + one session's

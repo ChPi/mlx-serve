@@ -21,6 +21,7 @@
 
 ### Fixes
 
+- A batch sweep no longer evicts your conversation from the prefix cache. Cache entries are grouped by workload (`prompt_cache_key`, else `metadata.user_id`, else the system prompt) and eviction takes the oldest entry of the largest group, so a sweep of documents evicts its own documents and a warm conversation stays warm. One workload alone behaves exactly as before. (#378)
 - A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.
 - More of the same class: an out-of-memory while growing the attention cache, or inside a speculative round, could free a buffer twice or free memory that was never built, taking the server down instead of failing one request. Latent until #353 made these paths reachable.
 - Models whose output layer is padded past the end of their tokenizer (Qwen 3.8 Flash Next has 243 such rows) could draw one of those rows: the token decoded to nothing, so a reply lost a step and the wasted token stayed in the context. Those rows are now never sampled; reported log-probabilities are unchanged.

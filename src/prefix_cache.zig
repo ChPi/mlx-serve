@@ -127,6 +127,9 @@ const Entry = struct {
     /// state strictly before this boundary is independent of the media pixels
     /// and can be shared across different `vision_key` values.
     media_start: ?usize = null,
+    /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
+    /// Eviction is fair across keys: the key holding the most entries pays first.
+    cache_key: u64 = 0,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
     /// handles to the GPU buffers backing positions 0..tokens.len.
     snapshot: KVCacheSnapshot,
@@ -1338,7 +1341,7 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !void {
-        return self.commitWithMediaState(source_cache, tokens, has_tools, vision_key, null, ssm_cps, dflash, mtp);
+        return self.commitWithMediaState(source_cache, tokens, has_tools, vision_key, 0, null, ssm_cps, dflash, mtp);
     }
 
     pub fn commitWithMediaState(
@@ -1347,6 +1350,7 @@ pub const HotPrefixCache = struct {
         tokens: []const u32,
         has_tools: bool,
         vision_key: u64,
+        cache_key: u64,
         media_start: ?usize,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
@@ -1668,6 +1672,7 @@ pub const HotPrefixCache = struct {
             e.snapshot = new_snap;
             e.has_tools = has_tools;
             e.vision_key = vision_key;
+            e.cache_key = cache_key;
             e.media_start = eff_media_start;
             e.quant_config = quant_config;
             e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
@@ -1693,13 +1698,13 @@ pub const HotPrefixCache = struct {
                 while (self.current_kv_bytes > self.max_kv_bytes and
                     self.entries.items.len > 1)
                 {
-                    self.evictOneLru("byte budget");
+                    self.evictOneLru("byte budget", null);
                 }
                 self.shedCheckpointsToFit();
                 while (self.current_kv_bytes > self.max_kv_bytes and
                     self.entries.items.len > 0)
                 {
-                    self.evictOneLru("byte budget");
+                    self.evictOneLru("byte budget", null);
                 }
             }
             if (self.disk != null) self.disk_dirty = true;
@@ -1708,11 +1713,11 @@ pub const HotPrefixCache = struct {
         }
 
         while (self.entries.items.len >= self.max_entries) {
-            self.evictOneLru("count cap");
+            self.evictOneLru("count cap", cache_key);
         }
         if (self.max_kv_bytes > 0) {
             while (self.current_kv_bytes + new_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-                self.evictOneLru("byte budget");
+                self.evictOneLru("byte budget", cache_key);
             }
         }
 
@@ -1720,6 +1725,7 @@ pub const HotPrefixCache = struct {
             .tokens = tokens_owned,
             .has_tools = has_tools,
             .vision_key = vision_key,
+            .cache_key = cache_key,
             .media_start = eff_media_start,
             .snapshot = new_snap,
             .last_used = self.bumpCounter(),
@@ -2250,8 +2256,8 @@ pub const HotPrefixCache = struct {
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
     }
 
-    fn evictOneLru(self: *HotPrefixCache, reason: []const u8) void {
-        const idx = self.lruIndexExcluding(null) orelse return;
+    fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
+        const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
         self.evictAt(idx, reason);
     }
 
@@ -2261,15 +2267,16 @@ pub const HotPrefixCache = struct {
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
         const had_ssm = evicted.ssm_checkpoints != null;
         const ssm_mb = @as(f64, @floatFromInt(evicted.ssm_bytes)) / (1024.0 * 1024.0);
+        const key = evicted.cache_key;
         self.current_kv_bytes -|= evicted.kv_bytes;
         freeEntryOwnedState(self.allocator, &evicted);
         if (had_ssm) {
-            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
-                reason, tokens_len, kv_mb, ssm_mb,
+            log.info("  [hot-cache] evicted LRU entry ({s}; key={x}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
+                reason, key, tokens_len, kv_mb, ssm_mb,
             });
         } else {
-            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB)\n", .{
-                reason, tokens_len, kv_mb,
+            log.info("  [hot-cache] evicted LRU entry ({s}; key={x}; was {d} tokens, {d:.2} MB)\n", .{
+                reason, key, tokens_len, kv_mb,
             });
         }
     }
@@ -2411,7 +2418,7 @@ pub const HotPrefixCache = struct {
     ) EvictionReport {
         var report = EvictionReport{};
         while (!fits(ctx)) {
-            const idx = self.lruIndexExcluding(if (protect_restored) self.last_restored_used else null) orelse break;
+            const idx = self.lruIndexExcluding(if (protect_restored) self.last_restored_used else null, null) orelse break;
             // Accounting bytes are what the entry was billed; live bytes are what the allocator got back.
             var live_before: usize = 0;
             _ = mlx.mlx_get_active_memory(&live_before);
@@ -2446,16 +2453,29 @@ pub const HotPrefixCache = struct {
     }
 
     /// Least-recently-used entry index, skipping the one whose `last_used` equals `protect`.
-    fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64) ?usize {
+    /// Workload-fair: only entries of the `cache_key` holding the most eligible entries
+    /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
+    /// documents before another workload's conversation. One key = plain LRU.
+    fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
+        var max_count: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             // Held by a live slot that owns its buffers: evicting it frees nothing.
             if (e.checked_out_by != null) continue;
             if (protect) |p| {
                 if (e.last_used == p) continue;
             }
-            if (e.last_used < best_used) {
+            var count: usize = if (incoming_key != null and incoming_key.? == e.cache_key) 1 else 0;
+            for (self.entries.items) |*o| {
+                if (o.checked_out_by != null or o.cache_key != e.cache_key) continue;
+                if (protect) |p| {
+                    if (o.last_used == p) continue;
+                }
+                count += 1;
+            }
+            if (count > max_count or (count == max_count and e.last_used < best_used)) {
+                max_count = count;
                 best_used = e.last_used;
                 best = i;
             }
@@ -3184,6 +3204,7 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
         &cached_tokens,
         false,
         0x1111,
+        0,
         media_start,
         checkpoints,
         null,
@@ -3977,7 +3998,7 @@ test "HotPrefixCache: a failed commit still frees the checkpoints it was handed 
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = .{ .pos = 4, .layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
     var toks = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, 0, null, cps, null, null));
+    try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, 0, 0, null, cps, null, null));
     // No frees here: the cache owns the checkpoints on every outcome.
 }
 
@@ -6133,4 +6154,38 @@ test "SSD-first: the durability check STATS the chunks — a truncated file is n
     hc.spillIdleEntries(s);
     try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
     try testing.expectEqual(@as(usize, 2), hc.entryCount());
+}
+
+test "HotPrefixCache: eviction picks the LRU of the key holding the most entries" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const key_a: u64 = 0xa;
+    const key_b: u64 = 0xb;
+    // C (conversation, key A, the global LRU) then D1..D3 (sweep docs, key B).
+    const keys = [_]u64{ key_a, key_b, key_b, key_b };
+    for (keys, 1..) |k, used| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{ 1, @intCast(used) }),
+            .has_tools = false,
+            .cache_key = k,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = used,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        });
+    }
+    // A fourth sweep doc arriving: the sweep evicts its own oldest, never C.
+    try testing.expectEqual(@as(?usize, 1), cache.lruIndexExcluding(null, key_b));
+    // No incoming key: the largest existing group (B) still pays.
+    try testing.expectEqual(@as(?usize, 1), cache.lruIndexExcluding(null, null));
+    // D1 protected / checked out: next LRU within B.
+    try testing.expectEqual(@as(?usize, 2), cache.lruIndexExcluding(2, key_b));
+    cache.entries.items[1].checked_out_by = 7;
+    try testing.expectEqual(@as(?usize, 2), cache.lruIndexExcluding(null, key_b));
+    cache.entries.items[1].checked_out_by = null;
+    // One workload = plain LRU: C goes first.
+    for (cache.entries.items) |*e| e.cache_key = 0;
+    try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
 }

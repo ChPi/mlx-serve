@@ -275,6 +275,8 @@ pub const SubmitParams = struct {
     vision_embeddings: ?mlx.mlx_array = null,
     /// Prefix-cache key for the media under the placeholder tokens (0 = none).
     vision_key: u64 = 0,
+    /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
+    cache_key: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -422,6 +424,7 @@ pub const Slot = struct {
     cancelled_prefill: Generator.CancelledCheckpointSink = .{},
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64 = 0,
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
     media_start: ?usize,
@@ -636,6 +639,7 @@ pub const Slot = struct {
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
             .vision_key = params.vision_key,
+            .cache_key = params.cache_key,
             .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
@@ -4853,7 +4857,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
         };
     };
-    hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
@@ -4904,7 +4908,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, media_start, cps, null, null) catch |err| {
+    hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };

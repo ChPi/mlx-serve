@@ -7177,6 +7177,52 @@ fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) 
     return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
 }
 
+/// Workload key for hot-cache eviction (#378): `prompt_cache_key` (OpenAI's own
+/// routing field) > `metadata.user_id` (Anthropic; Claude Code sends its session
+/// id) > the system prompt (OpenAI `messages[0]`, Anthropic `system`, Responses
+/// `instructions`) > 0 = anonymous. Text parts hash in order like `joinedTextParts`.
+fn requestCacheKey(root: std.json.ObjectMap) u64 {
+    if (root.get("prompt_cache_key")) |v| if (v == .string and v.string.len > 0)
+        return std.hash.Wyhash.hash(1, v.string);
+    if (root.get("metadata")) |mv| if (mv == .object) {
+        if (mv.object.get("user_id")) |v| if (v == .string and v.string.len > 0)
+            return std.hash.Wyhash.hash(2, v.string);
+    };
+    if (root.get("messages")) |mv| if (mv == .array and mv.array.items.len > 0) {
+        const first = mv.array.items[0];
+        if (first == .object) if (first.object.get("role")) |r| if (r == .string and std.mem.eql(u8, r.string, "system")) {
+            if (first.object.get("content")) |c| return hashTextValue(c) orelse 0;
+        };
+    };
+    if (root.get("system")) |v| return hashTextValue(v) orelse 0;
+    if (root.get("instructions")) |v| return hashTextValue(v) orelse 0;
+    return 0;
+}
+
+fn hashTextValue(v: std.json.Value) ?u64 {
+    var h = std.hash.Wyhash.init(3);
+    var n: usize = 0;
+    switch (v) {
+        .string => |t| {
+            if (t.len == 0) return null;
+            h.update(t);
+            n = 1;
+        },
+        .array => |parts| for (parts.items) |part| {
+            if (part != .object) continue;
+            const ptype = part.object.get("type") orelse continue;
+            if (ptype != .string or !std.mem.eql(u8, ptype.string, "text")) continue;
+            const tv = part.object.get("text") orelse continue;
+            if (tv != .string or tv.string.len == 0) continue;
+            if (n > 0) h.update("\n");
+            h.update(tv.string);
+            n += 1;
+        },
+        else => {},
+    }
+    return if (n == 0) null else h.final();
+}
+
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
     switch (v) {
@@ -7769,6 +7815,7 @@ fn handleChatCompletions(
     // submit time. Defer frees if we don't transfer ownership.
     var local_ve: ?mlx.mlx_array = null;
     var vis_key: u64 = 0;
+    const cache_key = requestCacheKey(root);
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -7908,13 +7955,13 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -7942,6 +7989,7 @@ fn handleCompletions(
         return;
     }
     const root = parsed.value.object;
+    const cache_key = requestCacheKey(root);
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/completions -> 400 (unsupported n)\n", .{});
@@ -8137,12 +8185,12 @@ fn handleCompletions(
     };
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, logprobs_n, cache_key) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, logprobs_n, cache_key) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -8164,6 +8212,7 @@ fn handleNonStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     logprobs_n: u32,
+    cache_key: u64,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
@@ -8176,7 +8225,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, cache_key, .{}, logprobs_n, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -8254,6 +8303,7 @@ fn handleStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     logprobs_n: u32,
+    cache_key: u64,
 ) !void {
     const cmpl_id = nowMs(stream.io);
     const created_ts = nowSecs(stream.io);
@@ -8291,6 +8341,7 @@ fn handleStreamingCompletion(
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
+        .cache_key = cache_key,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
@@ -8476,6 +8527,7 @@ fn nonStreamingViaScheduler(
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     mrope: MropeData,
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
@@ -8510,6 +8562,7 @@ fn nonStreamingViaScheduler(
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .vision_key = vision_key,
+        .cache_key = cache_key,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -8609,6 +8662,7 @@ fn handleNonStreamingGeneration(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -8645,7 +8699,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -9259,6 +9313,7 @@ fn handleStreamingGeneration(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -9337,6 +9392,7 @@ fn handleStreamingGeneration(
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
         .vision_key = vision_key,
+        .cache_key = cache_key,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -14247,6 +14303,7 @@ fn handleAnthropicMessages(
     // Phase A8: per-request ownership.
     var local_ve: ?mlx.mlx_array = null;
     var vis_key: u64 = 0;
+    const cache_key = requestCacheKey(root);
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -14349,12 +14406,12 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -14387,6 +14444,7 @@ fn handleAnthropicNonStreaming(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -14423,7 +14481,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -14623,6 +14681,7 @@ fn handleAnthropicStreaming(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -14681,6 +14740,7 @@ fn handleAnthropicStreaming(
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .vision_key = vision_key,
+        .cache_key = cache_key,
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -15884,6 +15944,7 @@ fn handleResponsesInner(
     // transferring the array to a scheduler slot.
     var local_ve: ?mlx.mlx_array = null;
     var vis_key: u64 = 0;
+    const cache_key = requestCacheKey(root);
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -16135,6 +16196,7 @@ fn handleResponsesInner(
             .mtp_depth = lm.mtp_depth,
             .vision_embeddings = slot_ve_resp,
             .vision_key = vis_key,
+            .cache_key = cache_key,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
             .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
@@ -16418,7 +16480,7 @@ fn handleResponsesInner(
             break :blk v;
         };
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -19014,6 +19076,53 @@ test "joinedTextParts: single text part borrows; empty and non-text parts ignore
     const none = try joinedTextParts(testing.allocator, &.{});
     try testing.expect(!none.owned);
     try testing.expectEqualStrings("", none.text);
+}
+
+fn cacheKeyOf(body: []const u8) !u64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    return requestCacheKey(parsed.value.object);
+}
+
+test "requestCacheKey: prompt_cache_key > metadata.user_id > system prompt > anonymous" {
+    const sys_str = try cacheKeyOf(
+        \\{"messages":[{"role":"system","content":"You are S."},{"role":"user","content":"hi"}]}
+    );
+    const sys_parts = try cacheKeyOf(
+        \\{"messages":[{"role":"system","content":[{"type":"text","text":"You are S."}]}]}
+    );
+    const anth = try cacheKeyOf(
+        \\{"system":[{"type":"text","text":"You are S."}],"messages":[{"role":"user","content":"hi"}]}
+    );
+    const resp = try cacheKeyOf(
+        \\{"instructions":"You are S.","input":"hi"}
+    );
+    try testing.expect(sys_str != 0);
+    try testing.expectEqual(sys_str, sys_parts);
+    try testing.expectEqual(sys_str, anth);
+    try testing.expectEqual(sys_str, resp);
+    try testing.expect(sys_str != try cacheKeyOf(
+        \\{"messages":[{"role":"system","content":"You are T."}]}
+    ));
+
+    const uid = try cacheKeyOf(
+        \\{"metadata":{"user_id":"sess-1"},"messages":[{"role":"system","content":"You are S."}]}
+    );
+    try testing.expect(uid != 0 and uid != sys_str);
+    const pck = try cacheKeyOf(
+        \\{"prompt_cache_key":"batch","metadata":{"user_id":"sess-1"},"messages":[{"role":"system","content":"You are S."}]}
+    );
+    try testing.expect(pck != 0 and pck != uid);
+    try testing.expectEqual(pck, try cacheKeyOf(
+        \\{"prompt_cache_key":"batch","prompt":"doc"}
+    ));
+
+    try testing.expectEqual(@as(u64, 0), try cacheKeyOf(
+        \\{"messages":[{"role":"user","content":"hi"}]}
+    ));
+    try testing.expectEqual(@as(u64, 0), try cacheKeyOf(
+        \\{"prompt_cache_key":"","prompt":"doc"}
+    ));
 }
 
 // --- /props payload regression ------------------------------------------------
