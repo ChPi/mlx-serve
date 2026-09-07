@@ -91,6 +91,11 @@ pub var g_lan_share_spec: ?[]const u8 = null;
 pub var g_lan_name: ?[]const u8 = null;
 pub var g_lan_discover: bool = false;
 
+/// Upstream chat providers (src/providers.zig): `~/.mlx-serve/providers.json`,
+/// rows mirrored into /v1/models as `<id>@<name>`, `/v1/chat/completions`
+/// proxied with the provider's key. Started by `serve()` beside the LAN.
+pub var g_providers: ?*providers_mod.Providers = null;
+
 /// Should boot print the open-bind warning? True only when serve mode is about
 /// to listen on a non-loopback address the user never chose: no explicit
 /// `--host` (the default is still 0.0.0.0) and no `--lan-share` (which needs
@@ -119,6 +124,7 @@ test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
 
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
+const providers_mod = @import("providers.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
@@ -696,6 +702,8 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/messages",
     "/v1/models",
     "/v1/models/rescan",
+    "/v1/providers",
+    "/v1/providers/reload",
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/unload-model",
@@ -1474,6 +1482,21 @@ pub fn serve(
         g_lan = null;
         l.shutdown();
     };
+    // The App Store build cannot exec curl (the providers transport), so it
+    // never starts them — same limit as `mlx-serve pull`.
+    if (!build_options.mas) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.mlx-serve/providers.json", .{home}) catch "";
+        g_providers = providers_mod.Providers.start(allocator, io, path, port) catch |err| blk: {
+            log.warn("[providers] failed to start ({s}); providers disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    defer if (g_providers) |p| {
+        g_providers = null;
+        p.shutdown();
+    };
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
@@ -1899,6 +1922,16 @@ fn handleConnection(
         try handleUnloadModelStrict(allocator, stream, request_body);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/providers/reload")) {
+        try handleProvidersReload(allocator, stream);
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/providers")) {
+        const body = if (g_providers) |p| try p.statusJson(allocator) else try allocator.dupe(u8, "{\"providers\":[]}");
+        defer allocator.free(body);
+        try sendResponse(stream, "200 OK", "application/json", body);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
         // Absorb models downloaded AFTER boot (the Model Browser pulls while
         // the server runs; discovery only walks the roots at startup).
@@ -1953,6 +1986,15 @@ fn handleConnection(
     //    that marker, not loopback-ness, is the multi-hop bound. A
     //    registered LOCAL id containing '@' keeps winning via the peek; an
     //    offline peer is an honest 404, never a silent local-default answer.
+    // ── Configured provider (`<id>@<provider>`) → proxied to its
+    //    /v1/chat/completions with the provider's key. Checked before the LAN
+    //    table: a provider is a URL the user typed, a peer is discovered.
+    if (g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
+        !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
+    {
+        try handleProviderProxy(allocator, stream, prov, path, request_body, requested_model_id);
+        return;
+    };
     if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
@@ -5805,8 +5847,10 @@ fn handleModels(
         }
     }
 
-    // Discovered LAN models ride the same list for local clients.
+    // Discovered LAN models and configured providers ride the same list for
+    // local clients; neither is re-exported to the LAN.
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
+    if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
     const body = try std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]}}
@@ -5895,15 +5939,17 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     // mirrored entry so client flows (load → generate → unload) work
     // unchanged on network models. Unknown peer/model falls through to
     // ensureLoaded's honest 404.
-    if (g_lan) |l| if (lan_mod.splitRemoteId(requested_id) != null) {
-        if (l.remoteEntryFor(allocator, requested_id)) |entry| {
+    if (lan_mod.splitRemoteId(requested_id) != null) {
+        const remote_entry: ?[]u8 = if (g_providers) |p| p.entryFor(allocator, requested_id) else null;
+        const entry_opt = remote_entry orelse if (g_lan) |l| l.remoteEntryFor(allocator, requested_id) else null;
+        if (entry_opt) |entry| {
             defer allocator.free(entry);
             const body = try std.fmt.allocPrint(allocator, "{{\"model\":{s}}}", .{entry});
             defer allocator.free(body);
             try sendResponse(stream, "200 OK", "application/json", body);
             return;
         }
-    };
+    }
     // Register-by-path: an absolute path to a model directory OUTSIDE the
     // --model-dir scan (e.g. the app's auto-downloaded embedding encoder).
     // The dir is validated exactly like discovery (config.json, supported
@@ -6137,7 +6183,7 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
 
     // Remote ids hold no residency on THIS host — idempotent 200, matching
     // the load-model no-op (the peer's owner controls its memory).
-    if (g_lan != null and lan_mod.splitRemoteId(requested_id) != null and
+    if ((g_lan != null or g_providers != null) and lan_mod.splitRemoteId(requested_id) != null and
         (global_registry == null or global_registry.?.peek(requested_id) == null))
     {
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
@@ -10490,6 +10536,10 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         &mid_buf,
         parseModelFromRequest(body, content_type) orelse "",
     );
+    if (lan_mod.splitRemoteId(mid)) |rid| if (registry.peek(mid) == null) {
+        // A provider is the host owner's paid key: never reachable from the LAN.
+        if (g_providers) |p| if (p.isProvider(rid.peer)) return "Provider models are host-local";
+    };
     if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model
@@ -10564,6 +10614,45 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
     lan_mod.tunnel(remote, method, raw_path, rewritten, stream) catch {
         try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
     };
+}
+
+/// Proxy `<bare>@<provider>` to the provider's /v1/chat/completions. Only that
+/// surface exists upstream, so every other model-gated route is a named 400
+/// rather than a request the provider would reject in its own words.
+fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, full_id: []const u8) !void {
+    if (!std.mem.eql(u8, path, "/v1/chat/completions")) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Provider models are served on /v1/chat/completions only", 400);
+        return;
+    }
+    var canon_buf: [512]u8 = undefined;
+    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
+    var up = prov.lookup(allocator, canon) orelse {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No such provider", 404);
+        return;
+    };
+    defer up.deinit(allocator);
+    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, up.bare);
+    defer allocator.free(rewritten);
+    log.info("[providers] proxy \"{s}\" -> {s}/chat/completions\n", .{ up.bare, up.url });
+    providers_mod.proxyChat(allocator, stream.io, up, rewritten, stream) catch {
+        try sendErrorResponse(allocator, stream, "502 Bad Gateway", "provider_unreachable", "Provider did not answer", 502);
+    };
+}
+
+fn handleProvidersReload(allocator: std.mem.Allocator, stream: *Conn) !void {
+    const p = g_providers orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "providers_unavailable", "Providers are disabled on this server", 503);
+        return;
+    };
+    const n = p.reload() catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "providers.json could not be read: {s}", .{@errorName(err)});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
+    const body = try std.fmt.allocPrint(allocator, "{{\"providers\":{d}}}", .{n});
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
 }
 
 /// Case-insensitive HTTP header lookup in the raw header block. `name_lower`

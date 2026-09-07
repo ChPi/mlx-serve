@@ -33,6 +33,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `muse_vision.zig` / `lfm2_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling |
 | `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (`src/html/` as `{s}` args, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
 | `lan.zig` | LAN sharing: Bonjour, `SharedSet` + `routeClass` allowlist, `<id>@<peer>` mirroring, streaming proxy. Pure transport |
+| `providers.zig` | Upstream OpenAI-compatible chat providers (`~/.mlx-serve/providers.json`): background `/v1/models` probe, `<id>@<name>` rows (declared `models` fallback), curl-backed `/v1/chat/completions` proxy. `GET /v1/providers`, `POST /v1/providers/reload` |
 | `metrics.zig` | Lock-free zero-when-off observability (`--metrics`): `vllm:`+`mlx_serve:` Prometheus + JSON |
 | `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
 | `gen.zig` | Unified media gen: modality-named engine slots, `detectModality`/`peekModelType`, per-request handlers, img2img/edit/LoRA, residency estimators |
@@ -154,6 +155,7 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl. `stop_sequence` echo, full SSE block lifecycle. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`.
 - **Ollama `/api/*`**: pure translation, no-model endpoints answered pre-scheduler; `resolveName` handles `name:tag`. One path must never register under TWO ids (`registry.peekByPath` — double-residency OOM).
 - `/v1/models` rows carry `context_length`+`max_model_len` at TOP level twinning `meta.context_length` (#188): discovery clients never read `meta.*`. Both emitters. Guard: `tests/test_models_capabilities.sh` [4b].
+- **Providers**: `<model>@<name>` from `~/.mlx-serve/providers.json` proxies `/v1/chat/completions` ONLY (other surfaces = named 400) through curl with the provider's key; rows ride `/v1/models` with a `provider` badge while the probe answers, declared `models` when it answers without a list, none when unreachable. Never shared to the LAN. Design: `docs/reference.md`.
 - **LAN sharing**: proxy is a TRANSPORT; keyless gate = `routeClass` × `SharedSet`; `<id>@<peer>` mirroring; loops impossible by construction (self-token + tunnel marker, one hop). Design: `docs/reference.md`.
 - **Observability** (`--metrics`): zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick. `--api-key`: loopback exempt; `/health`+OPTIONS open; `constTimeEql`. No admin surface.
 
@@ -165,7 +167,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 
 - Product skills: `~/.mlx-serve/skills/*.md` (frontmatter trigger substring → body into system prompt; `SkillManager` rescans on mtime).
 - `DownloadManager`: streams to `.partial`, Range resume, 3 retries, cancel preserves partial, size-matching files skipped.
-- Server log `~/.mlx-serve/logs/mlx-serve-<port>.log` is THE post-mortem file (`--log-level debug`). Grep: `jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache]`, `[hot-cache]`, `[admission]`. Capture: `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; `pkill -f mlx-serve` between KV-poison tests.
+- Server log `~/.mlx-serve/logs/mlx-serve-<port>.log` is THE post-mortem file (`--log-level debug`). Grep: `jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache]`, `[hot-cache]`, `[admission]`, `[providers]`. Capture: `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; `pkill -f mlx-serve` between KV-poison tests.
 
 ## Rules (distilled gotchas — stories in docs/gotchas/; every bullet ≤ 3 lines)
 
