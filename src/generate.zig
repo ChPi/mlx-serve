@@ -1196,6 +1196,8 @@ pub const Generator = struct {
     mtp_drafted_tokens: u64 = 0,
     /// Rounds where the confidence gate extended into chunk B.
     mtp_ext_rounds: u64 = 0,
+    /// Speculative rounds that rolled recurrent state back on a partial accept.
+    partial_rounds: u64 = 0,
     /// Extension dry-spell gate: consecutive extension-CONSIDERED rounds
     /// whose confidence gate did not clear, and the single-chunk cooldown
     /// that a full dry streak triggers (see mtpExtDryAllows).
@@ -1543,7 +1545,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1552,6 +1554,7 @@ pub const Generator = struct {
                     self.mtp_depth,
                     self.mtp_drafted_tokens,
                     self.mtp_ext_rounds,
+                    self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     @tagName(self.spec_disable_reason),
                     @tagName(self.mtp_adaptive.arm),
@@ -1588,7 +1591,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
@@ -1596,6 +1599,7 @@ pub const Generator = struct {
                     self.dflash_min_accepted_per_round,
                     per_draft_pct,
                     if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
+                    self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                     self.xfm.round_cost.formatBucket(table_bucket, &table_buf),
@@ -2232,7 +2236,11 @@ pub const Generator = struct {
             );
             ctx.cache.reserve(@intCast(reserved_tokens));
             // The arch's own per-request buffers reserve at the same length.
-            transformer_mod.reserveQsaHistory(ctx.ssm_entries, @intCast(reserved_tokens));
+            transformer_mod.reserveQsaHistoryWithHead(
+                ctx.ssm_entries,
+                if (xfm.qwen4_mtp) |*m| &m.entry else null,
+                @intCast(reserved_tokens),
+            );
 
             var pos: usize = 0;
             while (pos < loop_end) {
@@ -2314,6 +2322,9 @@ pub const Generator = struct {
                     for (dfl_out_buf) |*a| a.* = mlx.mlx_array_new();
                     ctx.capture_layers = &dfl_cl;
                 }
+                errdefer if (dflash_active) {
+                    for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
+                };
                 const chunk_logits = if (xfm.compiled_forward != null and
                     !mtp_capture and
                     !dflash_active and
@@ -2331,7 +2342,10 @@ pub const Generator = struct {
                 if (dflash_active) {
                     ctx.capture_layers = null;
                     try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + pos);
-                    for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
+                    for (dfl_out_buf) |*a| {
+                        _ = mlx.mlx_array_free(a.*);
+                        a.* = .{ .ctx = null };
+                    }
                 }
                 if (trace_enabled) chunked_ns += prefill_sw.read() - chunk_start_ns;
 
@@ -2417,7 +2431,11 @@ pub const Generator = struct {
                 const abs_end_for_cp2 = end + ssm_cp_offset;
                 if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
-                    try ssm_checkpoints.append(allocator, cp);
+                    ssm_checkpoints.append(allocator, cp) catch |e| {
+                        var doomed = cp;
+                        doomed.deinit(allocator);
+                        return e;
+                    };
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
                     // the last `max * stride` tokens and left no affordable trim point.
                     if (options.ssm_checkpoint_max > 0 and
@@ -2524,7 +2542,11 @@ pub const Generator = struct {
                     // or a partial tail (also evaluated). The snapshot is a
                     // cheap refcount-share.
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs, xfm.s);
-                    try ssm_checkpoints.append(allocator, cp);
+                    ssm_checkpoints.append(allocator, cp) catch |e| {
+                        var doomed = cp;
+                        doomed.deinit(allocator);
+                        return e;
+                    };
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
@@ -2585,6 +2607,9 @@ pub const Generator = struct {
             for (dfl_out_buf) |*a| a.* = mlx.mlx_array_new();
             ctx.capture_layers = &dfl_cl;
         }
+        errdefer if (dflash_active) {
+            for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
+        };
         const raw_logits = if (tail_mtp_capture) blk: {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -2628,7 +2653,10 @@ pub const Generator = struct {
         if (dflash_active) {
             ctx.capture_layers = null;
             try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + final_start);
-            for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
+            for (dfl_out_buf) |*a| {
+                _ = mlx.mlx_array_free(a.*);
+                a.* = .{ .ctx = null };
+            }
         }
         // Slice to the last position when the span is longer than one token,
         // so downstream sampling/grammar paths see the classic shape.
@@ -2958,6 +2986,7 @@ pub const Generator = struct {
             self.prompt_ids_owned = &.{};
             self.prompt_ids_alloc = null;
         }
+        self.xfm.markQsaPooledRopeStale();
         if (self.mtp_cache) |*mc| {
             mc.deinit();
             self.mtp_cache = null;
@@ -3299,6 +3328,16 @@ pub const Generator = struct {
         return round;
     }
 
+    /// The ONE place a partial accept rolls recurrent state back from the verify capture:
+    /// the loop and the `partial_rounds` count travel together, so a caller cannot take the
+    /// rollback without being counted.
+    fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
+        self.partial_rounds += 1;
+        for (entries) |*entry| {
+            try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
+        }
+    }
+
     pub fn nextPld(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -3548,7 +3587,8 @@ pub const Generator = struct {
         // only GatedDeltaNet layers actually populate `spec_state_seq`, so
         // pure-attention / Mamba2 / LFM2 fall through to the snapshot fallback.
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
-        const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        var verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.capture_ssm_seq = false;
         // Always free the transient capture buffers before returning, however
         // we exit this round (full accept, partial accept, or error).
@@ -3566,17 +3606,20 @@ pub const Generator = struct {
         // without re-running forward, and re-use them for both stochastic
         // accept tests and the correction sample.
         const per_pos_logits = try allocator.alloc(mlx.mlx_array, 1 + m);
+        var per_pos_logits_n: usize = 0;
         defer {
-            for (per_pos_logits) |arr| _ = mlx.mlx_array_free(arr);
+            for (per_pos_logits[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(per_pos_logits);
         }
         for (per_pos_logits, 0..) |*slot, idx| {
             slot.* = mlx.mlx_array_new();
+            per_pos_logits_n = idx + 1;
             const start = [_]c_int{ 0, @intCast(idx), 0 };
             const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
             try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
         }
         _ = mlx.mlx_array_free(verify_logits);
+        verify_logits = .{ .ctx = null };
 
         // ── Phase 5: Walk drafts. accepted ∈ [0, m]. Full accept = m. ──
         // verify_logits[i] is the prediction for draft[i] (i = 0..m-1).
@@ -3686,9 +3729,7 @@ pub const Generator = struct {
                 const step_keep = kv_snap.step;
                 try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
                 self.ctx.cache.step = step_keep;
-                for (self.ctx.ssm_entries.?) |*entry| {
-                    try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
-                }
+                try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
                 self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
             } else {
                 try self.ctx.cache.restore(&kv_snap);
@@ -3857,8 +3898,9 @@ pub const Generator = struct {
         // `draft_arrs[i]` is the lazy [1] argmax output of drafter step i.
         // Owned here; freed at end of nextDrafter (after verify uses them).
         const draft_arrs = try allocator.alloc(mlx.mlx_array, m);
+        var draft_arrs_n: usize = 0;
         defer {
-            for (draft_arrs) |arr| _ = mlx.mlx_array_free(arr);
+            for (draft_arrs[0..draft_arrs_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(draft_arrs);
         }
 
@@ -3888,6 +3930,7 @@ pub const Generator = struct {
                 // Sample lazily — `sampleTokenLazy` for greedy returns the
                 // argmax as a [1]-shaped lazy array. NO eval here.
                 draft_arrs[i] = self.sampleLazy(step_out.logits);
+                draft_arrs_n = i + 1;
                 _ = mlx.mlx_array_free(step_out.logits);
 
                 // Roll h_prev forward.
@@ -3933,12 +3976,14 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(verify_input);
         {
             const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
+            var drafts_2d_n: usize = 0;
             defer {
-                for (drafts_2d) |arr| _ = mlx.mlx_array_free(arr);
+                for (drafts_2d[0..drafts_2d_n]) |arr| _ = mlx.mlx_array_free(arr);
                 allocator.free(drafts_2d);
             }
             for (draft_arrs, drafts_2d) |dlazy, *out| {
                 out.* = mlx.mlx_array_new();
+                drafts_2d_n += 1;
                 try mlx.check(mlx.mlx_reshape(out, dlazy, &reshape_2d, 2, s));
             }
             const vec = mlx.mlx_vector_array_new();
@@ -3949,9 +3994,11 @@ pub const Generator = struct {
         }
 
         var new_hidden = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(new_hidden);
         // Captures the post-final-norm hidden at the LAST input position
         // (= position m, predicting the bonus token if all drafts accept).
-        const verify_logits = try xfm.forwardWithCapture(&self.ctx, verify_input, &new_hidden);
+        var verify_logits = try xfm.forwardWithCapture(&self.ctx, verify_input, &new_hidden);
+        errdefer _ = mlx.mlx_array_free(verify_logits);
         // verify_logits shape: [1, 1+m, V]
         self.drafter_attempted += 1;
 
@@ -3969,20 +4016,22 @@ pub const Generator = struct {
         // and (on partial accept) build the residual. Greedy path skips
         // slicing entirely. `per_pos_logits` is null in greedy mode.
         var per_pos_logits: ?[]mlx.mlx_array = null;
+        var per_pos_logits_n: usize = 0;
         defer if (per_pos_logits) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         if (stochastic) {
             const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
+            per_pos_logits = slots;
             const slice_strides = [_]c_int{ 1, 1, 1 };
             for (slots, 0..) |*slot, idx| {
                 slot.* = mlx.mlx_array_new();
+                per_pos_logits_n = idx + 1;
                 const start = [_]c_int{ 0, @intCast(idx), 0 };
                 const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
                 try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
             }
-            per_pos_logits = slots;
         }
 
         // Build the greedy argmax tensor lazily; it'll be eval'd alongside
@@ -3993,6 +4042,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
         }
         _ = mlx.mlx_array_free(verify_logits);
+        verify_logits = .{ .ctx = null };
 
         // ── Phase 4b: batched eval — drafts + verify_argmax + new_hidden ──
         //
@@ -4127,6 +4177,7 @@ pub const Generator = struct {
             if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
             self.last_hidden = new_hidden;
             self.has_last_hidden = true;
+            new_hidden = .{ .ctx = null };
 
             self.drafter_accepted_tokens += m;
             self.next_token_id = next_pending;
@@ -4148,6 +4199,7 @@ pub const Generator = struct {
         // last_hidden lands at the position immediately past the last
         // accepted draft (where next_pending will live).
         _ = mlx.mlx_array_free(new_hidden);
+        new_hidden = .{ .ctx = null };
 
         try self.ctx.cache.restore(&kv_snap);
         if (ssm_snaps) |snaps| {
@@ -4165,6 +4217,7 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(re_input);
 
         var re_new_hidden = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(re_new_hidden);
         const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
         _ = mlx.mlx_array_free(re_logits);
 
@@ -4178,6 +4231,7 @@ pub const Generator = struct {
         if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
         self.last_hidden = re_new_hidden;
         self.has_last_hidden = true;
+        re_new_hidden = .{ .ctx = null };
 
         self.drafter_accepted_tokens += accepted;
         self.next_token_id = next_pending;
@@ -4528,7 +4582,8 @@ pub const Generator = struct {
         // Per-position SSM capture on a GDN trunk so partial accept can roll
         // back the recurrent state without re-forwarding (mirrors nextMtp).
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
-        const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        var verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.capture_ssm_seq = false;
         defer if (self.ctx.ssm_entries) |entries| {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
@@ -4549,20 +4604,22 @@ pub const Generator = struct {
         // ── Phase 3: decide the longest accepted prefix ──
         const vl_shape = mlx.getShape(verify_logits);
         var per_pos_logits: ?[]mlx.mlx_array = null;
+        var per_pos_logits_n: usize = 0;
         defer if (per_pos_logits) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         if (stochastic) {
             const slots = try allocator.alloc(mlx.mlx_array, bs);
+            per_pos_logits = slots;
             const slice_strides = [_]c_int{ 1, 1, 1 };
             for (slots, 0..) |*slot, idx| {
                 slot.* = mlx.mlx_array_new();
+                per_pos_logits_n = idx + 1;
                 const start = [_]c_int{ 0, @intCast(idx), 0 };
                 const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
                 try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
             }
-            per_pos_logits = slots;
         }
         var verify_argmax = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(verify_argmax);
@@ -4570,6 +4627,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
         }
         _ = mlx.mlx_array_free(verify_logits);
+        verify_logits = .{ .ctx = null };
 
         // One batched dispatch, then read (drafts branch + verify branch are
         // separate graphs — eval BOTH before reading either; the v26.5.6
@@ -4679,9 +4737,7 @@ pub const Generator = struct {
                 if (self.ctx.ssm_entries) |entries| {
                     const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
                     if (!gdn_captured) return error.SpecRollbackUnavailable;
-                    for (entries) |*entry| {
-                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
-                    }
+                    try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
                 }
                 self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
             } else if (hybrid_path) {
@@ -4697,9 +4753,7 @@ pub const Generator = struct {
                         }
                     }
                     if (!captured) return error.SpecRollbackUnavailable;
-                    for (entries) |*entry| {
-                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, bs, s);
-                    }
+                    try self.rollbackSsmFromCapture(entries, accepted, bs, s);
                 }
                 self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
             }
@@ -4708,12 +4762,14 @@ pub const Generator = struct {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
         } else {
             const sliced = try allocator.alloc(mlx.mlx_array, cap_out.len);
+            var sliced_n: usize = 0;
             defer {
-                for (sliced) |a| _ = mlx.mlx_array_free(a);
+                for (sliced[0..sliced_n]) |a| _ = mlx.mlx_array_free(a);
                 allocator.free(sliced);
             }
             for (cap_out, sliced) |full, *out| {
                 out.* = mlx.mlx_array_new();
+                sliced_n += 1;
                 const fsh = mlx.getShape(full);
                 const start = [_]c_int{ 0, 0, 0 };
                 const stop = [_]c_int{ 1, @intCast(n_commit), fsh[2] };
@@ -4986,7 +5042,7 @@ pub const Generator = struct {
             // append: both skip the vocab projection, but the draft still needs
             // the vector that projection would have consumed.
             const want: mtp_mod.StepWant = if (use_rerank) .mixed else .logits;
-            const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
+            var step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
                 // Deferred history append (stashed at the END of the
                 // previous round, Phase 5a) merged into this chain's first
                 // draft: ONE (n+1)-row head forward appends the
@@ -5019,6 +5075,10 @@ pub const Generator = struct {
                 }
                 break :blk try head.forward(xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), want, mtp_mrope_ctx);
             } else try head.forward(xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), want, mtp_mrope_ctx);
+            errdefer {
+                if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
+                _ = mlx.mlx_array_free(step_out.hidden_next);
+            }
             // A `.mixed` step that publishes `rerank_x` means `hidden_next` is
             // NOT what the lm_head consumes — on qwen4_exp it is the pre-mixer
             // `[B,S,hc*H]` stream and the mixer output is the rerank input.
@@ -5050,8 +5110,10 @@ pub const Generator = struct {
                 chain.n_conf = i + 1;
             }
             if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
+            step_out.logits = .{ .ctx = null };
             if (chain.h_chain) |h_old| _ = mlx.mlx_array_free(h_old);
             chain.h_chain = step_out.hidden_next;
+            step_out.hidden_next = .{ .ctx = null };
         }
     }
 
@@ -5676,12 +5738,14 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(verify_input);
         {
             const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
+            var drafts_2d_n: usize = 0;
             defer {
-                for (drafts_2d) |arr| _ = mlx.mlx_array_free(arr);
+                for (drafts_2d[0..drafts_2d_n]) |arr| _ = mlx.mlx_array_free(arr);
                 allocator.free(drafts_2d);
             }
             for (draft_arrs[0..m], drafts_2d) |dlazy, *out| {
                 out.* = mlx.mlx_array_new();
+                drafts_2d_n += 1;
                 try mlx.check(mlx.mlx_reshape(out, dlazy, &reshape_2d, 2, s));
             }
             const vec = mlx.mlx_vector_array_new();
@@ -5692,6 +5756,7 @@ pub const Generator = struct {
         }
 
         var new_hidden = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(new_hidden);
         var verify_hidden_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(verify_hidden_all);
         // Enable per-position SSM capture for the verify pass on a GDN trunk
@@ -5719,12 +5784,13 @@ pub const Generator = struct {
         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
         // 4 evaluates anything. Other arches never set `ple_pending`.
         self.ctx.ple_defer = true;
-        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all) catch |e| {
+        var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
             xfm.discardDeferredPle(&self.ctx);
             return e;
         };
+        errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
         // Always free the transient capture buffers before returning, however
@@ -5756,8 +5822,9 @@ pub const Generator = struct {
         const vl_shape = mlx.getShape(verify_logits);
 
         var per_pos_probs: ?[]mlx.mlx_array = null;
+        var per_pos_probs_n: usize = 0;
         defer if (per_pos_probs) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..per_pos_probs_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         var accept_p_vec = mlx.mlx_array_new();
@@ -5765,8 +5832,9 @@ pub const Generator = struct {
         var accept_q_vec = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(accept_q_vec);
         var corr_samples: ?[]mlx.mlx_array = null;
+        var corr_samples_n: usize = 0;
         defer if (corr_samples) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..corr_samples_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         // Batched-corrections path: ONE [1+m] pre-sampled correction array
@@ -5803,6 +5871,7 @@ pub const Generator = struct {
             per_pos_probs = slots;
             for (slots, 0..) |*slot, idx| {
                 slot.* = mlx.mlx_array_new();
+                per_pos_probs_n = idx + 1;
                 const start = [_]c_int{ 0, @intCast(idx), 0 };
                 const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
                 try mlx.check(mlx.mlx_slice(slot, probs_all, &start, 3, &stop, 3, &slice_strides, 3, s));
@@ -5812,12 +5881,14 @@ pub const Generator = struct {
             // draft id array → [m] f32 after one eval.
             {
                 const taken = try allocator.alloc(mlx.mlx_array, m);
+                var taken_n: usize = 0;
                 defer {
-                    for (taken) |arr| _ = mlx.mlx_array_free(arr);
+                    for (taken[0..taken_n]) |arr| _ = mlx.mlx_array_free(arr);
                     allocator.free(taken);
                 }
                 for (0..m) |k| {
                     taken[k] = mlx.mlx_array_new();
+                    taken_n = k + 1;
                     try mlx.check(mlx.mlx_take_axis(&taken[k], slots[k], draft_arrs[k], -1, s));
                 }
                 const vec = mlx.mlx_vector_array_new();
@@ -5833,12 +5904,14 @@ pub const Generator = struct {
             // the sampled draft, for the Leviathan ratio (sharp drafts only).
             if (q_probs) |qslots| {
                 const taken = try allocator.alloc(mlx.mlx_array, m);
+                var taken_n: usize = 0;
                 defer {
-                    for (taken) |arr| _ = mlx.mlx_array_free(arr);
+                    for (taken[0..taken_n]) |arr| _ = mlx.mlx_array_free(arr);
                     allocator.free(taken);
                 }
                 for (0..m) |k| {
                     taken[k] = mlx.mlx_array_new();
+                    taken_n = k + 1;
                     try mlx.check(mlx.mlx_take_axis(&taken[k], qslots[k], draft_arrs[k], -1, s));
                 }
                 const vec = mlx.mlx_vector_array_new();
@@ -5863,6 +5936,7 @@ pub const Generator = struct {
             corr_samples = corrs;
             for (corrs, 0..) |*slot, a| {
                 slot.* = mlx.mlx_array_new();
+                corr_samples_n = a + 1;
                 if (a < m) {
                     // residual = max(target_p − proposal, 0): the proposal is
                     // the FULL sharpened q distribution under sharp drafts
@@ -5909,6 +5983,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
         }
         _ = mlx.mlx_array_free(verify_logits);
+        verify_logits = .{ .ctx = null };
         if (tracing) {
             self.mtp_trace.add(.corr, ph.read());
             ph.reset();
@@ -6081,6 +6156,7 @@ pub const Generator = struct {
             if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
             self.last_hidden = new_hidden;
             self.has_last_hidden = true;
+            new_hidden = .{ .ctx = null };
 
             self.mtp_accepted_tokens += m;
             self.next_token_id = next_pending;
@@ -6115,6 +6191,7 @@ pub const Generator = struct {
         // (input index `accepted`), which forwardWithCaptureAll captured.
         // Non-GDN archs keep the proven restore + re-forward fallback.
         _ = mlx.mlx_array_free(new_hidden);
+        new_hidden = .{ .ctx = null };
 
         const gdn_captured = if (self.ctx.ssm_entries) |entries|
             entries.len > 0 and entries[0].spec_state_seq.ctx != null
@@ -6122,6 +6199,7 @@ pub const Generator = struct {
             false;
 
         var re_new_hidden = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(re_new_hidden);
         if (gdn_captured) {
             const accepted_len: usize = 1 + @as(usize, accepted);
             // `truncate` overwrites cache.step with its length arg; on this
@@ -6131,9 +6209,7 @@ pub const Generator = struct {
             // the restore-based fallback (same rule as nextPld).
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
             self.ctx.cache.step = kv_step_snap;
-            for (self.ctx.ssm_entries.?) |*entry| {
-                try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
-            }
+            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
 
             const vh_shape = mlx.getShape(verify_hidden_all);
@@ -6162,6 +6238,7 @@ pub const Generator = struct {
             // GDN layer populates the capture when capture_ssm_seq is set);
             // pinned by tests/test_mtp_equivalence.sh.
             _ = mlx.mlx_array_free(re_new_hidden);
+            re_new_hidden = .{ .ctx = null };
             return error.MtpRollbackUnavailable;
         }
 
@@ -6175,6 +6252,7 @@ pub const Generator = struct {
         if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
         self.last_hidden = re_new_hidden;
         self.has_last_hidden = true;
+        re_new_hidden = .{ .ctx = null };
 
         self.mtp_accepted_tokens += accepted;
         self.next_token_id = next_pending;
@@ -8436,7 +8514,14 @@ pub const Generator = struct {
             const lazy_token = self.sampleLazy(step_logits);
             _ = mlx.mlx_array_free(step_logits);
 
+            var adopted = false;
+            defer if (!adopted) {
+                _ = mlx.mlx_array_free(lazy_token);
+            };
             if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
+                defer if (!adopted) {
+                    _ = mlx.mlx_array_free(next_logits);
+                };
                 const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
                 _ = mlx.mlx_async_eval(vec);
@@ -8458,6 +8543,7 @@ pub const Generator = struct {
                 self.has_pending_token = true;
                 self.pending_logits = next_logits;
                 self.has_pending_logits = true;
+                adopted = true;
 
                 return token;
             } else |_| {
@@ -8466,6 +8552,7 @@ pub const Generator = struct {
                 var val: i32 = 0;
                 try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
                 _ = mlx.mlx_array_free(lazy_token);
+                adopted = true;
                 self.next_token_id = @intCast(val);
                 self.has_pending_token = false;
             }
@@ -8597,10 +8684,10 @@ pub const Generator = struct {
 
         // Synchronous sample: we need the realized token id to advance the grammar.
         const lazy = self.sampleLazy(masked_logits);
+        defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
         const token: u32 = @intCast(val);
         self.next_token_id = token;
 
@@ -8752,12 +8839,14 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
 /// All filter helpers operate on the last axis, so leading dims pass through.
 fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     var current = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(current);
     try mlx.check(mlx.mlx_array_set(&current, logits_3d));
 
     // Reserved-token suppression (batched MTP stochastic verify) — same
     // rationale as `probsAtLastPos`.
     if (sampling.suppress_mask) |m| {
         var masked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(masked);
         try applySuppressMask(&masked, current, m, s);
         _ = mlx.mlx_array_free(current);
         current = masked;
@@ -8767,6 +8856,7 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
         const t = mlx.mlx_array_new_float(sampling.temperature);
         defer _ = mlx.mlx_array_free(t);
         var scaled = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_divide(&scaled, current, t, s));
         _ = mlx.mlx_array_free(current);
         current = scaled;
@@ -8785,8 +8875,10 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
     }
 
     var probs = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(probs);
     try mlx.check(mlx.mlx_softmax_axis(&probs, current, -1, true, s));
     _ = mlx.mlx_array_free(current);
+    current = .{ .ctx = null };
     return probs;
 }
 
@@ -8846,6 +8938,7 @@ fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx
     const shape = mlx.getShape(logits_3d);
     const seq_len = shape[1];
     var current = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(current);
     if (seq_len == 1) {
         const sq_shape = [_]c_int{ shape[0], shape[2] };
         try mlx.check(mlx.mlx_reshape(&current, logits_3d, &sq_shape, 2, s));
@@ -8865,12 +8958,15 @@ fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx
     // acceptance probability is exactly 0 and the residual can't re-draw it.
     if (sampling.suppress_mask) |m| {
         var masked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(masked);
         try applySuppressMask(&masked, current, m, s);
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
 
-    return filteredProbsRows(current, sampling, s);
+    const owned = current;
+    current = .{ .ctx = null };
+    return filteredProbsRows(owned, sampling, s);
 }
 
 /// Temperature → top-k → top-p → softmax over the LAST axis of an owned
@@ -8881,11 +8977,13 @@ fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx
 /// a whole `[m, V]` block identically.
 fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     var current = owned_rows;
+    errdefer _ = mlx.mlx_array_free(current);
     // Apply temperature → top-k → top-p (same order as `sampleTokenLazy`).
     if (sampling.temperature != 1.0) {
         const t = mlx.mlx_array_new_float(sampling.temperature);
         defer _ = mlx.mlx_array_free(t);
         var scaled = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_divide(&scaled, current, t, s));
         _ = mlx.mlx_array_free(current);
         current = scaled;
@@ -8905,8 +9003,10 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
 
     // Softmax: tokens at -inf become 0, kept tokens renormalize to sum=1.
     var probs = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(probs);
     try mlx.check(mlx.mlx_softmax_axis(&probs, current, -1, true, s));
     _ = mlx.mlx_array_free(current);
+    current = .{ .ctx = null };
     return probs;
 }
 
@@ -8917,15 +9017,19 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
 fn filteredProbsBlock(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = mlx.getShape(logits_3d);
     var rows = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(rows);
     const rows_shape = [_]c_int{ shape[0] * shape[1], shape[2] };
     try mlx.check(mlx.mlx_reshape(&rows, logits_3d, &rows_shape, 2, s));
     if (sampling.suppress_mask) |m| {
         var masked = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(masked);
         try applySuppressMask(&masked, rows, m, s);
         _ = mlx.mlx_array_free(rows);
         rows = masked;
     }
-    return filteredProbsRows(rows, sampling, s);
+    const owned = rows;
+    rows = .{ .ctx = null };
+    return filteredProbsRows(owned, sampling, s);
 }
 
 /// Read `probs[0, token_id]` as f32. Forces realization with a single eval.
@@ -10301,6 +10405,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
 
     // Sample from categorical distribution
     var sampled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sampled);
 
     const key = seedKey(sampling);
     defer _ = mlx.mlx_array_free(key);
@@ -10319,7 +10424,6 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         logprob_result = try computeLogprobs(allocator, logprobs_logits, token_id, logprobs_n, s);
     }
 
-    _ = mlx.mlx_array_free(sampled);
     return .{ .token_id = token_id, .logprob_result = logprob_result };
 }
 

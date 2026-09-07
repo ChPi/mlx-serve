@@ -744,6 +744,7 @@ pub const Slot = struct {
             self.allocator.destroy(runner);
             self.diffusion = null;
         }
+        if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -4199,6 +4200,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+            if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
             s.deinit();
         }
         if (vision_n > 0 or embed_n > 0) {
