@@ -428,11 +428,8 @@ pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usi
 }
 
 /// Wrapper reading the live server config + scheduler default scheme.
-fn resolveKvAttnFused(explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
-    const scheme: kv_quant_mod.Scheme = if (kv_override) |o|
-        o.scheme
-    else
-        configuredKvQuant().scheme;
+fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
+    const scheme: kv_quant_mod.Scheme = (kv_override orelse configuredKvQuantFor(config)).scheme;
     return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
 }
 
@@ -522,6 +519,11 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// checkpoint AND has been measured no-worse-than-serial across the context
 /// ladder (`Transformer.nativeMoeMtpHeadMeasured`, which carries the bar). It
 /// still needs a head LOADED — the claim is about the head, not the arch.
+/// `--mtp` process-wide, or the model's own `"mtp": true` in `model-settings.json`.
+fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
+    return config.mtp_override == true or server_config.default_force_mtp;
+}
+
 pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool) bool {
     if (dsv4_stages) return true;
     if (!mtp_loaded) return false;
@@ -613,6 +615,17 @@ var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
 fn configuredKvQuant() transformer_mod.KVQuantConfig {
     if (global_scheduler) |sch| return sch.kv_quant_config;
     return configured_kv_quant orelse transformer_mod.KVQuantConfig.dense;
+}
+
+/// The width THIS model stores at: its `model-settings.json` override, else the process default.
+pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
+    return config.kv_quant_override orelse configuredKvQuant();
+}
+
+/// The explicit context for THIS model: its `model-settings.json` `ctx_size`, else `--ctx-size`.
+/// 0 = auto. Every reader of the manual context goes through here, never `server_config.max_context_size`.
+pub fn manualContext(config: *const model_mod.ModelConfig) u32 {
+    return if (config.ctx_override > 0) config.ctx_override else server_config.max_context_size;
 }
 
 /// Plan 05 — model registry. Always non-null in serve mode (set by
@@ -1503,8 +1516,8 @@ pub fn serve(
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
-    if (server_config.max_context_size > 0) {
-        log.info("Context size: {d} tokens (manual)\n", .{server_config.max_context_size});
+    if (manualContext(config) > 0) {
+        log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = safeAutoContext(memory_ctx);
@@ -2721,7 +2734,7 @@ fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
     // resolved before any context is computed from it. Pinned even under an
     // explicit `--ctx-size`, because the guard reads it on every request.
     _ = pinPrefillChunk(config);
-    if (server_config.max_context_size > 0) return server_config.max_context_size;
+    if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context == 0) {
         config.pinned_context = autoContextFor(config);
     }
@@ -2729,7 +2742,7 @@ fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
-    if (server_config.max_context_size > 0) return server_config.max_context_size;
+    if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
     // current GPU memory rather than a fixed 16K cap.
@@ -2833,9 +2846,14 @@ var wired_floor_logged = std.atomic.Value(bool).init(false);
 /// The floor for THIS model, gated on `ModelConfig.longCtxGated()`. `null` config (no model
 /// resolved yet) takes no floor.
 fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
+    return wiredCeilingFloorForRam(config, metrics.getTotalMemBytes());
+}
+
+/// PURE: the floor for a machine with `total_ram` bytes; the wrapper above reads the machine.
+fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
     const c = config orelse return 0;
     if (!c.longCtxGated()) return 0;
-    const floor = wiredLimitFloor(wiredLimitBytes(), metrics.getTotalMemBytes());
+    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
         log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
             floor >> 20,
@@ -2914,8 +2932,11 @@ pub fn applyMlxCacheLimit() void {
 /// working set (or the wired limit). The load-time hot-cache clamp bills against this and
 /// nothing else: two boots 11 minutes apart resolved the same ask to 1076 and 9757 MB off the
 /// live term. Request-time admission still reads live memory.
+/// Tests only: stand in for the machine's working-set limit (CI runners have 7 GB).
+pub var static_ceiling_override: ?u64 = null;
+
 pub fn staticGpuMemoryCeiling() u64 {
-    return getGpuWorkingSetLimit();
+    return static_ceiling_override orelse getGpuWorkingSetLimit();
 }
 
 /// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
@@ -3001,8 +3022,8 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 /// admission guard read one answer.
 ///
 /// Through `configuredKvQuant`, so a load-time bill gets the boot's `--kv-quant`, not the dense fallback.
-fn defaultKvBits() u64 {
-    const cfg: transformer_mod.KVQuantConfig = configuredKvQuant();
+fn defaultKvBits(config: *const model_mod.ModelConfig) u64 {
+    const cfg: transformer_mod.KVQuantConfig = configuredKvQuantFor(config);
     return if (cfg.scheme == .off) 16 else cfg.bits;
 }
 
@@ -3087,7 +3108,7 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
 ///
 /// The KV term is a RESERVE, not a prediction: see `ane.MIN_CONTEXT_TOKENS`.
 pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
-    const kv_bits: u64 = defaultKvBits();
+    const kv_bits: u64 = defaultKvBits(config);
     const ctx: u64 = if (config.max_position_embeddings > 0)
         @min(ane_mod.MIN_CONTEXT_TOKENS, config.max_position_embeddings)
     else
@@ -3218,9 +3239,9 @@ pub fn billedPrefillChunk(
 /// The context KV the chunk sizer must leave standing: the pinned context's bill under an
 /// explicit `--ctx-size`, 0 while the context is auto (the auto sizer adapts to the rung).
 pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
-    if (server_config.max_context_size == 0) return 0;
+    if (manualContext(config) == 0) return 0;
     return (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
-        statePerTokenBilled(config)) *| server_config.max_context_size;
+        statePerTokenBilled(config)) *| manualContext(config);
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -3232,7 +3253,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
-        const kv_bits: u64 = defaultKvBits();
+        const kv_bits: u64 = defaultKvBits(config);
         // Which ask: the gated arch reads the resolved budget; every other arch reads the raw
         // ask as before (the accessor would pin a second model against the first's budget).
         const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk();
@@ -3385,7 +3406,7 @@ pub fn resolvedContextForLoad(
 /// configured KV width (billing at bf16 on a `--kv-quant 8` boot was the 22,464-vs-13,824 MB defect).
 fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
     return resolvedContextForLoad(
-        server_config.max_context_size,
+        manualContext(config),
         config.pinned_context,
         ceiling,
         active_mem,
@@ -3458,7 +3479,7 @@ fn legacyPrefixCacheAsk() u64 {
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
 fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
     return resolvedContextForLoad(
-        server_config.max_context_size,
+        manualContext(config),
         config.pinned_context,
         currentGpuMemoryCeiling(config, active_mem),
         active_mem,
@@ -3474,7 +3495,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
     idle_out.* = 0;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
-    const kv_bits: u64 = defaultKvBits();
+    const kv_bits: u64 = defaultKvBits(config);
     // Arch gate: the budget resolver changed three inputs at once (static ceiling, the
     // load-time context resolver, the floor-width reserve), all measured on qwen4_exp alone.
     // Ungated is the previous `prefixCacheMemForLoad`.
@@ -3898,6 +3919,10 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     const orig_over = prefix_cache_mod.ssd_first_override;
     defer prefix_cache_mod.ssd_first_override = orig_over;
     prefix_cache_mod.ssd_first_override = true; // the env switch is not what is on trial
+    // The budget is a property of the machine; the test's machine is a 128 GB one, not the runner.
+    const orig_ceiling = static_ceiling_override;
+    defer static_ceiling_override = orig_ceiling;
+    static_ceiling_override = 109_395 * (1 << 20);
 
     try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
     try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
@@ -4005,20 +4030,20 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
 
     // `--kv-quant 8`, no scheduler yet: the state the load runs in.
     configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
-    try t.expectEqual(@as(u64, 8), defaultKvBits());
+    try t.expectEqual(@as(u64, 8), defaultKvBits(&cfg));
     try t.expectEqual(
         @as(u64, 13_824 * MiB),
-        ssdFirstSessionKvBytes(&cfg, defaultKvBits(), ceiling, active, chunk),
+        ssdFirstSessionKvBytes(&cfg, defaultKvBits(&cfg), ceiling, active, chunk),
     );
 
     configured_kv_quant = transformer_mod.KVQuantConfig.dense;
-    try t.expectEqual(@as(u64, 16), defaultKvBits());
+    try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
     try t.expectEqual(
         @as(u64, 22_464 * MiB),
-        ssdFirstSessionKvBytes(&cfg, defaultKvBits(), ceiling, active, chunk),
+        ssdFirstSessionKvBytes(&cfg, defaultKvBits(&cfg), ceiling, active, chunk),
     );
     configured_kv_quant = null;
-    try t.expectEqual(@as(u64, 16), defaultKvBits());
+    try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
 
     const idle: u64 = 10 * 1024 * MiB;
     const transient: u64 = prefillTransientReserve(&cfg, 8, chunk);
@@ -4347,7 +4372,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     if (heads == 0) return 16384;
 
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
-    const kv_bits: u64 = defaultKvBits();
+    const kv_bits: u64 = defaultKvBits(config);
     const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + statePerTokenBilled(config);
 
     // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
@@ -5223,7 +5248,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
 
-    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse configuredKvQuant();
+    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse configuredKvQuantFor(config);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     // Available = the lesser of Metal's static working-set max and what is physically reachable
     // now (#64). Read before the width is chosen: on a per-request arch the width is a function of it.
@@ -5745,7 +5770,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -5772,6 +5797,7 @@ fn renderModelEntry(
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
+            configuredKvQuantFor(config).wireName(),
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
@@ -6300,7 +6326,9 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
     if (std.mem.startsWith(u8, requested_id, "/")) {
         var trimmed = requested_id;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-        requested_id = std.fs.path.basename(trimmed);
+        // A discovered entry is keyed `org/name`, so the path is the only exact handle.
+        const by_path = if (global_registry) |r| r.peekByPath(trimmed) else null;
+        requested_id = if (by_path) |e| e.id else std.fs.path.basename(trimmed);
     }
 
     // Remote ids hold no residency on THIS host — idempotent 200, matching
@@ -7672,7 +7700,7 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
@@ -8029,7 +8057,7 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
@@ -8261,7 +8289,7 @@ fn handleStreamingCompletion(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(null, prompt_ids.len, null),
+        .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -8479,7 +8507,7 @@ fn nonStreamingViaScheduler(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .vision_key = vision_key,
         .mrope_pos = mrope.pos,
@@ -9305,7 +9333,7 @@ fn handleStreamingGeneration(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
         .vision_key = vision_key,
@@ -11872,23 +11900,7 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
 /// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
 fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
     const v = root.get("kv_quant") orelse return null;
-    switch (v) {
-        .string => |s| {
-            if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return transformer_mod.KVQuantConfig.dense;
-            if (std.mem.eql(u8, s, "4")) return transformer_mod.KVQuantConfig.affine(4);
-            if (std.mem.eql(u8, s, "8")) return transformer_mod.KVQuantConfig.affine(8);
-            if (std.mem.eql(u8, s, "turbo2")) return transformer_mod.KVQuantConfig.turboquant(2);
-            if (std.mem.eql(u8, s, "turbo4")) return transformer_mod.KVQuantConfig.turboquant(4);
-            return null;
-        },
-        .integer => |i| {
-            if (i == 0) return transformer_mod.KVQuantConfig.dense;
-            if (i == 4) return transformer_mod.KVQuantConfig.affine(4);
-            if (i == 8) return transformer_mod.KVQuantConfig.affine(8);
-            return null;
-        },
-        else => return null,
-    }
+    return transformer_mod.KVQuantConfig.fromJsonValue(v);
 }
 
 // ── Vision Processing ──
@@ -14162,7 +14174,7 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
@@ -14665,7 +14677,7 @@ fn handleAnthropicStreaming(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .vision_key = vision_key,
@@ -16063,7 +16075,7 @@ fn handleResponsesInner(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
@@ -16125,7 +16137,7 @@ fn handleResponsesInner(
             .vision_key = vis_key,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
-            .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+            .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         });
@@ -18045,13 +18057,13 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
 
     // Gated: every other arch takes floor 0, which is `physicalMemoryCeiling` exactly.
     var cfg = qwen4ExpLive364kConfig();
-    try t.expect(wiredCeilingFloorFor(&cfg) > 0);
-    try t.expectEqual(@as(u64, 0), wiredCeilingFloorFor(null));
+    try t.expect(wiredCeilingFloorForRam(&cfg, total_ram) > 0);
+    try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(null, total_ram));
     for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "deepseek_v4", "bailing_hybrid" }) |mt| {
         var other = cfg;
         other.model_type = mt;
         try t.expect(!other.longCtxGated());
-        try t.expectEqual(@as(u64, 0), wiredCeilingFloorFor(&other));
+        try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(&other, total_ram));
     }
     const footprint: u64 = 87_722 * mb;
     for ([_]u64{ 0, 12_934 * mb, 400 * (1 << 30) }) |free| {
@@ -18069,7 +18081,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
     try t.expectEqual(@as(u64, 13_450), needed / mb);
     try t.expect(needed > gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, 0) -| footprint);
-    const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorFor(&cfg));
+    const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
     try t.expectEqual(@as(u64, 24_086), (lifted -| footprint) / mb);
     try t.expect(needed <= lifted -| footprint);
 }
@@ -18273,9 +18285,9 @@ test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
     // The KV reserve is exactly MIN_CONTEXT_TOKENS worth — the guarantee that
     // an admitted offload leaves a usable context behind.
     try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
-        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits()) * ane_mod.MIN_CONTEXT_TOKENS +
+        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits(&cfg)) * ane_mod.MIN_CONTEXT_TOKENS +
         resolvedPrefixCacheMem() +
-        prefillTransientReserve(&cfg, defaultKvBits(), 1024));
+        prefillTransientReserve(&cfg, defaultKvBits(&cfg), 1024));
 
     // A model that cannot reach the reserve context only reserves its own max.
     cfg.max_position_embeddings = 8192;
@@ -20694,7 +20706,7 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     const body = server_src[pin..@min(server_src.len, pin + 800)];
     const chunk_at = std.mem.indexOf(u8, body, "pinPrefillChunk(config)") orelse return error.PinMissing;
     const ctx_at = std.mem.indexOf(u8, body, "autoContextFor(config)") orelse return error.CallSiteMoved;
-    const ctxsize_at = std.mem.indexOf(u8, body, "server_config.max_context_size > 0") orelse return error.CallSiteMoved;
+    const ctxsize_at = std.mem.indexOf(u8, body, "manualContext(config) > 0") orelse return error.CallSiteMoved;
     try t.expect(chunk_at < ctx_at);
     try t.expect(chunk_at < ctxsize_at);
 }

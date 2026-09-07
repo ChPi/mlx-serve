@@ -972,14 +972,7 @@ pub const DiskTier = struct {
             for (layers) |*l| l.qsa_rows = rows;
         } else {
             for (layers) |*l| {
-                const probe: transformer_mod.SSMCacheEntry = .{
-                    .conv_state = l.conv_state,
-                    .ssm_state = l.ssm_state,
-                    .aux_state = l.aux_state,
-                    .qsa_pooled = l.qsa_pooled,
-                    .initialized = l.initialized,
-                };
-                if (!transformer_mod.ssmAuxIsQsaHistory(&probe)) continue;
+                if (!transformer_mod.snapshotHasQsaHistory(l)) continue;
                 if (l.aux_state.ctx != null) {
                     const sh = mlx.getShape(l.aux_state);
                     if (sh.len >= 2) l.qsa_rows = sh[1];
@@ -2109,14 +2102,7 @@ pub const DiskTier = struct {
         var ratio_written = false;
         var rows_written = false;
         for (cp.layers, 0..) |l, li| {
-            const probe: transformer_mod.SSMCacheEntry = .{
-                .conv_state = l.conv_state,
-                .ssm_state = l.ssm_state,
-                .aux_state = l.aux_state,
-                .qsa_pooled = l.qsa_pooled,
-                .initialized = l.initialized,
-            };
-            const qsa_hist = transformer_mod.ssmAuxIsQsaHistory(&probe);
+            const qsa_hist = transformer_mod.snapshotHasQsaHistory(&l);
             const names = .{ "conv", "ssm", "aux", "pooled" };
             const arrs = .{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled };
             inline for (names, arrs) |name, arr| {
@@ -2189,16 +2175,9 @@ pub const DiskTier = struct {
 
     fn qsaHistoryRowsOf(cp: *const transformer_mod.SSMCheckpoint) c_int {
         var r: c_int = 0;
-        for (cp.layers) |l| {
+        for (cp.layers) |*l| {
             if (l.qsa_rows > r) r = l.qsa_rows;
-            const probe: transformer_mod.SSMCacheEntry = .{
-                .conv_state = l.conv_state,
-                .ssm_state = l.ssm_state,
-                .aux_state = l.aux_state,
-                .qsa_pooled = l.qsa_pooled,
-                .initialized = l.initialized,
-            };
-            if (!transformer_mod.ssmAuxIsQsaHistory(&probe)) continue;
+            if (!transformer_mod.snapshotHasQsaHistory(l)) continue;
             if (l.aux_state.ctx != null) {
                 const sh = mlx.getShape(l.aux_state);
                 if (sh.len >= 2 and sh[1] > r) r = sh[1];

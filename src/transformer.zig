@@ -7442,11 +7442,15 @@ fn qsaHistoryRows(e: *const SSMCacheEntry) c_int {
     return if (sh.len >= 2) sh[1] else 0;
 }
 
-fn snapshotHasQsaHistory(l: *const SSMCacheEntrySnapshot) bool {
-    if (l.aux_state.ctx == null) return false;
-    if (l.qsa_pooled.ctx != null) return true;
-    if (l.conv_state.ctx == null) return true;
-    return mlx.mlx_array_size(l.conv_state) == 0;
+/// `ssmAuxIsQsaHistory` over a snapshot layer.
+pub fn snapshotHasQsaHistory(l: *const SSMCacheEntrySnapshot) bool {
+    return ssmAuxIsQsaHistory(&.{
+        .conv_state = l.conv_state,
+        .ssm_state = l.ssm_state,
+        .aux_state = l.aux_state,
+        .qsa_pooled = l.qsa_pooled,
+        .initialized = l.initialized,
+    });
 }
 
 pub fn checkpointHasQsaHistory(cp: *const SSMCheckpoint) bool {

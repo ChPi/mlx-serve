@@ -1337,11 +1337,7 @@ private struct ContextSizeRow: View {
     // Powers of two plus 1.5× midpoints (issue #188: 32K→64K→128K jumps are
     // too coarse on a memory-limited Mac). Every value is a multiple of 1024
     // so formatTokens renders it exactly.
-    private static let allPresets: [Int] = [
-        0, 4_096, 6_144, 8_192, 12_288, 16_384, 24_576, 32_768,
-        49_152, 65_536, 98_304, 131_072, 196_608, 262_144,
-        393_216, 524_288, 786_432, 1_048_576,
-    ]
+    private static let allPresets = ContextSizeDisplay.presets
 
     /// Drop any preset larger than the model's `max_position_embeddings` so
     /// the slider can't pick a value the model would refuse. Auto (0) always

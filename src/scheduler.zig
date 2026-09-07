@@ -49,6 +49,7 @@ const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
+const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
@@ -1634,7 +1635,6 @@ pub const Scheduler = struct {
         // Construct the slot up front so we don't hold the queue mutex
         // through any allocation. Per-request `kv_quant_config` override (Wave
         // 1.A) wins over the process-level default carried on the scheduler.
-        const eff_kv_quant = params.kv_quant_config orelse self.kv_quant_config;
         // Phase D fix: use the slot's target-model config (not the
         // scheduler's startup-model config) so per-slot state allocation
         // (KVCache shape, SSM entries) matches the model that will
@@ -1642,6 +1642,7 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
         errdefer slot.deinit();
 
@@ -1813,7 +1814,8 @@ pub const Scheduler = struct {
         // entry `.error_state` so /v1/models surfaces the failure (and
         // future ensureLoaded calls fail fast instead of re-tripping the
         // same parse error). FileNotFound / parse errors land here.
-        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, self.gguf_ctx_size) catch |err| {
+        const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
+        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse self.gguf_ctx_size) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
             self.registry.markErrorLocked(entry, @errorName(err));
             self.registry.mutex.unlock(self.io);
@@ -1825,6 +1827,7 @@ pub const Scheduler = struct {
         var owned = cpu_state;
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
+        applyModelSettings(owned.config, settings);
         // The resolved .gguf path (when this is a GGUF entry) is borrowed by
         // the LoadRequest until `done`; the engines dupe what they keep, so
         // it's released here on success AND failure.
@@ -2382,6 +2385,14 @@ const GgufRoute = struct {
     path: []u8,
     engine: gguf_meta.Engine,
 };
+
+/// Both load construction sites (here and main.zig's startup load) stamp the
+/// per-model settings onto the config the bills and defaults read.
+pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
+    config.ctx_override = o.ctx_size orelse 0;
+    config.kv_quant_override = o.kv_quant;
+    config.mtp_override = o.mtp;
+}
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
 /// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.
@@ -3401,8 +3412,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // caches in serve mode honor this independently in `Slot.init`; this
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
-    if (params.kv_quant_config.scheme != .off) {
-        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, params.kv_quant_config, params.config.kvCacheKeyHeadDim());
+    // Per-model settings (stamped on the config at BOTH construction sites) outrank the flags.
+    const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
+    const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
+    if (kv_quant_config.scheme != .off) {
+        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config, params.config.kvCacheKeyHeadDim());
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
@@ -3757,7 +3771,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // bind only disables the head — the model still serves.
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
-    if (params.mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
+    if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
@@ -3787,7 +3801,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 sch.allocator.destroy(h);
             }
         } else |_| {}
-    } else if (params.mtp_enabled) {
+    } else if (mtp_enabled) {
         // A quiet fallback to mode=pld cost a tester a day: nothing logged
         // when the probe finds no head. Debug-level — most checkpoints have
         // no MTP head and an info line per load would be noise.
@@ -3810,7 +3824,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
-    if (mtp_ptr == null and params.mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
+    if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
 
     // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
     // HERE because the mlx dequant must run on the inference thread (sole
@@ -3886,7 +3900,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter_block_size = sch.drafter_block_size;
     entry.mtp = if (mtp_ptr) |h|
         generate_mod.MtpHeadRef{ .qwen = h }
-    else if (params.mtp_enabled and xfm_ptr.qwen4_mtp != null)
+    else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
     else
         null;
@@ -7758,7 +7772,7 @@ test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
     const build = std.mem.indexOf(u8, body, "qwen4BuildDraftRerank()") orelse return error.MissingEagerRerankBuild;
     // Gated exactly like the head it drafts for: `--no-mtp` never drafts, so
     // it must never pay for the coarse head.
-    const gate = std.mem.lastIndexOf(u8, body[0..build], "params.mtp_enabled") orelse return error.EagerRerankBuildUngated;
+    const gate = std.mem.lastIndexOf(u8, body[0..build], "mtp_enabled") orelse return error.EagerRerankBuildUngated;
     try testing.expect(build - gate < 200);
 
     // Boot load (inferenceLoop) and cold load (runLoadRequest) both land there.
