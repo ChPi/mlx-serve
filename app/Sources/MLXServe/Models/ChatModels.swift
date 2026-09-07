@@ -213,6 +213,25 @@ struct ChatImage: Identifiable, Codable, Equatable {
     }
 }
 
+enum ThinkingDuration {
+
+    /// "Thinking" until measured, then "Thinking took 2 minutes 7 seconds".
+    static func label(seconds: Double?) -> String {
+        guard let seconds, seconds >= 1 else { return "Thinking" }
+        let total = Int(seconds.rounded())
+        let minutes = total / 60
+        let remainder = total % 60
+
+        if minutes == 0 { return "Thinking took \(plural(remainder, "second"))" }
+        if remainder == 0 { return "Thinking took \(plural(minutes, "minute"))" }
+        return "Thinking took \(plural(minutes, "minute")) \(plural(remainder, "second"))"
+    }
+
+    private static func plural(_ n: Int, _ unit: String) -> String {
+        "\(n) \(unit)\(n == 1 ? "" : "s")"
+    }
+}
+
 /// A generated media file attached to a message BY REFERENCE.
 struct ChatMediaRef: Codable, Equatable, Identifiable {
     enum Kind: String, Codable { case image, audio, video }
@@ -279,6 +298,9 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var promptTokens: Int?
     var completionTokens: Int?
     var tokensPerSecond: Double?
+    /// Seconds from the message's timestamp to the first content delta
+    /// (includes prefill). Absent in older histories.
+    var thinkingSeconds: Double?
     var toolCallId: String?   // For tool response messages
     var toolName: String?     // For tool response messages
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
@@ -333,7 +355,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
-        case promptTokens, completionTokens, tokensPerSecond
+        case promptTokens, completionTokens, tokensPerSecond, thinkingSeconds
         case toolCallId, toolName, toolCalls, images, videos, audio, failedRetry, processHandles
         case errorNotice, media, truncationNotice, revisions, activeRevision
     }
@@ -352,6 +374,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens)
         completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens)
         tokensPerSecond = try c.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        thinkingSeconds = try c.decodeIfPresent(Double.self, forKey: .thinkingSeconds)
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
