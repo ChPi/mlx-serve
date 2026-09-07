@@ -4857,13 +4857,17 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
         };
     };
-    hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
+        return;
     };
     publishHotCacheResidency(sch);
+    // The decline paths already log their reason inside the cache; a silent
+    // `_ =` here is fine — this caller has no commit-shaped log to lie about.
+    _ = finish_st;
 }
 
 /// Logical committed length for a cancelled-prefill commit: the tokens
@@ -4897,22 +4901,40 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // Hybrid restore requires SSM checkpoints; a checkpoint-less hybrid
     // entry restores as a cold miss ("hybrid miss") while occupying an LRU
     // slot. Non-hybrids commit KV-only.
-    if (slot.ssm_entries != null and salvage.checkpoints.len == 0) return;
+    if (slot.ssm_entries != null and salvage.checkpoints.len == 0) {
+        log.debug("[hot-cache] cancelled prefill carried no stride checkpoints — a hybrid entry would restore as a miss; not committed\n", .{});
+        return;
+    }
     // The sink's `forwarded` is the authoritative length — `cache.step`
     // only advances when Generator init completes, so it reads 0 on every
     // aborted prefill.
-    const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse return;
+    const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse {
+        log.debug("[hot-cache] cancelled prefill forwarded < {d} tokens — below the commit floor; not committed\n", .{prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS});
+        return;
+    };
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
-    const media_start = if (slot.media_start) |start| if (start < len) start else null else null;
+    // Pass the media boundary RAW: when the cancelled prefill forwarded less
+    // than the media position, the cache re-keys the pure-text entry to the
+    // null vision key (a kept pixel key with no boundary is the
+    // conservative-rejection poison shape; live 2026-09-07).
+    const media_start = slot.media_start;
     // Ownership of the checkpoints transfers to the cache unconditionally —
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null) catch |err| {
+    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
-    log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ len, slot.full_prompt.len });
+    // Truthful outcome only: a budget decline must never print as a commit
+    // (live 2026-09-07: "skipped oversized" + "committed N/M" were the SAME
+    // event and the cache looked healthy while a 122k session re-prefilled
+    // ~95k tokens per retry).
+    switch (st) {
+        .ok => |n| log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ n, slot.full_prompt.len }),
+        .kept_resident => |n| log.info("[hot-cache] kept resident {d}-token entry; oversized candidate declined\n", .{n}),
+        .declined => {},
+    }
 }
 
 /// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
