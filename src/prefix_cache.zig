@@ -1849,6 +1849,12 @@ pub const HotPrefixCache = struct {
         cps: ?[]SSMCheckpoint,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
+        // SSD-first captured the live state as `pending_disk` before the trim; the
+        // normal flush lands it under the writer's own readback bound.
+        if (self.ssd_first) {
+            if (self.pending_disk != null) self.disk_dirty = true;
+            return;
+        }
         if (tokens.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
         // A decline-spill runs after the client is gone: the per-flush cap
         // exists to bound the stall a LIVE next request pays, and capping
@@ -3707,6 +3713,35 @@ test "HotPrefixCache: chunk-heavy hybrid flush still lands its SSM checkpoints" 
         try testing.expectEqual(@as(usize, 256), cache2.step);
         try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm2[0].conv_state, 0, s));
     }
+}
+
+test "HotPrefixCache: under SSD-first a decline rides pending_disk, never a second synchronous spill" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 16 * 1024);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-spill-ssdfirst", 0, 128);
+    defer hc.deinit();
+    const cap_before = hc.disk.?.max_flush_bytes;
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const st = try hc.commit(&cache, &tokens, false);
+    try testing.expect(st == .declined);
+    // The capture at commit time is the one record; nothing lands until the flush.
+    try testing.expect(hc.pending_disk != null);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+    try testing.expectEqual(cap_before, hc.disk.?.max_flush_bytes);
+    hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
 }
 
 test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
