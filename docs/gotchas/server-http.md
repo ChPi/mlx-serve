@@ -1982,3 +1982,7 @@ the same 51200 tokens every time. Two causes:
 Guards: `a decline-spill is not bounded by the per-flush byte cap` and
 `hybrid disk restore ranks entries by restorable checkpoint, not raw
 length` (prefix_cache.zig).
+
+### The hot-cache budget was clamped once and never revisited (#364, 2026-09-07)
+
+`max_kv_bytes` had one write site, `initWithMem`, fed by a clamp that read `mlx_get_active_memory`, which counts every resident model. Load a second model beside a 70 GB one and its budget landed at ~0 for the life of the process (197 straight declines on the reporter's box); unloading the neighbour did not give it back. Fix: `reviseHotCacheBudgets` runs after every load/unload on the inference thread and re-resolves each resident model's budget with its own resident cache bytes excluded (a full cache must not ratchet itself down); `setBudget` evicts LRU down to a smaller cap and is silent when the megabyte value is unchanged. Trap found on the way: MLX frees the weights at once but the system-free number the ceiling reads recovers over seconds, so the unload-time revise saw almost none of it; the revise repeats before each prefill batch for 10 s after an unload. The resolver publishes a process-global the admission guard reads, so the current model is resolved last. Guard: `tests/test_prefix_cache_budget_revisit.sh` (A loses B's weights when B loads and gets them back after the unload, warm turn intact).

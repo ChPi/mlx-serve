@@ -156,7 +156,7 @@ pub const LoadParams = struct {
     /// Clamp the hot-cache byte budget against live post-load headroom
     /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
     /// deliberately has no server.zig import. Null = no clamp (tests).
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -1119,7 +1119,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1243,7 +1243,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -1301,6 +1301,9 @@ pub const Scheduler = struct {
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
+    /// before each prefill batch while this is armed and settles as the ceiling recovers.
+    budget_revise_sw: ?io_util.Stopwatch = null,
 
     /// Per-entry digest snapshot the connection-thread guard reads instead of the cache.
     /// Replaced under `digest_mu` by the inference thread; readers copy under the lock.
@@ -3943,7 +3946,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // RAM allowance for idle entries on the SSD-first arm; 0 elsewhere.
         var ssd_idle_mem: u64 = 0;
         const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
-            resolve(params.config, params.prefix_cache_mem_bytes, &ssd_idle_mem)
+            resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
@@ -4063,6 +4066,38 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
 /// Republish the hot cache's residency for the connection thread's admission guard.
 /// Called from the inference thread after a commit, eviction, invalidation or model switch.
+const BUDGET_REVISE_WINDOW_NS: u64 = 10 * std.time.ns_per_s;
+
+/// How a budget resolve differs from the load-time one: the cache's own resident bytes
+/// are excluded from the machine read, and the resolver keeps quiet (`setBudget` logs).
+pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
+
+/// Re-clamp every resident model's hot-cache budget after residency changed (#364): the
+/// load-time clamp read the machine with the other models on it and was never revisited, so
+/// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
+/// entries are excluded from the read so a full cache cannot ratchet itself down.
+fn reviseHotCacheBudgets(sch: *Scheduler) void {
+    const resolve = sch.prefix_cache_mem_resolver orelse return;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    // The resolver publishes the process-global budget the admission guard reads, so the
+    // current model goes last.
+    for ([_]bool{ false, true }) |current_pass| {
+        var it = sch.registry.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if ((entry == sch.current_model) != current_pass) continue;
+            if (entry.state != .ready) continue;
+            const hc = if (entry.prefix_cache) |*h| h else continue;
+            const config = entry.config orelse continue;
+            var idle: u64 = 0;
+            hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
+            hc.ssd_idle_mem = idle;
+            if (current_pass) publishHotCacheResidency(sch);
+        }
+    }
+}
+
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
@@ -4228,6 +4263,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
+        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_req) |req| runGenRequest(sch, req);
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
@@ -4285,6 +4322,11 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 r -= 1;
                 _ = sch.pending.orderedRemove(admit_idx[r]);
             }
+        }
+
+        if (sch.budget_revise_sw) |sw| {
+            if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
+            if (n_prefill > 0) reviseHotCacheBudgets(sch);
         }
 
         // 2. Prefill each pending slot (heavy; mlx ops on this thread).

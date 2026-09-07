@@ -3433,6 +3433,7 @@ fn ssdFirstBudgetForLoad(
     ctx_kv: u64,
     transient_reserve: u64,
     idle_out: *u64,
+    quiet: bool,
 ) ?u64 {
     // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
     if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
@@ -3450,6 +3451,7 @@ fn ssdFirstBudgetForLoad(
     // The idle allowance, handed to the cache for `spillIdleEntries` to enforce.
     idle_out.* = budget -| ctx_kv;
     // On this arch `--prefix-cache-mem` is the idle allowance, not the whole cache; say so once.
+    if (quiet) return budget;
     log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB idle (--prefix-cache-mem {d} MB = the IDLE allowance on this arch; 0 = no idle entries)\n", .{
         budget >> 20,
         ctx_kv >> 20,
@@ -3490,11 +3492,14 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
     );
 }
 
-pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idle_out: *u64) u64 {
+/// `revise` marks a post-load re-clamp (#364): the cache's own resident bytes come off the
+/// machine read so it never bills itself, and the budget lines stay quiet.
+pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle_out: *u64) u64 {
     // RAM-first default: no idle allowance. Written first so every early return carries it.
     idle_out.* = 0;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
+    active_mem -|= @as(usize, @intCast(@min(revise.exclude_bytes, std.math.maxInt(usize))));
     const kv_bits: u64 = defaultKvBits(config);
     // Arch gate: the budget resolver changed three inputs at once (static ceiling, the
     // load-time context resolver, the floor-width reserve), all measured on qwen4_exp alone.
@@ -3513,6 +3518,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
         );
         // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
         publishResolvedPrefixCacheMem(clamped);
+        if (revise.quiet) return clamped;
         if (requested > 0 and clamped < requested) {
             log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
         } else if (requested == 0) {
@@ -3528,7 +3534,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
     // reserve at the same width `planHotCache` reserves for: the ladder floor on an arch that
     // re-bills per request. The session is billed at the pinned width, the budget at the floor.
     const ssd_clamp_reserve: u64 = prefillTransientReserve(config, kv_bits, clampReserveWidth(config, @intCast(ssd_chunk)));
-    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out)) |b| return b;
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out, revise.quiet)) |b| return b;
     // Pin first, then hand the pinned width in as the override.
     const pinned: u32 = pinPrefillChunk(config);
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
@@ -3544,6 +3550,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
         pinned,
     );
     publishResolvedPrefixCacheMem(plan.budget);
+    if (revise.quiet) return plan.budget;
     // Say so when the box is under external pressure right now, but do not shrink the budget for it.
     const live_ceiling: u64 = currentGpuMemoryCeiling(config, active_mem);
     if (live_ceiling < staticGpuMemoryCeiling()) {
@@ -3942,13 +3949,13 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
 
     prefix_cache_disk_bytes = 0;
     var idle_off: u64 = 12345;
-    const ram_arm = prefixCacheMemForLoad(&cfg, ask, &idle_off);
+    const ram_arm = prefixCacheMemForLoad(&cfg, ask, .{}, &idle_off);
     try t.expectEqual(@as(u64, 0), idle_off);
     try t.expect(ram_arm <= ask);
 
     prefix_cache_disk_bytes = 64 * 1024 * 1024 * 1024;
     var idle_on: u64 = 0;
-    const ssd_arm = prefixCacheMemForLoad(&cfg, ask, &idle_on);
+    const ssd_arm = prefixCacheMemForLoad(&cfg, ask, .{}, &idle_on);
     try t.expect(ssd_arm > ask);
     try t.expect(ssd_arm > ram_arm);
     try t.expect(idle_on > 0 and idle_on <= ask);

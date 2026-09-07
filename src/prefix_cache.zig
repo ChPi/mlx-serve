@@ -2377,6 +2377,24 @@ pub const HotPrefixCache = struct {
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
     }
 
+    /// Re-clamp the byte budget after the machine's residency changed (a model loaded
+    /// or unloaded beside this one). Shrinking evicts LRU down to the new cap; 0 = uncapped.
+    pub fn setBudget(self: *HotPrefixCache, max_kv_bytes: u64) void {
+        if (max_kv_bytes == self.max_kv_bytes) return;
+        if (max_kv_bytes >> 20 != self.max_kv_bytes >> 20)
+            log.info("  [hot-cache] budget revised {d} -> {d} MB\n", .{ self.max_kv_bytes >> 20, max_kv_bytes >> 20 });
+        const shrank = max_kv_bytes != 0 and (self.max_kv_bytes == 0 or max_kv_bytes < self.max_kv_bytes);
+        self.max_kv_bytes = max_kv_bytes;
+        if (!shrank) return;
+        while (self.current_kv_bytes > max_kv_bytes and self.entries.items.len > 0) {
+            const before = self.entries.items.len;
+            self.evictOneLru("budget revised", null);
+            if (self.entries.items.len == before) break; // every survivor is checked out
+        }
+        self.shedCheckpointsToFit();
+        self.logResident();
+    }
+
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
         self.evictAt(idx, reason);
@@ -4019,6 +4037,37 @@ test "HotPrefixCache: replace path bounds SSM checkpoints and keeps them spread"
     try testing.expectEqual(@as(usize, 300), kept[1].pos);
     try testing.expectEqual(@as(usize, 500), kept[2].pos);
     try testing.expectEqual(@as(usize, 800), kept[3].pos);
+}
+
+test "HotPrefixCache: a revised budget evicts down to fit and a raised one keeps everything" {
+    const s = mlx.gpuStream();
+    var a = try KVCache.init(testing.allocator, 2);
+    defer a.deinit();
+    try testFillCache(&a, s, 2, 600);
+    var b = try KVCache.init(testing.allocator, 2);
+    defer b.deinit();
+    try testFillCache(&b, s, 2, 600);
+    var toks_a: [600]u32 = undefined;
+    for (&toks_a, 0..) |*t2, i| t2.* = @intCast(i + 1);
+    var toks_b: [600]u32 = undefined;
+    for (&toks_b, 0..) |*t2, i| t2.* = @intCast(i + 1000);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    _ = try hc.commit(&a, &toks_a, false);
+    _ = try hc.commit(&b, &toks_b, false);
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    const one = hc.entries.items[0].kv_bytes;
+
+    // Shrink to one entry's worth: the LRU (A) goes, B stays whole.
+    hc.setBudget(one);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
+    try testing.expectEqual(@as(u32, 1000), hc.entries.items[0].tokens[0]);
+    // Raise (0 = uncapped): nothing moves.
+    hc.setBudget(0);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqual(@as(u64, 0), hc.max_kv_bytes);
 }
 
 test "HotPrefixCache: byte budget rejects an oversized sole entry and preserves a smaller prefix" {
