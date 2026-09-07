@@ -1545,7 +1545,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} serial_drops=t{d}/c{d}/b{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1571,6 +1571,7 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
+                    self.xfm.round_cost.dropped_implausible,
                     self.xfm.round_cost.serial_dropped_transition,
                     self.xfm.round_cost.serial_dropped_contended,
                     self.xfm.round_cost.serial_dropped_bad,
@@ -1591,7 +1592,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
@@ -1606,6 +1607,7 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
+                    self.xfm.round_cost.dropped_implausible,
                     if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
                     if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
                     if (self.dflash_chooser) |ch| ch.trial.trials else 0,
@@ -5418,6 +5420,13 @@ pub const Generator = struct {
     pub fn invalidateSerialClock(self: *Generator) void {
         self.mtp_serial_clock = null;
         self.mtp_serial_warm = 0;
+    }
+
+    /// Same for the spec round's clock: the interval since the previous round end held a
+    /// prefill chunk. The next round times itself and is dropped as a transition.
+    pub fn invalidateRoundClock(self: *Generator) void {
+        self.mtp_regime_clock = null;
+        self.spec_round_prev_width = null;
     }
 
     /// Fold one plain serial decode token into the model's serial cell. The first
@@ -12810,9 +12819,9 @@ test "mtpRegime: a simulated round loop reaches BOTH shapes, and the worse one k
 }
 
 test "MtpCostSource: a measured cliff stops the plan where the fitted surface would extend" {
-    // M1 Pro 27B: depth 4 -> 5 costs +150 ms/round. The fitted surface
-    // prices position 5 at 0.26 floor units and extends; the table has
-    // measured it. Same acceptance, same cap, two answers.
+    // M1 Pro 27B: depth 4 -> 5 is a +43% round. The fitted surface prices
+    // position 5 at 0.26 floor units and extends; the table has measured
+    // it. Same acceptance, same cap, two answers.
     const a = [_]f32{ 0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95 };
     const prior = Generator.mtpEvPlanForAt(&a, 8, Generator.MTP_EV_DEFAULT_COSTS, 8, 10000);
     try testing.expect(prior.m_hi >= 5);
@@ -12820,7 +12829,7 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
     for (0..round_cost.MIN_SAMPLES) |_| {
         _ = t.observe(3, 10000, 60.0, 4.0, true, false);
         _ = t.observe(4, 10000, 70.0, 5.0, true, false);
-        _ = t.observe(5, 10000, 220.0, 6.0, true, false);
+        _ = t.observe(5, 10000, 102.0, 6.0, true, false);
     }
     const src = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 10000, &t);
     try testing.expect(src.fromTable());
@@ -12828,7 +12837,7 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
     // there, and below it the prior's shape fills in.
     try testing.expectApproxEqAbs(Generator.mtpEvRoundCostAt(Generator.MTP_EV_DEFAULT_COSTS, 3, false, 10000), src.roundCost(3, false), 1e-4);
     try testing.expectApproxEqAbs(Generator.mtpEvRoundCostAt(Generator.MTP_EV_DEFAULT_COSTS, 2, false, 10000), src.roundCost(2, false), 1e-4);
-    try testing.expect(src.marginal(5) > 5.0 * src.marginal(4));
+    try testing.expect(src.marginal(5) > 2.5 * src.marginal(4));
     // Past the widest measured width the cliff's slope continues (it is
     // steeper than the prior's marginal here).
     try testing.expectApproxEqAbs(src.roundCost(5, false) + (src.roundCost(5, false) - src.roundCost(4, false)), src.roundCost(6, false), 1e-3);
@@ -12841,7 +12850,7 @@ test "MtpCostSource: a measured cliff stops the plan where the fitted surface wo
         _ = t1.observe(3, 10000, 60.0, 4.0, true, false);
         _ = t1.observe(4, 10000, 70.0, 5.0, true, false);
     }
-    _ = t1.observe(5, 10000, 220.0, 6.0, true, false);
+    _ = t1.observe(5, 10000, 102.0, 6.0, true, false);
     const src1 = Generator.MtpCostSource.init(Generator.MTP_EV_DEFAULT_COSTS, 10000, &t1);
     try testing.expectEqual(@as(u32, 4), Generator.mtpEvPlanSrc(&a, 8, src1, 8).m_hi);
     // ...and the trial stops asking for it (two-chunk plan, nothing owed).
@@ -12873,7 +12882,7 @@ test "mtpWidthTrial: blocks per period, idempotent per round, period grows with 
     // Identity checkable from the log: forced rounds == block * trials.
     try testing.expectEqual(wt.trials * round_cost.EXPLORE_BLOCK, forced);
     try testing.expect(wt.trials >= 17 and wt.trials <= 19);
-    // Unmeasured next width: default period. 10% worse: 30. 36% worse: 110.
+    // Unmeasured next width: default period. 10% worse: 60. 21% worse: 128.
     var t = round_cost.Table{};
     try testing.expectEqual(round_cost.EXPLORE_PERIOD_COLD, Generator.mtpWidthTrialPeriod(&t, 1000, 4));
     for (0..round_cost.MIN_SAMPLES) |_| {
@@ -12886,8 +12895,8 @@ test "mtpWidthTrial: blocks per period, idempotent per round, period grows with 
     for (0..round_cost.MIN_SAMPLES) |_| _ = u.observe(4, 1000, 40.0, 4.0, true, false);
     _ = u.observe(5, 1000, 45.0, 5.0, true, false);
     try testing.expectEqual(round_cost.EXPLORE_PERIOD_COLD, Generator.mtpWidthTrialPeriod(&u, 1000, 4));
-    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(6, 1000, 90.0, 6.0, true, false);
-    try testing.expectEqual(@as(u32, 219), Generator.mtpWidthTrialPeriod(&t, 1000, 5));
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(6, 1000, 80.0, 6.0, true, false);
+    try testing.expectEqual(@as(u32, 128), Generator.mtpWidthTrialPeriod(&t, 1000, 5));
 }
 
 test "round_cost: a simulated round loop measures every width the chooser picks and settles under the cliff" {
@@ -12904,7 +12913,7 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
                 2 => 62.0,
                 3 => 68.0,
                 4 => 74.0,
-                else => 74.0 + 150.0 * @as(f32, @floatFromInt(m - 4)),
+                else => 74.0 + 35.0 * @as(f32, @floatFromInt(m - 4)),
             };
         }
     };
@@ -12956,8 +12965,8 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
     // Before the table activates the prior extends 4 -> 5 blind every round
     // (live, the regime gate throttles that shape; the sim has no gate), so
     // the bar is the settled tail: from round 200 on, width 5 appears only
-    // as scheduled re-trial blocks (period capped at 128).
-    try testing.expect(late_wide <= 2 * round_cost.EXPLORE_BLOCK);
+    // as scheduled re-trial blocks (three in 400 rounds at this cliff).
+    try testing.expect(late_wide <= 3 * round_cost.EXPLORE_BLOCK);
     try testing.expect(picked[6] + picked[7] + picked[8] <= 4); // the prior's first rounds only
     // Identity: forced rounds == 2 * trials (each block is 2 rounds).
     try testing.expect(wt.trials >= 2);
@@ -14643,7 +14652,7 @@ test "characterization: a sidecar (legacy-layout) boot plans exactly as 26.9.1 d
     try testing.expectEqual(@as(usize, 3), round_cost.bucketFor(kv));
 
     // The warm table, restored from the file 26.9.1 wrote.
-    const rc1_body = "rc1\n2 3 44.0000 2.7000 3\n3 3 88.0000 3.0500 3\n4 3 140.0000 3.2000 3\n";
+    const rc1_body = "rc1\n2 3 44.0000 2.7000 3\n3 3 64.0000 3.0500 3\n4 3 92.0000 3.2000 3\n";
     const warm = round_cost.parse(rc1_body, .legacy) orelse return error.TestUnexpectedResult;
     const warm_src = G.MtpCostSource.init(costs, kv, &warm);
     try testing.expect(warm_src.fromTable());

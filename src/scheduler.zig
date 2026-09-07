@@ -3618,6 +3618,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
             xfm_ptr.round_cost = t;
             log.info("[spec-cost] round-cost table restored ({d} width cells, {d} serial cells)\n", .{ t.restored, t.restored_serial });
+            if (t.restored_dropped > 0) log.info("[spec-cost] dropped {d} implausible persisted cell(s)\n", .{t.restored_dropped});
         }
     }
 
@@ -5571,7 +5572,10 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     // The interval since these slots' previous tick contains a prefill chunk; the serial
     // cell must not fold it as a token's wall time. Drop it; the next tick seeds afresh.
     for (buf[0..n]) |s| {
-        if (s.legacy_gen) |*g| g.invalidateSerialClock();
+        if (s.legacy_gen) |*g| {
+            g.invalidateSerialClock();
+            g.invalidateRoundClock();
+        }
     }
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {

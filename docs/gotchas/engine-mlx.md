@@ -4761,3 +4761,43 @@ mapping (31% of the prefill slowdown); on a resident table the pool LOSES
 2-7% at every rung to 256k. `PREFILL_PREFETCH_MIN_KV` 262144 sits at the top
 of the measured-cost range; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm,
 and both arms announce which one ran.
+
+## A contaminated round-cost cell that no trial could ever re-measure (2026-09-07)
+
+The 27B MTP pack benched 51 tok/s twice on a day it did 66-67 on the same
+binary. Its persisted table held `w2 <2k = 119.7 ms` beside `w1 = 41.2 ms`
+(60 vs 21 ms/tok), so the EV plan priced width 2 at 3x width 1 and never
+left width 1; the request decoded at 0.94 accepted/round, serial minus the
+head's overhead, and every `[spec-stats]` line read `trials=0` because a
+MEASURED cell is never a trial target. Cause: `spec_cost_solo` counts
+DECODING slots, and in a 4-stream scenario the MTP slot decodes alone while
+the others prefill; `interleaveDecodeTick` runs its rounds between their
+prefill chunks, and `mtpRegimeWallMs` is the interval between round ENDS,
+so every interleaved round carried a ~100 ms chunk. The interleaver already
+dropped the serial clock for this reason, not the round clock. Fix, three
+parts, no lever: `Generator.invalidateRoundClock` beside
+`invalidateSerialClock` (the next round times itself and is dropped as a
+transition); `Table.observe` rejects a width-w sample past
+`IMPLAUSIBLE_STEP` (1.5x, measured steps on the 27B run under 1.25x and the
+M1 Pro w4->w5 cliff is 1.33x) of a trusted width-(w-1) cell as
+`.implausible`, counted as the `i` letter of `table_drops`; `parse` sweeps
+the same bound and clears the cell (`restored_dropped`, one `[spec-cost]
+dropped N implausible persisted cell(s)` line), so it is unmeasured and the
+cold-period trial re-learns it. Booted against the poisoned file: the cell
+dropped, w2 re-measured at 47 ms (19 ms/tok), 65 / 64 tok/s on two
+back-to-back runs. Guards: `round_cost.zig` fold and parse tests.
+Follow-up, same day: the fix above compares round MS, and the next table
+was poisoned in TOK. The ddalcu 27B pack's `<2k` row read w2 at 41 ms /
+3.0 tok (echo-era samples) and w3 at 49 ms / 1.66 tok (prose-era), so per
+token w3 was 2x w2, `clearlyWorse` floored the horizon and every echo round
+ran width 2 (63.5 vs 71.5 tok/s on a fresh table). A wider draft never
+accepts fewer tokens than a narrower one on the same workload, so
+`msPerTok`/`rawMsPerTok` divide by the monotone envelope `planTok` (the
+raw cell keeps its own number). Two holes from #369 closed at the same
+time: the step bound walks down to the nearest TRUSTED narrower cell
+(clearing w2 must not exempt w3), and a sample past `SELF_SPIKE` (3x) of
+a mature, non-stale cell's own value is rejected, serial row included, so
+width 1 and the serial cell are covered too. The "predictable" collapse
+that started this was NOT the engine: the 27B refuses llmprobe's "repeat
+this passage" prompt on about half of its random cache-bust tags, and a
+refusal is novel text.
