@@ -10,7 +10,18 @@ const chat_mod = @import("chat.zig");
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
 // ─── a circular import; identical behavior) ──────────────────────────────
 
+/// Escape into a JSON string literal. Every string here is built from model
+/// bytes, and a token is a BPE fragment — see the same chokepoint in server.zig.
 pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) {
+        const clean = try chat_mod.utf8Sanitize(allocator, input);
+        defer allocator.free(clean);
+        return jsonEscapeValid(allocator, clean);
+    }
+    return jsonEscapeValid(allocator, input);
+}
+
+fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '"');

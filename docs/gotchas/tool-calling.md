@@ -756,3 +756,30 @@ It is not closed in this change, and the attempt is worth recording. Two designs
 The generalisable lesson is about the INSTRUMENTS: a ladder test derived from a marker proves the ladder, and a corpus walk over marker interiors proves the interiors — **neither says anything about the byte after the marker.** A dialect whose discriminator is that byte needs a prefix replay over a complete parser-accepted call.
 
 Comparative note (SGLang `MiniCPM5Detector`, read-only reference, never a dependency): on the same eight dimensions mlx-serve is stronger on CDATA-held close tags (SGLang's non-greedy `<function.*?</function>` regex loses the whole first call) and on truncation salvage; it deliberately diverges on unknown/duplicate/missing-required parameters, where SGLang rejects the entire call and re-emits the block as `normal_text` — which is markup leaking as visible content by design, the one reference behaviour we must not copy. Value typing matches at the chokepoint (`coerceToolArgsToSchema` turns `"3"` into `3`), not at the parser. Value trimming diverges deliberately: SGLang `.strip()`s all surrounding whitespace; mlx-serve removes only the template's own framing, sharing `stripHermesValueFraming` with the `<parameter=>` dialect so `<param>` inherits the exactly-one-newline-per-side rule instead of re-deriving a looser one.
+
+## A model that opens its OWN think block had no way in (Gemma 4, LFM2.5-8B-A1B, muse; 2026-09-07/08)
+
+Three checkpoints streamed their whole chain of thought as the visible answer
+while the same request non-streamed split correctly. A stream enters the think
+block only from `prompt_opened_think` or, on the tools path, from the buffered
+gate; when the template opens nothing the MODEL emits the opener, and the plain
+content arm had no way to see it:
+
+- Gemma 4: `<|channel>` then the bare word `thought`, the marker dropped by
+  `isChannelMarkerToken`, so only `thought` reached the arm.
+- LFM2.5-8B-A1B (`<|im_start|>assistant\n`, no `<think>` in the prompt): the
+  model's first token is `<think>`, which the SAME marker skip swallowed.
+- Muse-Glimmer with `enable_thinking:true` and no tools (prompt ends at
+  `<|start|>assistant`): the model writes ` to=self<|message|>` itself, and the
+  header skip only armed on a `<|start|>` TOKEN, which sat in the prompt.
+
+Fix: `chat.modelThinkOpener` latches on a bare `<think>` or the armed `thought`,
+checked BEFORE the marker skip, seeding `think_buf` so the in-block arm strips
+it like a template-injected one; `promptOpensMuseHeader` arms the header skip at
+stream start and `museHeaderOpensReasoning` routes a `self` header to reasoning
+(the Anthropic site opens its `thinking` block there via
+`openAnthropicThinkingBlock`). All streaming surfaces.
+
+Guard: `tests/test_thinking_tools.sh` Test 6b and the per-arch
+`tests/test_smoke_matrix.sh` thinking check: the same temp-0 request streamed
+and not must agree on the split. A tag grep cannot see this class.

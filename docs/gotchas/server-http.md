@@ -687,7 +687,7 @@ The whole response fails to parse. Not a degraded field — an unusable response
 from one candidate in one top-5 list. It surfaced as a bare decode error while
 sweeping models for the alignment bug, on one model out of seven.
 
-`jsonEscapeLossy` emits U+FFFD per invalid sequence, using the maximal-subpart
+`chat.utf8Sanitize` emits U+FFFD per invalid sequence, using the maximal-subpart
 rule so a character split across two tokens costs one replacement rather than
 one per byte. `bytes` is untouched and still carries the exact bytes, which is
 OpenAI's own shape and lets a client reassemble across tokens.
@@ -2036,3 +2036,23 @@ A spent reasoning budget set `in_think_block = false` on both streaming surfaces
 Live: a 400k qwen4_exp opencode session, 43 turns each carrying one screenshot at position 348211, then one text-only turn — `[hot-cache] hybrid miss (no checkpoint <= 348211 of 399199)` and a 348k-token cold prefill. `findBestRestorableMatch` already knew that rows before a media placeholder are ordinary text and cross pixel keys, so the image turn restored the text prefix correctly; `bestCheckpointDonor` did not, and demanded exact `vision_key` equality. The image commit therefore landed as a fresh pixel-keyed entry with only its own tail checkpoints (all above the boundary), the count cap evicted the text entry, and the boundary — exactly where the next text turn is capped — held nothing. Fix: the donor scan takes the commit's `eff_media_start` and applies the same cross-key rule, so a key-mismatched entry donates checkpoints at or below `min(entry.media_start, commit media_start)`; `shared` is already clamped to that boundary, which is the inheritance limit `cloneCheckpointsUpTo` gets.
 
 The class behind it: retention had no idea a boundary existed. `spanPreservingDropIndex` thins the interior by narrowest span, and the checkpoint at a media boundary is a known future divergence point that a later text-only turn is the only consumer of — in a dense stretch it is exactly what the scan picks. It now takes a `protect` index (the way the newest quarter is protected), and both hot-cache thinning sites pass `boundaryCheckpointIndex(cps, media_start)`. Protecting the sole candidate falls back to dropping the oldest, which sits below the protected position, so the invariant holds either way. Guards: `HotPrefixCache: a text turn after image turns restores the pre-media prefix` (instance) and `HotPrefixCache: thinning keeps the highest checkpoint below the media boundary` (class); integration `tests/test_vision_prefix_cache.sh`.
+
+### A reply that is not valid UTF-8 is LOST, not degraded (2026-09-07)
+
+`test_multi_model_concurrent.sh` died in `json.load`: a 27B pack answering with
+byte-level garbage emitted a lone UTF-8 lead byte in `message.content`, and the
+whole reply became unparseable for every strict client. The 2026-08-05 fix had
+found this class in `top_logprobs` and stopped there, on the claim that every
+other string we emit is "valid UTF-8 by construction". It is not: `content` is
+decoded model bytes like any other, and a model can emit the lead of a
+multi-byte character and never complete it.
+
+Fix: sanitizing lives INSIDE the escaper so no call site can forget it.
+`chat.utf8Next` is the one sequence walker; `server.jsonEscape`,
+`responses.jsonEscape`, `chat.appendJsonString` (the prompt render: nlohmann
+rejects invalid UTF-8 exactly as it rejects a raw control byte, the silent
+`fallbackFormatChat` class) and `ollama.writeJsonString` all replace an invalid
+sequence with one U+FFFD. Valid input is byte-identical.
+
+Guard: `EVERY JSON string escaper survives bytes that are not valid UTF-8`
+(server.zig), one invariant over all four.

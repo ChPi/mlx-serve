@@ -1672,6 +1672,16 @@ const INKLING_END_TAG = "<|end_message|>";
 const INKLING_MODEL_TAG = "<|message_model|>";
 const INKLING_INVOKE_TAG = "<|content_invoke_tool_json|>";
 
+/// A think block the MODEL opens when the template did not: a bare `<think>` token, or
+/// Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible deltas) then the
+/// word `thought`. `channel_armed` = the previous delta was that marker and nothing visible
+/// has been emitted. Returns the opener to seed `think_buf` with.
+pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), "<think>")) return "<think>";
+    if (channel_armed and std.mem.eql(u8, token_text, "thought")) return "<|channel>thought";
+    return null;
+}
+
 /// Control-channel marker TOKENS that must never appear in a visible stream
 /// delta. Every entry is a single special token in its family's vocab, so
 /// exact-match filtering at the delta level is complete — a marker can't be
@@ -2175,6 +2185,20 @@ pub fn museThinkOpenerAt(buf: []const u8) MuseThinkOpener {
         if (!museIsRecipientChar(c)) return .not_muse;
     }
     return .growing;
+}
+
+/// A muse prompt that ends at `<|start|>assistant` leaves the model to write its own
+/// header, so the plain stream arm must start skipping as if `<|start|>` had just arrived.
+pub fn promptTailOpensMuseHeader(tail: []const u8) bool {
+    return std.mem.endsWith(u8, std.mem.trimEnd(u8, tail, "\n "), MUSE_START_TAG ++ "assistant");
+}
+
+/// The held header bytes between `<|start|>` and `<|message|>` name `self`: the segment is reasoning.
+pub fn museHeaderOpensReasoning(head: []const u8) bool {
+    var rest = std.mem.trimStart(u8, head, " \n");
+    if (std.mem.startsWith(u8, rest, "assistant")) rest = std.mem.trimStart(u8, rest["assistant".len..], " \n");
+    if (!std.mem.startsWith(u8, rest, "to=")) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, rest["to=".len..], " \n"), "self");
 }
 
 /// Length of a COMPLETE next-segment header at the start of `text`
@@ -6703,6 +6727,33 @@ fn isJsonNumber(s: []const u8) bool {
     return i == s.len;
 }
 
+/// One UTF-8 sequence starting at `i`: `valid` = well-formed, else `end` is the maximal
+/// subpart to replace with U+FFFD (a character split across two tokens costs ONE replacement).
+pub const Utf8Seq = struct { end: usize, valid: bool };
+
+pub fn utf8Next(s: []const u8, i: usize) Utf8Seq {
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return .{ .end = i + 1, .valid = false };
+    if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) return .{ .end = i + len, .valid = true };
+    var j = i + 1;
+    while (j < s.len and j < i + len and s[j] & 0xC0 == 0x80) j += 1;
+    return .{ .end = j, .valid = false };
+}
+
+/// The lossy view of bytes that are not valid UTF-8: one U+FFFD per invalid sequence.
+/// A token is a BPE fragment, so ANY string built from model bytes can end mid-character;
+/// raw, that makes a response body unparseable and a prompt render fall back silently.
+pub fn utf8Sanitize(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var clean = std.ArrayList(u8).empty;
+    errdefer clean.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) {
+        const seq = utf8Next(input, i);
+        try clean.appendSlice(allocator, if (seq.valid) input[i..seq.end] else "\u{FFFD}");
+        i = seq.end;
+    }
+    return clean.toOwnedSlice(allocator);
+}
+
 /// THE JSON string escaper (quoted, control bytes \u-escaped). Public so other
 /// request builders reuse it instead of hand-rolling a second one — a duplicate
 /// escaper is exactly how the control-byte class shipped twice before.
@@ -6711,42 +6762,31 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
-        if (c < 0x80) {
-            i += 1;
-            switch (c) {
-                '"' => try buf.appendSlice(allocator, "\\\""),
-                '\\' => try buf.appendSlice(allocator, "\\\\"),
-                '\n' => try buf.appendSlice(allocator, "\\n"),
-                '\r' => try buf.appendSlice(allocator, "\\r"),
-                '\t' => try buf.appendSlice(allocator, "\\t"),
-                // Every other control char (e.g. ESC from ANSI codes in tool
-                // results) must be \u-escaped — nlohmann inside jinja_render_chat
-                // rejects raw control bytes, and the render failure silently
-                // downgrades the prompt to fallbackFormatChat.
-                0...8, 0x0B, 0x0C, 0x0E...0x1F => {
-                    var esc: [6]u8 = undefined;
-                    const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
-                    try buf.appendSlice(allocator, n);
-                },
-                else => try buf.append(allocator, c),
-            }
+        if (c >= 0x80) {
+            // nlohmann rejects ill-formed UTF-8 like a raw control byte.
+            const seq = utf8Next(s, i);
+            try buf.appendSlice(allocator, if (seq.valid) s[i..seq.end] else "\u{FFFD}");
+            i = seq.end;
             continue;
         }
-        // nlohmann rejects ill-formed UTF-8 like a raw control byte: each invalid subpart becomes U+FFFD.
-        const len = std.unicode.utf8ByteSequenceLength(c) catch {
-            try buf.appendSlice(allocator, "\u{FFFD}");
-            i += 1;
-            continue;
-        };
-        if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
-            try buf.appendSlice(allocator, s[i .. i + len]);
-            i += len;
-            continue;
+        i += 1;
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            // Every other control char (e.g. ESC from ANSI codes in tool
+            // results) must be \u-escaped — nlohmann inside jinja_render_chat
+            // rejects raw control bytes, and the render failure silently
+            // downgrades the prompt to fallbackFormatChat.
+            0...8, 0x0B, 0x0C, 0x0E...0x1F => {
+                var esc: [6]u8 = undefined;
+                const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+                try buf.appendSlice(allocator, n);
+            },
+            else => try buf.append(allocator, c),
         }
-        var j = i + 1;
-        while (j < s.len and j < i + len and s[j] & 0xC0 == 0x80) j += 1;
-        try buf.appendSlice(allocator, "\u{FFFD}");
-        i = j;
     }
     try buf.append(allocator, '"');
 }
@@ -14165,4 +14205,30 @@ test "appendJsonString: invalid UTF-8 becomes U+FFFD, valid multibyte is byte-ex
     buf.clearRetainingCapacity();
     try appendJsonString(allocator, &buf, "a\xe4\xb8");
     try testing.expectEqualStrings("\"a\u{FFFD}\"", buf.items);
+}
+
+test "a muse header the MODEL writes at position 0 is resolved, self means reasoning" {
+    // The prompt ends at `<|start|>assistant`; the model's ` to=self<|message|>` used to
+    // stream as content because only a `<|start|>` TOKEN armed the header skip.
+    try std.testing.expect(promptTailOpensMuseHeader("...<|eot|><|start|>assistant"));
+    try std.testing.expect(promptTailOpensMuseHeader("<|start|>assistant\n"));
+    try std.testing.expect(!promptTailOpensMuseHeader("<|start|>assistant to=user<|message|>"));
+    try std.testing.expect(museHeaderOpensReasoning(" to=self"));
+    try std.testing.expect(museHeaderOpensReasoning("assistant to=self\n"));
+    try std.testing.expect(!museHeaderOpensReasoning(" to=user"));
+    try std.testing.expect(!museHeaderOpensReasoning(" to=selfish"));
+    try std.testing.expect(!museHeaderOpensReasoning(""));
+}
+
+test "a model-opened think block latches from its own opener token" {
+    // Both openers are dropped from visible deltas as channel markers, so without
+    // this latch the whole thought streams as the answer (LFM2.5-8B-A1B, Gemma 4).
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>").?);
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>\n").?);
+    try std.testing.expectEqualStrings("<|channel>thought", modelThinkOpener(true, "thought").?);
+    try std.testing.expect(modelThinkOpener(false, "thought") == null);
+    // Prose that merely BEGINS with the word is not the opener token.
+    try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
+    try std.testing.expect(modelThinkOpener(true, "\n") == null);
+    try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
 }

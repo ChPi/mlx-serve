@@ -1070,6 +1070,15 @@ fn promptOpensThink(
     return chat_mod.promptTailOpensThink(tail);
 }
 
+fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
+    const c = lm.config orelse return false;
+    if (!std.mem.eql(u8, c.model_type, "muse_glimmer") or prompt_ids.len == 0) return false;
+    const n = @min(prompt_ids.len, 8);
+    const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - n ..], false) catch return false;
+    defer allocator.free(tail);
+    return chat_mod.promptTailOpensMuseHeader(tail);
+}
+
 /// Generation-side grammar switching currently has one exact boundary: the
 /// atomic bare `</think>` token. Keep this narrower than response parsing,
 /// which also recognizes suffixed and channel-based reasoning families.
@@ -9563,6 +9572,7 @@ fn handleStreamingGeneration(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var in_think_block = prompt_opened_think;
+    var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools or std.mem.eql(u8, config.model_type, "gpt_oss");
     var think_closed = false; // a complete think block was already split+emitted this stream
     // Leading whitespace is suppressed until the first visible byte, so the
@@ -9581,7 +9591,9 @@ fn handleStreamingGeneration(
     // Muse-Glimmer: dropping a segment header in the plain arm — <|start|>
     // arms it, <|message|> disarms; the role+recipient text between them is
     // ordinary tokens that must never reach the client as content.
-    var muse_skip_header = false;
+    var muse_skip_header = promptOpensMuseHeader(allocator, lm, tok, prompt_ids);
+    var muse_head = std.ArrayList(u8).empty; // header bytes held while skipping
+    defer muse_head.deinit(allocator);
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
@@ -10041,12 +10053,32 @@ fn handleStreamingGeneration(
             const was_skipping = muse_skip_header;
             muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
             if (was_skipping or muse_skip_header) {
+                if (muse_skip_header) try muse_head.appendSlice(allocator, token_text);
+                // `<|message|>` resolved a header the model wrote: `to=self` is reasoning.
+                if (was_skipping and !muse_skip_header and !content_started and chat_mod.museHeaderOpensReasoning(muse_head.items)) {
+                    in_think_block = true;
+                    saw_think_open = true;
+                    skipped_think_open = true;
+                    think_close_tag = "<|eom|>";
+                }
+                if (!muse_skip_header) muse_head.clearRetainingCapacity();
                 continue;
             }
             // Skip Gemma 4 channel tags that leak after thinking blocks
+            // A think block the MODEL opens: seeded like a template-injected one.
+            // Checked before the marker skip, which would swallow a bare `<think>`.
+            if (!content_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+                channel_armed = false;
+                in_think_block = true;
+                saw_think_open = true;
+                try think_buf.appendSlice(allocator, opener);
+                continue;
+            };
             if (chat_mod.isChannelMarkerToken(token_text)) {
+                channel_armed = !content_started and std.mem.eql(u8, token_text, "<|channel>");
                 continue;
             }
+            channel_armed = false;
             const vis_token_text = chat_mod.streamContentLead(token_text, content_started);
             if (vis_token_text.len == 0) {
                 lps.dropPending();
@@ -11763,7 +11795,17 @@ fn formatPerfBracket(
     return s catch buf[0..0];
 }
 
+/// THE JSON string escaper for every response body. Every string here is model bytes
+/// somewhere and a token is a BPE fragment, so invalid UTF-8 is sanitized INSIDE the
+/// escaper (one U+FFFD per bad sequence); valid input passes through byte for byte.
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(input)) return jsonEscapeValid(allocator, input);
+    const clean = try chat_mod.utf8Sanitize(allocator, input);
+    defer allocator.free(clean);
+    return jsonEscapeValid(allocator, clean);
+}
+
+fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
@@ -11790,47 +11832,38 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     return result.toOwnedSlice(allocator);
 }
 
-/// `jsonEscape` for text that is NOT guaranteed to be valid UTF-8.
-///
-/// A single token is a BPE fragment, so it can carry only PART of a multi-byte
-/// character — the rest arrives in the next token. `jsonEscape` passes every
-/// byte >= 0x20 through verbatim, so those raw bytes landed in the JSON string
-/// and the WHOLE response body stopped being valid UTF-8: unparseable, not
-/// merely degraded. Live on Qwen3.6-27B, a `b"\xf0\x9f"` candidate (the first
-/// half of a 4-byte emoji) inside `top_logprobs`.
-///
-/// The `bytes` array beside it carries the exact bytes, so the string is the
-/// lossy view — one U+FFFD per invalid sequence, which is the shape OpenAI
-/// documents. Only the logprobs token strings need this: every other string we
-/// emit is complete decoded text, valid UTF-8 by construction.
-fn jsonEscapeLossy(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    if (std.unicode.utf8ValidateSlice(input)) return jsonEscape(allocator, input);
+test "EVERY JSON string escaper survives bytes that are not valid UTF-8" {
+    // Class guard over the four escapers (OpenAI/Anthropic, Responses, the prompt
+    // render, Ollama NDJSON): one passing bytes through loses a whole reply.
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "near\xe8\x91\xe4\xb8\x89 in", // 3-byte lead, one continuation, then another lead
+        "\xff\xfe", // never-valid lead bytes
+        "tail\xf0\x9f", // first half of a 4-byte emoji, cut by max_tokens
+    };
+    for (cases) |bad| {
+        const a1 = try jsonEscape(a, bad);
+        defer a.free(a1);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(a1));
 
-    const replacement = "\u{FFFD}";
-    var clean = std.ArrayList(u8).empty;
-    defer clean.deinit(allocator);
+        const a2 = try responses_mod.jsonEscape(a, bad);
+        defer a.free(a2);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(a2));
 
-    var i: usize = 0;
-    while (i < input.len) {
-        const len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
-            try clean.appendSlice(allocator, replacement);
-            i += 1;
-            continue;
-        };
-        if (i + len <= input.len and std.unicode.utf8ValidateSlice(input[i .. i + len])) {
-            try clean.appendSlice(allocator, input[i .. i + len]);
-            i += len;
-            continue;
-        }
-        // Consume the lead plus the continuation bytes that follow it as ONE
-        // maximal subpart, so a character split across two tokens costs a
-        // single replacement rather than one per byte.
-        var j = i + 1;
-        while (j < input.len and j < i + len and input[j] & 0xC0 == 0x80) j += 1;
-        try clean.appendSlice(allocator, replacement);
-        i = j;
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(a);
+        try chat_mod.appendJsonString(a, &buf, bad);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(buf.items));
+
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try ollama_mod.writeJsonString(&out.writer, bad);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(out.written()));
     }
-    return jsonEscape(allocator, clean.items);
+    // Valid input is passed through byte for byte.
+    const good = try jsonEscape(a, "héllo \u{1F600}");
+    defer a.free(good);
+    try std.testing.expectEqualStrings("\"héllo \u{1F600}\"", good);
 }
 
 /// Build logprobs JSON for a single token (for both streaming and non-streaming).
@@ -11849,7 +11882,7 @@ fn formatTokenLogprob(
     const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
     defer allocator.free(token_text);
 
-    const escaped_token = try jsonEscapeLossy(allocator, token_text);
+    const escaped_token = try jsonEscape(allocator, token_text);
     defer allocator.free(escaped_token);
 
     // Build bytes array
@@ -11873,7 +11906,7 @@ fn formatTokenLogprob(
 
         const tlp_text = try tok.decode(allocator, &[_]u32{tlp.token_id}, strip and false);
         defer allocator.free(tlp_text);
-        const escaped_tlp = try jsonEscapeLossy(allocator, tlp_text);
+        const escaped_tlp = try jsonEscape(allocator, tlp_text);
         defer allocator.free(escaped_tlp);
 
         // Bytes for this token
@@ -11942,7 +11975,7 @@ fn formatCompletionsLogprobs(
         }
         const text = try tok.decode(allocator, &[_]u32{token_ids[i]}, false);
         defer allocator.free(text);
-        const esc = try jsonEscapeLossy(allocator, text);
+        const esc = try jsonEscape(allocator, text);
         defer allocator.free(esc);
         try toks.appendSlice(allocator, esc);
 
@@ -11956,7 +11989,7 @@ fn formatCompletionsLogprobs(
             if (j > 0) try tops.appendSlice(allocator, ",");
             const ttext = try tok.decode(allocator, &[_]u32{t.token_id}, false);
             defer allocator.free(ttext);
-            const tesc = try jsonEscapeLossy(allocator, ttext);
+            const tesc = try jsonEscape(allocator, ttext);
             defer allocator.free(tesc);
             try tops.appendSlice(allocator, tesc);
             try tops.appendSlice(allocator, ":");
@@ -14925,6 +14958,7 @@ fn handleAnthropicStreaming(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var in_think_block = prompt_opened_think;
+    var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools or std.mem.eql(u8, config.model_type, "gpt_oss");
     // Set once the buffered think block has been split + emitted (tools
     // branch). Releases the buffer hold AND tells the end-of-stream split
@@ -14932,7 +14966,9 @@ fn handleAnthropicStreaming(
     var think_closed = false;
     var content_started = false;
     // Muse-Glimmer plain-arm segment-header skip (<|start|>…<|message|>).
-    var muse_skip_header = false;
+    var muse_skip_header = promptOpensMuseHeader(allocator, lm, tok, prompt_ids);
+    var muse_head = std.ArrayList(u8).empty; // header bytes held while skipping
+    defer muse_head.deinit(allocator);
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>";
@@ -15134,11 +15170,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
@@ -15152,11 +15184,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
@@ -15169,11 +15197,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .analysis) {
@@ -15194,11 +15218,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .growing) {
@@ -15221,11 +15241,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .growing) {
@@ -15239,11 +15255,7 @@ fn handleAnthropicStreaming(
                     // Stay in the think block; close tag is detected dynamically.
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 }
@@ -15377,8 +15389,34 @@ fn handleAnthropicStreaming(
             // Muse segment-header skip: <|start|>…<|message|> is never content.
             const was_skipping = muse_skip_header;
             muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
-            if (was_skipping or muse_skip_header) continue;
-            if (chat_mod.isChannelMarkerToken(token_text)) continue;
+            if (was_skipping or muse_skip_header) {
+                if (muse_skip_header) try muse_head.appendSlice(allocator, token_text);
+                // `<|message|>` resolved a header the model wrote: `to=self` is reasoning.
+                if (was_skipping and !muse_skip_header and !content_started and chat_mod.museHeaderOpensReasoning(muse_head.items)) {
+                    in_think_block = true;
+                    skipped_think_open = true;
+                    think_close_tag = "<|eom|>";
+                    if (!thinking_block_open) {
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
+                        thinking_block_open = true;
+                    }
+                }
+                if (!muse_skip_header) muse_head.clearRetainingCapacity();
+                continue;
+            }
+            // A think block the MODEL opens: seeded like a template-injected one.
+            // Checked before the marker skip, which would swallow a bare `<think>`.
+            if (!content_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+                channel_armed = false;
+                in_think_block = true;
+                try think_buf.appendSlice(allocator, opener);
+                continue;
+            };
+            if (chat_mod.isChannelMarkerToken(token_text)) {
+                channel_armed = !content_started and std.mem.eql(u8, token_text, "<|channel>");
+                continue;
+            }
+            channel_armed = false;
             const vis_token = chat_mod.streamContentLead(token_text, content_started);
             if (vis_token.len == 0) continue;
             content_started = true;
@@ -15614,6 +15652,14 @@ fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: *Conn, index
 }
 
 /// Close a thinking block with a fake signature and content_block_stop.
+fn openAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: *Conn, block_index: u32) !void {
+    const sd = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+    , .{block_index});
+    defer allocator.free(sd);
+    try sendAnthropicEvent(stream, "content_block_start", sd);
+}
+
 fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: *Conn, index: u32) !void {
     const sig = try std.fmt.allocPrint(allocator,
         \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"signature_delta","signature":"mlx-serve-local"}}}}
@@ -16382,6 +16428,7 @@ fn handleResponsesInner(
         // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
         // Prompt-derived, never flag-derived — see the chat streaming arm.
         var in_think_block = promptOpensThink(allocator, lm, tok, prompt_ids);
+        var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var skipped_think_open = false;
@@ -16588,7 +16635,19 @@ fn handleResponsesInner(
                 }
             } else {
                 // Skip Gemma 4 channel tags that may leak after the thinking block.
-                if (chat_mod.isChannelMarkerToken(token_text)) continue;
+                // A think block the MODEL opens: seeded like a template-injected one.
+                // Checked before the marker skip, which would swallow a bare `<think>`.
+                if (!streamed_message_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+                    channel_armed = false;
+                    in_think_block = true;
+                    try think_buf.appendSlice(allocator, opener);
+                    continue;
+                };
+                if (chat_mod.isChannelMarkerToken(token_text)) {
+                    channel_armed = !streamed_message_started and std.mem.eql(u8, token_text, "<|channel>");
+                    continue;
+                }
+                channel_armed = false;
                 if (!streamed_message_started) {
                     streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
