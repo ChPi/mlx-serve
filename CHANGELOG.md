@@ -39,6 +39,7 @@
 - A warm turn on Flash Next copied its whole cached conversation before writing a single token (5 GB at 393k) and was billed for memory it already had; a restored prefix is now handed to the request outright.
 - A hybrid-model prefix too big for the cache budget was dropped whole instead of trimmed: retention thinned the wrong end of the checkpoint list.
 - Two conversations of very different length could be decoded together on the hybrid architectures, padding the short one to the long one's width every step (Flash Next only; the other hybrids keep the previous behaviour pending a measurement).
+- A draft-width cost table poisoned at width 1 (a prefill chunk landing in the round's wall time on an older build) was never cleaned up at load, so the planner kept skipping the narrowest width; the load sweep now also checks each width against the next wider one.
 - Qwen 3.8 27B packs, and every other model with a separate draft head, lost about 25% of decode speed at 8k against 26.9.1: the round-cost table's file format had changed under them, so every boot started cold. They read the file 26.9.1 wrote again, and a speculative reply no longer gets stuck at the narrowest draft width because a cold context bucket kept a neighbour's trial schedule.
 - Long Flash Next sessions eventually wedged with "Failed to create Metal shared event": one small array per decoded step was never released.
 - A malformed Qwen 3.8 Flash Next checkpoint could be loaded instead of refused; its n-gram, sparse-attention and PLE bounds are now checked at load.

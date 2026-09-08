@@ -124,6 +124,11 @@ pub const Verdict = enum { folded, reseeded, contended, transition, bad_sample, 
 /// times the width-(w-1) round (measured steps run under 1.25x). Anything past
 /// it carried foreign work between round ends and would poison the planner.
 pub const IMPLAUSIBLE_STEP: f32 = 1.5;
+/// The mirror bound for the persisted sweep: a narrower round is strictly less work than a
+/// wider one, so a stored cell past this multiple of its nearest trusted WIDER cell carried
+/// foreign work. Width 1 has no narrower neighbour and only this bound reaches it (#382).
+/// Healthy tables reach 1.08x (M4 Max); a poisoned width-1 cell reads 1.6x to 2.1x.
+pub const IMPLAUSIBLE_WIDER: f32 = 1.25;
 /// A sample past this multiple of a mature cell's own value is the machine, not the round
 /// (another process on the GPU, #369). A stale cell is a regime change and reseeds instead.
 pub const SELF_SPIKE: f32 = 3.0;
@@ -223,15 +228,30 @@ pub const Table = struct {
         return false;
     }
 
-    /// Clear every width cell that fails the step bound against its narrower neighbour
-    /// (the persisted-table sweep); returns the count cleared.
+    /// `ms` at `width` exceeds IMPLAUSIBLE_WIDER over the nearest trusted wider cell. Sweep
+    /// only: at fold time a slower regime would have every narrower sample refused against a
+    /// stale wider cell, where the step bound alone still lets width 1 reseed the bucket.
+    fn widerImplausible(self: *const Table, width: u32, bucket: usize, ms: f32) bool {
+        var w = width;
+        while (w < MAX_WIDTH) {
+            w += 1;
+            const above = self.cells[w][bucket];
+            if (above.n < MIN_SAMPLES) continue;
+            return ms > above.ms * IMPLAUSIBLE_WIDER;
+        }
+        return false;
+    }
+
+    /// Clear every width cell that fails the step bound against its narrower neighbour or
+    /// the wider bound against its wider one (the persisted-table sweep); returns the count cleared.
     fn dropImplausibleCells(self: *Table) u32 {
         var dropped: u32 = 0;
         for (0..N_BUCKETS) |b| {
-            var w: u32 = 2;
+            var w: u32 = 1;
             while (w <= MAX_WIDTH) : (w += 1) {
                 const c = self.cells[w][b];
-                if (c.n == 0 or !self.stepImplausible(w, b, c.ms)) continue;
+                if (c.n == 0) continue;
+                if (!self.stepImplausible(w, b, c.ms) and !self.widerImplausible(w, b, c.ms)) continue;
                 self.cells[w][b] = .{};
                 dropped += 1;
             }
@@ -1405,6 +1425,17 @@ test "round_cost: the load sweep bounds against the nearest TRUSTED narrower cel
     try testing.expectEqual(@as(u32, 0), t.cells[3][0].n);
     try testing.expectApproxEqAbs(44.0, t.measuredMs(4, 0).?, 1e-3);
     try testing.expectEqual(@as(u32, 2), t.restored_dropped);
+}
+
+test "round_cost: the load sweep drops a width-1 cell that costs more than its wider neighbour (#382)" {
+    // Width 1 has no narrower cell, so the step bound never reaches it; a narrower round is
+    // strictly less work than a wider one, so the wider neighbour bounds it instead.
+    const t = parse("rc1\n1 1 149.68 1.85 20000\n2 1 86 2.0 5000\n3 1 95 2.4 4000\n1 0 45 1.8 3000\n2 0 42 2.0 3000\n", .legacy) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), t.cells[1][1].n);
+    try testing.expectApproxEqAbs(86.0, t.measuredMs(2, 1).?, 1e-3);
+    // A healthy tail (M4 Max tables reach 1.08x) stays.
+    try testing.expectApproxEqAbs(45.0, t.measuredMs(1, 0).?, 1e-3);
+    try testing.expectEqual(@as(u32, 1), t.restored_dropped);
 }
 
 test "round_cost: ms per token reads tokens MONOTONE in width (a wider draft never accepts fewer)" {

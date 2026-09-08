@@ -4799,3 +4799,14 @@ width 1 and the serial cell are covered too. The "predictable" collapse
 that started this was NOT the engine: the 27B refuses llmprobe's "repeat
 this passage" prompt on about half of its random cache-bust tags, and a
 refusal is novel text.
+Follow-up (#382): the sweep started at w2 and the step bound only looks
+narrower, so a poisoned width-1 cell (149 ms against 55 in its neighbours,
+20k samples, pre-fix table on an M5 Max) survived every boot, and trials
+never go narrower than m_lo so nothing re-measured it. A narrower round is
+strictly less work than a wider one, so the sweep now also clears a cell
+past `IMPLAUSIBLE_WIDER` (1.25x) of its nearest trusted wider cell. Healthy
+tables reach 1.08x (M4 Max rc3 w4/w5 and w1/w2), poisoned width-1 cells
+1.6x and 2.1x. Sweep only, not the fold path: at fold a slower regime would
+see every narrower sample refused against a stale wider cell. Uniform
+contamination across a bucket is invisible to any ratio; that table wants
+deleting. Guard: the #382 parse test in `round_cost.zig`.
