@@ -21,6 +21,7 @@
 
 ### Fixes
 
+- JSON-schema output no longer collapses decode speed. The grammar mask walked the entire vocabulary on every token and the constrained step built the next forward only after sampling; the mask now probes only tokens the grammar can accept and the forward is built while the GPU is still busy, so constrained decode runs at the serial decode rate instead of ~1 tok/s on Flash Next. (#380)
 - The prefix-cache budget now follows what is resident. It used to be clamped once at load against every model on the machine, so a model loaded beside a large one could keep a near-zero budget for the whole session and unloading the other model did not give it back. (#364)
 - A batch sweep no longer evicts your conversation from the prefix cache. Cache entries are grouped by workload (`prompt_cache_key`, else `metadata.user_id`, else the system prompt) and eviction takes the oldest entry of the largest group, so a sweep of documents evicts its own documents and a warm conversation stays warm. One workload alone behaves exactly as before. (#378)
 - A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.

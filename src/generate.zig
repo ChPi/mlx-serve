@@ -8906,7 +8906,7 @@ pub const Generator = struct {
         if (!constraint.phase.active) return self.nextDeferredConstraint(allocator, constraint);
         const s = self.xfm.s;
 
-        const allowed = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        const allowed = (try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf)).allowed;
         if (allowed == 0) {
             // No legal token: every logit would be -inf and argmax over that
             // row returns id 0, whose bytes then fail `acceptByte` and switch
@@ -8936,18 +8936,36 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(masked_logits);
         try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
 
-        // Synchronous sample: we need the realized token id to advance the grammar.
+        // The next forward is built on the still-lazy sample so the CPU graph
+        // build overlaps this step's GPU work; the token is realized after
+        // dispatch and only then advances the grammar (the mask for the next
+        // logits is built on the next call, off the realized state).
         const lazy = self.sampleLazy(masked_logits);
         defer _ = mlx.mlx_array_free(lazy);
+        var next_logits: ?mlx.mlx_array = null;
+        if (self.step + 1 < self.max_tokens) {
+            if (lazyForward(self.xfm, &self.ctx, lazy)) |nl| {
+                const arr = [_]mlx.mlx_array{ lazy, nl };
+                const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+                _ = mlx.mlx_async_eval(vec);
+                _ = mlx.mlx_vector_array_free(vec);
+                next_logits = nl;
+            } else |_| {}
+        }
+        errdefer if (next_logits) |nl| {
+            _ = mlx.mlx_array_free(nl);
+        };
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
         const token: u32 = @intCast(val);
         self.next_token_id = token;
 
-        // Stop on EOS — do not advance grammar or include in output.
+        // Stop on EOS — do not advance grammar or include in output. A
+        // dispatched forward on the stop token is dropped, as on the lazy path.
         for (self.eos_token_ids) |eos_id| {
             if (token == eos_id) {
+                if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -8956,6 +8974,7 @@ pub const Generator = struct {
         if (token == 0) {
             self.consecutive_pad += 1;
             if (self.consecutive_pad >= 3) {
+                if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -8983,17 +9002,21 @@ pub const Generator = struct {
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
 
-        if (self.step < self.max_tokens) {
+        if (next_logits) |nl| {
+            self.pending_logits = nl;
+            self.has_pending_logits = true;
+        } else if (self.step < self.max_tokens) {
+            // Pipeline miss: forward the realized token.
             const tok_i32: i32 = @intCast(token);
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
-            const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
-            const arr = [_]mlx.mlx_array{next_logits};
+            const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
+            const arr = [_]mlx.mlx_array{nl};
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
             _ = mlx.mlx_async_eval(vec);
             _ = mlx.mlx_vector_array_free(vec);
-            self.pending_logits = next_logits;
+            self.pending_logits = nl;
             self.has_pending_logits = true;
         } else {
             self.done = true;

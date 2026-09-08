@@ -1033,6 +1033,45 @@ log before degrading, instead of sampling through it. The prompt-side
 instruction had been carrying these cases — that is why an
 `additionalProperties` violation read as a model-quality problem.
 
+## JSON-schema decode was 60x slower on Flash Next: the mask walked all 248k tokens per step (#380, 2026-09-07)
+
+`token_mask.buildMask` ran every vocab id through the grammar on every
+generated token: a `restoreFrom` (a memcpy of the whole frame stack, each frame
+carrying a 256-byte key buffer) plus a byte walk, 248k times per step. The
+reporter measured 0.9 tok/s against 54 without `response_format`; on this box
+the same walk cost 3-7 ms in structural states, which the GPU forward mostly
+hid, and the reporter's schema shape made it ~930 ms.
+
+Fix, all in `token_mask.zig`: `TokenBytes.init` indexes the vocabulary once
+per model — buckets by first byte, each bucket ordered by second byte, and a
+split into "plain" string tokens (no quote, backslash or control byte) and the
+rest. A step in a string body (`Grammar.stringBodyRoom`) admits every plain
+token whose length fits the remaining `maxLength` without touching the
+grammar and probes only the ~2.8k others. Any other state asks `allowedBytes`
+for the legal first bytes, and for each one asks again for the legal second
+byte, so only tokens whose first two bytes are legal are walked (the
+second level matters: most BPE tokens start with a space, which is legal
+everywhere between values, so a one-level bucket still probed 107k tokens).
+Mask build is now 0.1-0.4 ms at every state.
+
+Guard: the oracle test in `token_mask.zig` drives a grammar through a whole
+document and diffs the fast mask against the brute-force walk at every byte,
+plus a probe-count bar.
+
+The second half was the constrained step itself. `nextConstrained` sampled
+synchronously and built the next forward from the realized id, so the CPU
+graph build (~840 kernels on Flash Next, ~4 ms) ran while the GPU idled. It
+now samples lazily off the masked logits, hands the still-lazy token to
+`lazyForward` (the same deferred-PLE leaf the unconstrained path uses), dispatches,
+and only then realizes the token and advances the grammar. Byte-identical
+greedy output; Flash Next schema decode 49 -> 53 tok/s = the serial plain rate
+(spec decode stays off under a grammar, so MTP's 65-70 is not the bar).
+
+Trap met on the way: a per-model `"mtp": true` in `model-settings.json`
+overrides `--no-mtp` on the command line, so a "plain" arm launched with the
+flag was still spec-decoding. Send `enable_mtp:false` per request, or read
+the `[spec-stats]` lines, before calling an arm serial.
+
 ## `--no-drafter` did not survive a model switch, and two flags before it didn't either (2026-08-11)
 
 Audit prompted by the grammar-mask singleton above: same shape, different
