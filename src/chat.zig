@@ -81,6 +81,13 @@ pub const VideoData = struct {
     grid_w: u32,
 };
 
+/// OpenAI spells the system turn `developer` for reasoning models (pi does
+/// when `supportsDeveloperRole` is unset). No template we serve tells the two
+/// apart and Qwen's raises on the unknown role, which is a SILENT fallback.
+pub fn canonicalRole(role: []const u8) []const u8 {
+    return if (std.mem.eql(u8, role, "developer")) "system" else role;
+}
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,

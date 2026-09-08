@@ -428,7 +428,7 @@ fn appendMessageItem(
 ) !void {
     const role_val = obj.get("role") orelse return;
     if (role_val != .string) return;
-    const role = role_val.string;
+    const role = chat_mod.canonicalRole(role_val.string);
 
     const content_val = obj.get("content") orelse return;
     var content: []const u8 = "";
@@ -864,6 +864,18 @@ test "parseInput string becomes single user message" {
     try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
     try testing.expectEqualStrings("hello", pi.messages.items[0].content);
+}
+
+test "parseInput reads a developer item as the system turn" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
+    try testing.expectEqualStrings("system", pi.messages.items[0].role);
+    try testing.expectEqualStrings("You are S.", pi.messages.items[0].content);
 }
 
 test "parseInput with instructions prepends system" {

@@ -15,6 +15,9 @@
 
 ### Fixes
 
+- Claude Code no longer loses its SessionStart hook output, `CLAUDE.md` or any other context a client puts in a `system` message inside `messages` on `/v1/messages`. It was discarded without a warning, so the reply looked plausible on a third less prompt. (#365, thanks @nikolai-vysotskyi)
+- A `developer` message is read as the system turn instead of being dropped for an unknown role.
+- Mage-Flow Edit loads again. It had been refused for a missing vision tower, which the loader was dropping before the backend saw it.
 - Gemma 4, LFM2.5-8B-A1B and Muse-Glimmer no longer show their thinking as the answer when streaming. When the model opened its own thought rather than the prompt template, the streamed reply carried the whole chain of thought as text while the same request unstreamed split it correctly.
 - A reply cut off in the middle of a character (an emoji, an accented letter) no longer makes the whole response unreadable to the client.
 - Pasting binary data into a chat (for example `grep -a` output) no longer silently cuts the conversation short at that point, and no longer knocks the prompt back to a generic format. The model used to answer with nothing and the agent's turn ended empty.
@@ -34,6 +37,7 @@
 - A malformed Flash Next checkpoint is refused at load instead of served.
 - `--max-tokens N` in serve mode sets the reply budget for clients that do not send one, and `mlx-serve launch claude` passes the server's real context size instead of assuming 200k.
 - The server log says `auto` instead of a billion tokens when a client omits `max_tokens`.
+- Show log in the image, video, audio and 3D panes opens the Server Log window, and a recommended model that ships a draft head is rated at the speed it actually runs.
 
 ## v26.9.1 — Terminals in the sidebar, 1M context, faster Flash Next
 

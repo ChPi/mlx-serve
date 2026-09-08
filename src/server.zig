@@ -7251,7 +7251,7 @@ fn requestCacheKey(root: std.json.ObjectMap) u64 {
     };
     if (root.get("messages")) |mv| if (mv == .array and mv.array.items.len > 0) {
         const first = mv.array.items[0];
-        if (first == .object) if (first.object.get("role")) |r| if (r == .string and std.mem.eql(u8, r.string, "system")) {
+        if (first == .object) if (first.object.get("role")) |r| if (r == .string and std.mem.eql(u8, chat_mod.canonicalRole(r.string), "system")) {
             if (first.object.get("content")) |c| return hashTextValue(c) orelse 0;
         };
     };
@@ -7502,7 +7502,7 @@ fn handleChatCompletions(
         if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !wire_presence.any() and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
-            .role = role_val.string,
+            .role = chat_mod.canonicalRole(role_val.string),
             .content = content,
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
@@ -14221,6 +14221,20 @@ fn handleAnthropicMessages(
                 },
                 else => {},
             };
+        } else if (std.mem.eql(u8, role, "system")) {
+            // Claude Code puts SessionStart hook output here; dropping it is silent context loss.
+            const sys_text: []const u8 = if (content_val) |cv| switch (cv) {
+                .string => |s| s,
+                .array => |arr| blk: {
+                    const joined = try joinedTextParts(allocator, arr.items);
+                    if (joined.owned) try content_allocs.append(allocator, joined.text);
+                    break :blk joined.text;
+                },
+                else => "",
+            } else "";
+            if (sys_text.len > 0) {
+                try messages.append(allocator, .{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
+            }
         }
     }
 
@@ -19306,6 +19320,13 @@ fn cacheKeyOf(body: []const u8) !u64 {
     return requestCacheKey(parsed.value.object);
 }
 
+test "canonicalRole: developer is the system turn; every other role is itself" {
+    try testing.expectEqualStrings("system", chat_mod.canonicalRole("developer"));
+    try testing.expectEqualStrings("system", chat_mod.canonicalRole("system"));
+    try testing.expectEqualStrings("tool", chat_mod.canonicalRole("tool"));
+    try testing.expectEqualStrings("assistant", chat_mod.canonicalRole("assistant"));
+}
+
 test "requestCacheKey: prompt_cache_key > metadata.user_id > system prompt > anonymous" {
     const sys_str = try cacheKeyOf(
         \\{"messages":[{"role":"system","content":"You are S."},{"role":"user","content":"hi"}]}
@@ -19323,6 +19344,10 @@ test "requestCacheKey: prompt_cache_key > metadata.user_id > system prompt > ano
     try testing.expectEqual(sys_str, sys_parts);
     try testing.expectEqual(sys_str, anth);
     try testing.expectEqual(sys_str, resp);
+    // OpenAI's reasoning-model spelling of the system turn (pi sends it).
+    try testing.expectEqual(sys_str, try cacheKeyOf(
+        \\{"messages":[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]}
+    ));
     try testing.expect(sys_str != try cacheKeyOf(
         \\{"messages":[{"role":"system","content":"You are T."}]}
     ));
